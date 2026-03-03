@@ -1,0 +1,9 @@
+# Arduino
+*.tmp
+*.swp
+
+# Build artifacts
+build/
+
+# Local secrets
+secrets.h
