@@ -23,3 +23,23 @@ Example:
 `MOM01,1739936401,512`
 
 `unix_time` is currently derived from `millis()/1000`. Replace with RTC/NTP when ready.
+
+## Python listener (macOS)
+
+From this repo directory:
+
+```bash
+cd ~/devel/Arduino_WIFI
+python3 arduino_udp_listener.py --port 5005
+```
+
+If you want CSV logging:
+
+```bash
+python3 arduino_udp_listener.py --port 5005 --csv-log data/packets.csv
+```
+
+Notes:
+- `--port` should match `UDP_TARGET_PORT` in `secrets.h`.
+- Current sketch sends one UDP payload per second in CSV format:
+  `device_id,unix_time,sample`
