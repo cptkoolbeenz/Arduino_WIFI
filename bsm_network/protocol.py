@@ -94,6 +94,34 @@ def request_remote_file_list(
     return files
 
 
+def send_time_sync(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    epoch: int | None = None,
+    timeout_s: float = 3.0,
+) -> bool:
+    if epoch is None:
+        epoch = int(time.time())
+
+    msg = f"SET_TIME,{epoch}".encode("utf-8")
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_TIME,"):
+            return True
+        if line.startswith("ERR_TIME,"):
+            return False
+    return False
+
+
 def transfer_file_protocol(
     control_sock: socket.socket,
     device_ip: str,

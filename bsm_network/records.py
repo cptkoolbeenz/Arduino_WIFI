@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import re
 from pathlib import Path
 
 
@@ -136,7 +137,22 @@ def build_local_filename(remote_filename: str, device_uid: str) -> str:
 
 
 def select_most_recent_unsaved_file(remote_filenames: list[str], already_received: set[str]) -> str | None:
-    for name in sorted(remote_filenames, reverse=True):
+    dated: list[tuple[str, str]] = []
+    undated: list[str] = []
+    for name in remote_filenames:
+        m = re.search(r"DL(\\d{6})", name.upper())
+        if m:
+            dated.append((m.group(1), name))
+        else:
+            undated.append(name)
+
+    # Prefer files with parseable YYMMDD token, newest date first.
+    for _, name in sorted(dated, key=lambda x: x[0], reverse=True):
+        if name not in already_received:
+            return name
+
+    # Fallback for any legacy/unexpected naming.
+    for name in sorted(undated, reverse=True):
         if name not in already_received:
             return name
     return None

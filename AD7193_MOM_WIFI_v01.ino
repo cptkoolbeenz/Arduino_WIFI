@@ -69,6 +69,7 @@ const char POLL_MESSAGE[] = "POLL_UID";
 const char LIST_FILES_MESSAGE[] = "LIST_FILES";
 const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
+const char SET_TIME_MESSAGE[] = "SET_TIME";
 
 const uint8_t START_HOUR = 10;
 const uint8_t END_HOUR = 12;
@@ -430,6 +431,19 @@ void serviceWifiCommands() {
   if (fieldCount >= 3 && strcmp(fields[0], RESUME_MESSAGE) == 0) {
     String transferId = String(fields[1]);
     sendUdpMessage("ACK_RESUME_HINT," + transferId + ",USE_START_FILE_WITH_OFFSET", remoteIp, remotePort);
+    return;
+  }
+
+  if (fieldCount >= 2 && strcmp(fields[0], SET_TIME_MESSAGE) == 0) {
+    unsigned long epoch = strtoul(fields[1], nullptr, 10);
+    if (epoch > 0) {
+      RTC.adjust(DateTime((uint32_t) epoch));
+      sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
+      Serial.print(F("RTC set from controller epoch: "));
+      Serial.println(epoch);
+    } else {
+      sendUdpMessage("ERR_TIME,BAD_EPOCH", remoteIp, remotePort);
+    }
   }
 }
 
@@ -514,13 +528,15 @@ String rtnFilename() {
 
   currenttime = RTC.now();
 
+  int YY = currenttime.year() % 100;
   int MM = currenttime.month();
   int DD = currenttime.day();
 
-  String formattedDateTime = "DL_";
-  formattedDateTime += (MM < 10 ? "0" : "") + String(MM) + "_";
+  String formattedDateTime = "DL";
+  formattedDateTime += (YY < 10 ? "0" : "") + String(YY);
+  formattedDateTime += (MM < 10 ? "0" : "") + String(MM);
   formattedDateTime += (DD < 10 ? "0" : "") + String(DD);
-  formattedDateTime += ".txt";
+  formattedDateTime += ".TXT";
 
   return formattedDateTime;
 }

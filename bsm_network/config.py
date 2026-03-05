@@ -10,6 +10,8 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(
         discover=True,
         transfer_latest_file=True,
+        sync_time=True,
+        cloud_enabled=True,
     )
     parser.add_argument("--bind", default="0.0.0.0", help="Local interface/IP to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default: 5005)")
@@ -25,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discover-attempts", type=int, default=8, help="How many poll broadcasts to send (default: 8)")
     parser.add_argument("--discover-interval", type=float, default=0.5, help="Seconds between poll broadcasts (default: 0.5)")
     parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
+    parser.add_argument("--sync-time", action="store_true", help="Sync Arduino RTC from controller time before retrieval")
+    parser.add_argument("--no-sync-time", action="store_false", dest="sync_time", help="Disable RTC sync command")
     parser.add_argument("--download-command", default="DOWNLOAD_DATA", help="UDP command sent to each Arduino to trigger data burst (default: DOWNLOAD_DATA)")
     parser.add_argument("--download-lines", type=int, default=4, help="How many CSV payload lines to capture per Arduino (default: 4)")
     parser.add_argument("--download-timeout", type=float, default=120.0, help="Seconds to wait per Arduino when capturing payload lines (default: 120.0)")
@@ -40,4 +44,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-hour", type=int, default=12, help="Scheduled mode end hour, 0-23 local time (default: 12)")
     parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
     parser.add_argument("--out-window-sleep-sec", type=float, default=45.0, help="Seconds to sleep between time checks outside schedule window (default: 45)")
+    parser.add_argument("--cloud-enabled", action="store_true", dest="cloud_enabled", help="Enable cloud upload window processing")
+    parser.add_argument("--no-cloud-enabled", action="store_false", dest="cloud_enabled", help="Disable cloud upload window processing")
+    parser.add_argument("--cloud-start", default="0100", help="Cloud upload window start in HHMM local time (default: 0100)")
+    parser.add_argument("--cloud-end", default="0400", help="Cloud upload window end in HHMM local time (default: 0400)")
+    parser.add_argument("--cloud-cycle-interval-sec", type=float, default=300.0, help="Seconds between cloud upload cycles in cloud window (default: 300)")
+    parser.add_argument("--cloud-source-dir", default="data/files", help="Directory containing downloaded files to upload (default: data/files)")
+    parser.add_argument("--cloud-sent-log", default="data/cloud_sent_files.csv", help="CSV ledger of files already sent to cloud (default: data/cloud_sent_files.csv)")
+    parser.add_argument("--cloud-rclone-remote", default="", help="rclone remote name (required for actual upload), e.g. gdrive:")
+    parser.add_argument("--cloud-rclone-base", default="BSM_Uploads", help="Remote base path/folder under rclone remote (default: BSM_Uploads)")
+    parser.add_argument(
+        "--cloud-local-dir",
+        default="/Users/bobmauck/Library/CloudStorage/GoogleDrive-mauckr@kenyon.edu/.shortcut-targets-by-id/1paNSXGkj41CwPOn-VE1BFRt7k3oTzm51/PETREL NSF GRANT/2025 DATA and ANALYSIS/Bob Automation Information",
+        help="Local destination directory for cloud sync clients (alternative to rclone remote)",
+    )
+    parser.add_argument("--cloud-once", action="store_true", help="Run one immediate cloud upload cycle and exit")
     return parser.parse_args()

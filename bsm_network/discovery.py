@@ -9,7 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .protocol import parse_payload, request_remote_file_list, transfer_file_protocol
+from .protocol import parse_payload, request_remote_file_list, send_time_sync, transfer_file_protocol
 from .records import (
     build_local_filename,
     load_received_filenames,
@@ -215,7 +215,19 @@ def run_discovery(args: argparse.Namespace) -> int:
         file_log_root = Path(args.file_log_dir).expanduser()
         for row in rows:
             uid = str(row["unique_id"])
+            uid6 = (uid[-6:] if len(uid) >= 6 else uid).upper()
             device_ip = str(row["device_ip"] or row["recv_ip"])
+            if args.sync_time:
+                synced = send_time_sync(
+                    control_sock=sock,
+                    device_ip=device_ip,
+                    control_port=args.discover_port,
+                    timeout_s=3.0,
+                )
+                if synced:
+                    print(f"{uid}: RTC sync OK")
+                else:
+                    print(f"{uid}: RTC sync failed/timeout")
             try:
                 remote_files = request_remote_file_list(
                     control_sock=sock,
@@ -228,15 +240,15 @@ def run_discovery(args: argparse.Namespace) -> int:
                 continue
 
             if not remote_files:
-                print(f"No files reported by {uid} ({device_ip}).")
+                print(f"No files reported by {uid6} ({device_ip}).")
                 continue
 
             seen = load_received_filenames(file_log_root, uid)
             next_file = select_most_recent_unsaved_file(remote_files, seen)
             if not next_file:
-                print(f"No new files to fetch for {uid}.")
+                print(f"No new files to fetch for {uid6}.")
                 continue
-            print(f"{uid}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
+            print(f"{uid6}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
 
             try:
                 local_name = build_local_filename(next_file, uid)
@@ -246,19 +258,31 @@ def run_discovery(args: argparse.Namespace) -> int:
                     control_port=args.discover_port,
                     local_bind_ip=args.bind,
                     requested_filename=next_file,
-                    output_dir=file_output_root / uid,
+                    output_dir=file_output_root / uid6,
                     device_uid=uid,
                     log_root=file_log_root,
                     local_filename=local_name,
                     timeout_s=max(args.download_timeout, 30.0),
                 )
-                print(f"Saved file for {uid}: {saved_path}")
+                print(f"Saved file for {uid6}: {saved_path}")
             except Exception as exc:
-                print(f"Transfer failed for {uid} file {next_file}: {exc}")
+                print(f"Transfer failed for {uid6} file {next_file}: {exc}")
     else:
         download_root = Path(args.download_dir).expanduser()
         for row in rows:
             uid = str(row["unique_id"])
+            device_ip = str(row["device_ip"] or row["recv_ip"])
+            if args.sync_time:
+                synced = send_time_sync(
+                    control_sock=sock,
+                    device_ip=device_ip,
+                    control_port=args.discover_port,
+                    timeout_s=3.0,
+                )
+                if synced:
+                    print(f"{uid}: RTC sync OK")
+                else:
+                    print(f"{uid}: RTC sync failed/timeout")
             device_rows = collect_device_lines(sock, row, args)
             if not device_rows:
                 print(f"No data received from {uid}.")

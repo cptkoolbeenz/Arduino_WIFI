@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import time
 
+from .cloud import run_cloud_upload_cycle
 from .discovery import run_discovery
 
 
@@ -16,39 +17,82 @@ def is_between_hours(now: dt.datetime, start_hour: int, end_hour: int) -> bool:
     return h >= start_hour or h < end_hour
 
 
+def _parse_hhmm(value: str) -> int:
+    raw = value.strip()
+    if len(raw) != 4 or not raw.isdigit():
+        raise ValueError(f"Invalid HHMM time: {value}")
+    hh = int(raw[:2])
+    mm = int(raw[2:])
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError(f"Invalid HHMM time: {value}")
+    return hh * 60 + mm
+
+
+def is_between_hhmm(now: dt.datetime, start_hhmm: str, end_hhmm: str) -> bool:
+    start = _parse_hhmm(start_hhmm)
+    end = _parse_hhmm(end_hhmm)
+    cur = now.hour * 60 + now.minute
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
 def run_scheduled(args: argparse.Namespace) -> int:
-    if not args.discover:
-        print("Scheduled mode requires --discover.")
+    if not args.discover and not args.cloud_enabled:
+        print("Scheduled mode requires discovery and/or cloud window to be enabled.")
         return 2
-    if not (0 <= args.start_hour <= 23 and 0 <= args.end_hour <= 23):
+    if args.discover and not (0 <= args.start_hour <= 23 and 0 <= args.end_hour <= 23):
         print("Invalid schedule hours. Use 0-23 for --start-hour and --end-hour.")
         return 2
+    try:
+        _parse_hhmm(args.cloud_start)
+        _parse_hhmm(args.cloud_end)
+    except ValueError as exc:
+        print(str(exc))
+        return 2
 
-    in_window_prev = None
-    cycle_count = 0
+    in_discovery_prev = None
+    in_cloud_prev = None
+    discovery_cycle_count = 0
+    cloud_cycle_count = 0
     print(
-        f"Scheduled mode enabled: window={args.start_hour:02d}:00-"
-        f"{args.end_hour:02d}:00 local, cycle_interval={args.cycle_interval_sec:.0f}s"
+        f"Scheduled mode enabled: discovery={args.start_hour:02d}:00-{args.end_hour:02d}:00 "
+        f"(every {args.cycle_interval_sec:.0f}s), cloud={args.cloud_start}-{args.cloud_end} "
+        f"(every {args.cloud_cycle_interval_sec:.0f}s)"
     )
     print("Press Ctrl+C to stop.")
 
     try:
         while True:
             now = dt.datetime.now()
-            in_window = is_between_hours(now, args.start_hour, args.end_hour)
+            in_discovery = is_between_hours(now, args.start_hour, args.end_hour)
+            in_cloud = args.cloud_enabled and is_between_hhmm(now, args.cloud_start, args.cloud_end)
 
-            if in_window_prev is None or in_window != in_window_prev:
-                state = "IN WINDOW" if in_window else "OUT OF WINDOW"
-                print(f"[{now.isoformat(timespec='seconds')}] Schedule state: {state}")
-                in_window_prev = in_window
+            if in_discovery_prev is None or in_discovery != in_discovery_prev:
+                state = "IN WINDOW" if in_discovery else "OUT OF WINDOW"
+                print(f"[{now.isoformat(timespec='seconds')}] Discovery schedule: {state}")
+                in_discovery_prev = in_discovery
+            if in_cloud_prev is None or in_cloud != in_cloud_prev:
+                state = "IN WINDOW" if in_cloud else "OUT OF WINDOW"
+                print(f"[{now.isoformat(timespec='seconds')}] Cloud schedule: {state}")
+                in_cloud_prev = in_cloud
 
-            if in_window:
-                cycle_count += 1
-                print(f"[{now.isoformat(timespec='seconds')}] Starting cycle #{cycle_count}")
+            if in_discovery:
+                discovery_cycle_count += 1
+                print(f"[{now.isoformat(timespec='seconds')}] Starting discovery cycle #{discovery_cycle_count}")
                 rc = run_discovery(args)
                 end_time = dt.datetime.now().isoformat(timespec="seconds")
-                print(f"[{end_time}] Cycle #{cycle_count} complete (rc={rc})")
+                print(f"[{end_time}] Discovery cycle #{discovery_cycle_count} complete (rc={rc})")
                 time.sleep(max(args.cycle_interval_sec, 1.0))
+            elif in_cloud:
+                cloud_cycle_count += 1
+                print(f"[{now.isoformat(timespec='seconds')}] Starting cloud cycle #{cloud_cycle_count}")
+                rc = run_cloud_upload_cycle(args)
+                end_time = dt.datetime.now().isoformat(timespec="seconds")
+                print(f"[{end_time}] Cloud cycle #{cloud_cycle_count} complete (rc={rc})")
+                time.sleep(max(args.cloud_cycle_interval_sec, 1.0))
             else:
                 time.sleep(max(args.out_window_sleep_sec, 1.0))
     except KeyboardInterrupt:
