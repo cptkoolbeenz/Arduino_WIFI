@@ -271,10 +271,12 @@ def append_file_receive_log(
     transfer_id: str,
     total_bytes: int,
     checksum_hex: str,
+    transfer_seconds: float,
 ) -> Path:
     """Append one successful file receive event for a specific device."""
     log_root.mkdir(parents=True, exist_ok=True)
-    log_path = log_root / f"{device_uid}.csv"
+    device_uid_6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    log_path = log_root / f"{device_uid_6}.csv"
     exists = log_path.exists()
 
     with log_path.open("a", newline="", encoding="utf-8") as f:
@@ -289,17 +291,19 @@ def append_file_receive_log(
                     "transfer_id",
                     "total_bytes",
                     "checksum_crc32",
+                    "transfer_seconds",
                 ]
             )
         writer.writerow(
             [
                 dt.datetime.now().isoformat(timespec="seconds"),
-                device_uid,
+                device_uid_6,
                 source_filename,
                 str(saved_path),
                 transfer_id,
                 total_bytes,
                 checksum_hex,
+                f"{transfer_seconds:.3f}",
             ]
         )
 
@@ -308,7 +312,8 @@ def append_file_receive_log(
 
 def load_received_filenames(log_root: Path, device_uid: str) -> set[str]:
     """Return filenames already received for this device from its log CSV."""
-    log_path = log_root / f"{device_uid}.csv"
+    device_uid_6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    log_path = log_root / f"{device_uid_6}.csv"
     if not log_path.exists():
         return set()
 
@@ -320,6 +325,20 @@ def load_received_filenames(log_root: Path, device_uid: str) -> set[str]:
             if name:
                 seen.add(name)
     return seen
+
+
+def build_local_filename(remote_filename: str, device_uid: str) -> str:
+    """Build host filename as DL_YYMMDDHH_UID6.TXT when possible."""
+    base = Path(remote_filename).name
+    stem = Path(base).stem
+    suffix = Path(base).suffix or ".TXT"
+
+    uid6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    if len(stem) == 8 and stem.isdigit():
+        return f"DL_{stem}_{uid6}{suffix.upper()}"
+
+    safe_stem = stem.replace(" ", "_")
+    return f"DL_{safe_stem}_{uid6}{suffix.upper()}"
 
 
 def select_most_recent_unsaved_file(
@@ -393,6 +412,7 @@ def transfer_file_protocol(
     output_dir: Path,
     device_uid: str | None = None,
     log_root: Path | None = None,
+    local_filename: str | None = None,
     timeout_s: float = 30.0,
 ) -> Path:
     """Run START_FILE -> FILE_INFO -> TCP chunk stream -> DONE protocol.
@@ -410,6 +430,7 @@ def transfer_file_protocol(
       EOF,<transfer_id>,<total_bytes>,<full_crc32_hex>\\n
     """
     transfer_id = _new_transfer_id("T")
+    transfer_start = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{device_ip}] Transfer start: id={transfer_id} file={requested_filename}")
 
@@ -456,7 +477,8 @@ def transfer_file_protocol(
     server.close()
     print(f"[{device_ip}] TCP connected from {addr[0]}:{addr[1]}")
 
-    out_path = output_dir / filename
+    final_name = local_filename if local_filename else filename
+    out_path = output_dir / final_name
     stream_crc32 = 0
     expected_offset = 0
     bytes_written = 0
@@ -512,6 +534,8 @@ def transfer_file_protocol(
     done_msg = f"DONE,{transfer_id}".encode("utf-8")
     control_sock.sendto(done_msg, (device_ip, control_port))
     print(f"[{device_ip}] DONE sent. Saved -> {out_path}")
+    transfer_seconds = time.monotonic() - transfer_start
+    print(f"[{device_ip}] Transfer time: {transfer_seconds:.2f}s")
 
     if device_uid and log_root:
         append_file_receive_log(
@@ -522,6 +546,7 @@ def transfer_file_protocol(
             transfer_id=transfer_id,
             total_bytes=bytes_written,
             checksum_hex=f"{(stream_crc32 & 0xFFFFFFFF):08x}",
+            transfer_seconds=transfer_seconds,
         )
 
     return out_path
@@ -745,6 +770,7 @@ def run_discovery(args: argparse.Namespace) -> int:
             print(f"{uid}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
 
             try:
+                local_name = build_local_filename(next_file, uid)
                 saved_path = transfer_file_protocol(
                     control_sock=sock,
                     device_ip=device_ip,
@@ -754,6 +780,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                     output_dir=file_output_root / uid,
                     device_uid=uid,
                     log_root=file_log_root,
+                    local_filename=local_name,
                     timeout_s=max(args.download_timeout, 30.0),
                 )
                 print(f"Saved file for {uid}: {saved_path}")

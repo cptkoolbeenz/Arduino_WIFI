@@ -58,6 +58,7 @@ long int strain;  // value of the scale at any point in time
 
 int tCounter = 0;  // Count # loops we to thru - must be global because don't want to initialize each time
 String deviceId;
+String deviceID_6;
 bool wifiModeActive = false;
 bool wifiInitialized = false;
 bool sdReady = false;
@@ -128,6 +129,14 @@ String crc32Hex(uint32_t value) {
   return String(out);
 }
 
+void setLcdStatusLine1(const String &status) {
+  if (!printLCD) return;
+  lcd.setCursor(0, 0);
+  String text = status;
+  while (text.length() < 16) text += " ";
+  lcd.print(text.substring(0, 16));
+}
+
 void sendUdpMessage(const String &msg, const IPAddress &ip, uint16_t port) {
   udp.beginPacket(ip, port);
   udp.print(msg);
@@ -195,6 +204,7 @@ bool resolveTargetIp() {
 
 void enterWifiMode() {
   Serial.println(F("Entering WiFi mode"));
+  setLcdStatusLine1("WiFi: connect");
   if (!connectWiFi()) {
     return;
   }
@@ -204,6 +214,7 @@ void enterWifiMode() {
   }
   udp.begin(UDP_LOCAL_PORT);
   wifiInitialized = true;
+  setLcdStatusLine1("WiFi: waiting");
 }
 
 void exitWifiMode() {
@@ -211,6 +222,7 @@ void exitWifiMode() {
   udp.stop();
   WiFi.disconnect();
   wifiInitialized = false;
+  setLcdStatusLine1("Data:");
 }
 
 void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t replyPort) {
@@ -264,6 +276,7 @@ void sendFileOverTcp(
   const IPAddress &replyIp,
   uint16_t replyPort
 ) {
+  setLcdStatusLine1("Xfer: start");
   if (!sdReady) {
     sendUdpMessage("ERROR," + transferId + ",SD_NOT_READY,SD init failed", replyIp, replyPort);
     return;
@@ -300,6 +313,7 @@ void sendFileOverTcp(
     sendUdpMessage("ERROR," + transferId + ",TCP_CONNECT_FAILED," + String(controllerTcpPort), replyIp, replyPort);
     return;
   }
+  setLcdStatusLine1("Xfer: sending");
 
   uint8_t buffer[FILE_CHUNK_SIZE];
   unsigned long offset = startOffset;
@@ -356,6 +370,7 @@ void sendFileOverTcp(
   client.stop();
   file.close();
   sendUdpMessage("FILE_SENT," + transferId + "," + String(fileSize) + "," + crc32Hex(fullCrc), replyIp, replyPort);
+  setLcdStatusLine1("Xfer: done");
 }
 
 void serviceWifiCommands() {
@@ -529,6 +544,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
+  deviceID_6 = (deviceId.length() >= 6) ? deviceId.substring(deviceId.length() - 6) : deviceId;
   Serial.print("Device ID: ");
   Serial.println(deviceId);
 
@@ -704,7 +720,7 @@ void setup() {
     lcd.setCursor(0, 0);
     lcd.print("Data:           ");
     lcd.setCursor(0, 1);
-    lcd.print("                ");
+    lcd.print("UID: " + deviceID_6 + "      ");
     lcd.setCursor(6, 0);
     lcd.print(Get_Data());  // do this while we are messing with closing the datafile
   }
