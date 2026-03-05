@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-compatible entrypoint for bsm_network package."""
+"""Entrypoint for BSM network controller."""
 
 from __future__ import annotations
 

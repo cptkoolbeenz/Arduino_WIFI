@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+import argparse
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="UDP listener/controller for Arduino BSM payloads"
+    )
+    parser.set_defaults(
+        discover=True,
+        transfer_latest_file=True,
+    )
+    parser.add_argument("--bind", default="0.0.0.0", help="Local interface/IP to bind (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default: 5005)")
+    parser.add_argument("--buffer-size", type=int, default=2048, help="Max UDP datagram size in bytes (default: 2048)")
+    parser.add_argument("--csv-log", default="", help="Optional CSV file path to append parsed packets")
+    parser.add_argument("--ack", action="store_true", help="Reply to sender with a simple ACK message")
+    parser.add_argument("--host-label", default="Mac", help="Name shown in startup output for the host machine (default: Mac)")
+    parser.add_argument("--discover", action="store_true", help="Broadcast poll request and print discovered Arduino unique IDs")
+    parser.add_argument("--no-discover", action="store_false", dest="discover", help="Disable discovery mode")
+    parser.add_argument("--discover-ip", default="", help="Broadcast IP for discovery polls (default: auto-detect subnet broadcast)")
+    parser.add_argument("--discover-port", type=int, default=8888, help="UDP port Arduino listens on for discovery polls (default: 8888)")
+    parser.add_argument("--discover-timeout", type=float, default=20.0, help="Seconds to wait for discovery replies (default: 20.0)")
+    parser.add_argument("--discover-attempts", type=int, default=8, help="How many poll broadcasts to send (default: 8)")
+    parser.add_argument("--discover-interval", type=float, default=0.5, help="Seconds between poll broadcasts (default: 0.5)")
+    parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
+    parser.add_argument("--download-command", default="DOWNLOAD_DATA", help="UDP command sent to each Arduino to trigger data burst (default: DOWNLOAD_DATA)")
+    parser.add_argument("--download-lines", type=int, default=4, help="How many CSV payload lines to capture per Arduino (default: 4)")
+    parser.add_argument("--download-timeout", type=float, default=120.0, help="Seconds to wait per Arduino when capturing payload lines (default: 120.0)")
+    parser.add_argument("--post-poll-wait", type=float, default=10.0, help="Seconds to wait after polling before starting downloads (default: 10.0)")
+    parser.add_argument("--download-dir", default="data", help="Directory for per-device downloaded CSV files (default: data)")
+    parser.add_argument("--transfer-latest-file", action="store_true", help="After discovery, list remote files and transfer the latest unsaved file")
+    parser.add_argument("--no-transfer-latest-file", action="store_false", dest="transfer_latest_file", help="Disable latest-file transfer after discovery")
+    parser.add_argument("--file-list-timeout", type=float, default=10.0, help="Seconds to wait for LIST_FILES response per device (default: 10.0)")
+    parser.add_argument("--file-output-dir", default="data/files", help="Directory for transferred files (default: data/files)")
+    parser.add_argument("--file-log-dir", default="data/file_logs", help="Directory for per-device file transfer logs (default: data/file_logs)")
+    parser.add_argument("--scheduled", action="store_true", help="Run discover/transfer in a repeating time-window loop (opt-in)")
+    parser.add_argument("--start-hour", type=int, default=10, help="Scheduled mode start hour, 0-23 local time (default: 10)")
+    parser.add_argument("--end-hour", type=int, default=12, help="Scheduled mode end hour, 0-23 local time (default: 12)")
+    parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
+    parser.add_argument("--out-window-sleep-sec", type=float, default=45.0, help="Seconds to sleep between time checks outside schedule window (default: 45)")
+    return parser.parse_args()
