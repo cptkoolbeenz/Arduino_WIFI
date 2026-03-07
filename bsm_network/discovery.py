@@ -160,7 +160,10 @@ def run_discovery(args: argparse.Namespace) -> int:
         f"Polling {', '.join(f'udp://{ip}:{args.discover_port}' for ip in discover_ips)} "
         f"from local udp://{args.bind}:{args.port}"
     )
-    print(f"Waiting up to {args.discover_timeout:.1f}s for replies.")
+    print(
+        f"Waiting up to {args.discover_timeout:.1f}s for replies @ "
+        f"{dt.datetime.now().strftime('%H:%M:%S')}"
+    )
 
     for _ in range(args.discover_attempts):
         for discover_ip in discover_ips:

@@ -63,9 +63,6 @@ String deviceID_6;
 bool wifiModeActive = false;
 bool wifiInitialized = false;
 bool sdReady = false;
-bool wifiSessionLatched = false;
-bool wifiSessionDoneRequested = false;
-unsigned long wifiLastActivityMs = 0;
 IPAddress targetIp;
 WiFiUDP udp;
 
@@ -73,13 +70,10 @@ const char POLL_MESSAGE[] = "POLL_UID";
 const char LIST_FILES_MESSAGE[] = "LIST_FILES";
 const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
-const char SET_TIME_MESSAGE[] = "SET_TIME";
-const char DONE_MESSAGE[] = "DONE";
 
-const uint8_t START_HOUR = 14;
-const uint8_t END_HOUR = 16;
+const uint8_t START_HOUR = 17;
+const uint8_t END_HOUR = 18;
 const size_t FILE_CHUNK_SIZE = 1024;
-const unsigned long WIFI_SESSION_IDLE_TIMEOUT_MS = 180000UL;
 
 /////////////////////
 //  set constants
@@ -221,9 +215,6 @@ void enterWifiMode() {
   }
   udp.begin(UDP_LOCAL_PORT);
   wifiInitialized = true;
-  wifiSessionLatched = false;
-  wifiSessionDoneRequested = false;
-  wifiLastActivityMs = millis();
   setLcdStatusLine1("WiFi: waiting");
 }
 
@@ -232,8 +223,6 @@ void exitWifiMode() {
   udp.stop();
   WiFi.disconnect();
   wifiInitialized = false;
-  wifiSessionLatched = false;
-  wifiSessionDoneRequested = false;
   setLcdStatusLine1("Data:");
 }
 
@@ -401,8 +390,6 @@ void serviceWifiCommands() {
 
   IPAddress remoteIp = udp.remoteIP();
   uint16_t remotePort = udp.remotePort();
-  wifiSessionLatched = true;
-  wifiLastActivityMs = millis();
 
   if (strcmp(incoming, POLL_MESSAGE) == 0) {
     String response = "ID,";
@@ -444,30 +431,6 @@ void serviceWifiCommands() {
   if (fieldCount >= 3 && strcmp(fields[0], RESUME_MESSAGE) == 0) {
     String transferId = String(fields[1]);
     sendUdpMessage("ACK_RESUME_HINT," + transferId + ",USE_START_FILE_WITH_OFFSET", remoteIp, remotePort);
-    return;
-  }
-
-  if (fieldCount >= 2 && strcmp(fields[0], SET_TIME_MESSAGE) == 0) {
-    unsigned long epoch = strtoul(fields[1], nullptr, 10);
-    if (epoch > 0) {
-      RTC.adjust(DateTime((uint32_t) epoch));
-      DateTime newRtc = RTC.now();
-      sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
-      Serial.print(F("RTC set from controller epoch: "));
-      Serial.println(epoch);
-      Serial.print(F("RTC now: "));
-      Serial.println(newRtc.timestamp(DateTime::TIMESTAMP_FULL));
-    } else {
-      sendUdpMessage("ERR_TIME,BAD_EPOCH", remoteIp, remotePort);
-    }
-    return;
-  }
-
-  if (fieldCount >= 1 && strcmp(fields[0], DONE_MESSAGE) == 0) {
-    String transferId = (fieldCount >= 2) ? String(fields[1]) : String("T0");
-    sendUdpMessage("ACK_DONE," + transferId, remoteIp, remotePort);
-    wifiSessionDoneRequested = true;
-    return;
   }
 }
 
@@ -552,15 +515,13 @@ String rtnFilename() {
 
   currenttime = RTC.now();
 
-  int YY = currenttime.year() % 100;
   int MM = currenttime.month();
   int DD = currenttime.day();
 
-  String formattedDateTime = "DL";
-  formattedDateTime += (YY < 10 ? "0" : "") + String(YY);
-  formattedDateTime += (MM < 10 ? "0" : "") + String(MM);
+  String formattedDateTime = "DL_";
+  formattedDateTime += (MM < 10 ? "0" : "") + String(MM) + "_";
   formattedDateTime += (DD < 10 ? "0" : "") + String(DD);
-  formattedDateTime += ".TXT";
+  formattedDateTime += ".txt";
 
   return formattedDateTime;
 }
@@ -601,6 +562,27 @@ void setup() {
   lcd.print("                "); 
 
   ///////////////////////////
+  // setup ADC AD7193 on PCB from Tacuna code
+  ///////////////////////////
+  scale.setSPI(SPI);
+    if(!scale.begin(AD7193_CS, PIN_SPI_MISO)) {
+      Serial.println(F("AD7193 initialization failed!"));
+
+    } else {
+      scale.printAllRegisters();
+      scale.setClockMode(AD7193_CLK_INT);
+      scale.setRate(0x001);
+      scale.setFilter(AD7193_MODE_SINC4);
+      scale.enableNotchFilter(false);     // learn what this will do
+      scale.enableChop(false);
+      scale.enableBuffer(true);
+      scale.rangeSetup(0, AD7193_CONF_GAIN_128);
+      scale.channelSelect(AD7193_CH_0);
+      Serial.println(F("AD7193 Initialized!"));
+    }
+
+
+  ///////////////////////////
   // RTC - Setup - turn on and off with flag
   //.    May 7, 2024 - disable 
   ///////////////////////////
@@ -638,26 +620,6 @@ void setup() {
       delay(3000);
     }
   }
-
-  ///////////////////////////
-  // setup ADC AD7193 on PCB from Tacuna code
-  ///////////////////////////
-  scale.setSPI(SPI);
-    if(!scale.begin(AD7193_CS, PIN_SPI_MISO)) {
-      Serial.println(F("AD7193 initialization failed!"));
-
-    } else {
-      scale.printAllRegisters();
-      scale.setClockMode(AD7193_CLK_INT);
-      scale.setRate(0x001);
-      scale.setFilter(AD7193_MODE_SINC4);
-      scale.enableNotchFilter(false);     // learn what this will do
-      scale.enableChop(false);
-      scale.enableBuffer(true);
-      scale.rangeSetup(0, AD7193_CONF_GAIN_128);
-      scale.channelSelect(AD7193_CH_0);
-      Serial.println(F("AD7193 Initialized!"));
-    }
 
 
   ///////////////////////////
@@ -778,27 +740,13 @@ void loop() {
   if (inWifiWindow && !wifiModeActive) {
     enterWifiMode();
     wifiModeActive = wifiInitialized;
-  } else if (!inWifiWindow && wifiModeActive && !wifiSessionLatched) {
+  } else if (!inWifiWindow && wifiModeActive) {
     exitWifiMode();
     wifiModeActive = false;
   }
 
   if (wifiModeActive) {
     serviceWifiCommands();
-    if (!inWifiWindow) {
-      if (wifiSessionDoneRequested) {
-        Serial.println(F("WiFi session done, exiting WiFi mode."));
-        exitWifiMode();
-        wifiModeActive = false;
-        return;
-      }
-      if (wifiSessionLatched && (millis() - wifiLastActivityMs) > WIFI_SESSION_IDLE_TIMEOUT_MS) {
-        Serial.println(F("WiFi session idle timeout, exiting WiFi mode."));
-        exitWifiMode();
-        wifiModeActive = false;
-        return;
-      }
-    }
     return;
   }
 

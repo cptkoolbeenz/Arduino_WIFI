@@ -2,6 +2,19 @@ from __future__ import annotations
 
 import argparse
 
+# Network defaults used by CLI flags below.
+# Edit these in one place when moving to a different local network.
+DEFAULT_BIND_IP = "192.168.1.8"
+DEFAULT_DISCOVER_BROADCAST_IP = "192.168.1.255"
+DEFAULT_LISTEN_PORT = 5005
+DEFAULT_DISCOVER_PORT = 8888
+DEFAULT_LOCAL_OFFSET = -4
+DEFAULT_HOST_LABEL = "Mac"
+DEFAULT_START_HOUR = 10
+DEFAULT_END_HOUR = 20
+DEFAULT_CLOUD_START = "0100"
+DEFAULT_CLOUD_END = "0400"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -13,16 +26,16 @@ def parse_args() -> argparse.Namespace:
         sync_time=True,
         cloud_enabled=True,
     )
-    parser.add_argument("--bind", default="0.0.0.0", help="Local interface/IP to bind (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=5005, help="UDP port to listen on (default: 5005)")
+    parser.add_argument("--bind", default=DEFAULT_BIND_IP, help=f"Local interface/IP to bind (default: {DEFAULT_BIND_IP})")
+    parser.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"UDP port to listen on (default: {DEFAULT_LISTEN_PORT})")
     parser.add_argument("--buffer-size", type=int, default=2048, help="Max UDP datagram size in bytes (default: 2048)")
     parser.add_argument("--csv-log", default="", help="Optional CSV file path to append parsed packets")
     parser.add_argument("--ack", action="store_true", help="Reply to sender with a simple ACK message")
-    parser.add_argument("--host-label", default="Mac", help="Name shown in startup output for the host machine (default: Mac)")
+    parser.add_argument("--host-label", default=DEFAULT_HOST_LABEL, help=f"Name shown in startup output for the host machine (default: {DEFAULT_HOST_LABEL})")
     parser.add_argument("--discover", action="store_true", help="Broadcast poll request and print discovered Arduino unique IDs")
     parser.add_argument("--no-discover", action="store_false", dest="discover", help="Disable discovery mode")
-    parser.add_argument("--discover-ip", default="", help="Broadcast IP for discovery polls (default: auto-detect subnet broadcast)")
-    parser.add_argument("--discover-port", type=int, default=8888, help="UDP port Arduino listens on for discovery polls (default: 8888)")
+    parser.add_argument("--discover-ip", default=DEFAULT_DISCOVER_BROADCAST_IP, help=f"Broadcast IP for discovery polls (default: {DEFAULT_DISCOVER_BROADCAST_IP})")
+    parser.add_argument("--discover-port", type=int, default=DEFAULT_DISCOVER_PORT, help=f"UDP port Arduino listens on for discovery polls (default: {DEFAULT_DISCOVER_PORT})")
     parser.add_argument("--discover-timeout", type=float, default=20.0, help="Seconds to wait for discovery replies (default: 20.0)")
     parser.add_argument("--discover-attempts", type=int, default=8, help="How many poll broadcasts to send (default: 8)")
     parser.add_argument("--discover-interval", type=float, default=0.5, help="Seconds between poll broadcasts (default: 0.5)")
@@ -32,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--time-offset-hours",
         type=float,
-        default=-5,
-        help="Hours offset applied to controller epoch before SET_TIME (default: 0, UTC)",
+        default=DEFAULT_LOCAL_OFFSET,
+        help=f"Hours offset applied to controller epoch before SET_TIME (default: {DEFAULT_LOCAL_OFFSET})",
     )
     parser.add_argument("--download-command", default="DOWNLOAD_DATA", help="UDP command sent to each Arduino to trigger data burst (default: DOWNLOAD_DATA)")
     parser.add_argument("--download-lines", type=int, default=4, help="How many CSV payload lines to capture per Arduino (default: 4)")
@@ -56,14 +69,14 @@ def parse_args() -> argparse.Namespace:
         help="Treat partial transfers as received so they are not retried (only used with --transfer-tolerant)",
     )
     parser.add_argument("--scheduled", action="store_true", help="Run discover/transfer in a repeating time-window loop (opt-in)")
-    parser.add_argument("--start-hour", type=int, default=10, help="Scheduled mode start hour, 0-23 local time (default: 10)")
-    parser.add_argument("--end-hour", type=int, default=12, help="Scheduled mode end hour, 0-23 local time (default: 12)")
+    parser.add_argument("--start-hour", type=int, default=DEFAULT_START_HOUR, help=f"Scheduled mode start hour, 0-23 local time (default: {DEFAULT_START_HOUR})")
+    parser.add_argument("--end-hour", type=int, default=DEFAULT_END_HOUR, help=f"Scheduled mode end hour, 0-23 local time (default: {DEFAULT_END_HOUR})")
     parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
     parser.add_argument("--out-window-sleep-sec", type=float, default=45.0, help="Seconds to sleep between time checks outside schedule window (default: 45)")
     parser.add_argument("--cloud-enabled", action="store_true", dest="cloud_enabled", help="Enable cloud upload window processing")
     parser.add_argument("--no-cloud-enabled", action="store_false", dest="cloud_enabled", help="Disable cloud upload window processing")
-    parser.add_argument("--cloud-start", default="0100", help="Cloud upload window start in HHMM local time (default: 0100)")
-    parser.add_argument("--cloud-end", default="0400", help="Cloud upload window end in HHMM local time (default: 0400)")
+    parser.add_argument("--cloud-start", default=DEFAULT_CLOUD_START, help=f"Cloud upload window start in HHMM local time (default: {DEFAULT_CLOUD_START})")
+    parser.add_argument("--cloud-end", default=DEFAULT_CLOUD_END, help=f"Cloud upload window end in HHMM local time (default: {DEFAULT_CLOUD_END})")
     parser.add_argument("--cloud-cycle-interval-sec", type=float, default=300.0, help="Seconds between cloud upload cycles in cloud window (default: 300)")
     parser.add_argument("--cloud-source-dir", default="data/files", help="Directory containing downloaded files to upload (default: data/files)")
     parser.add_argument("--cloud-sent-log", default="data/cloud_sent_files.csv", help="CSV ledger of files already sent to cloud (default: data/cloud_sent_files.csv)")
