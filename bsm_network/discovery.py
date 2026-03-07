@@ -218,10 +218,12 @@ def run_discovery(args: argparse.Namespace) -> int:
             uid6 = (uid[-6:] if len(uid) >= 6 else uid).upper()
             device_ip = str(row["device_ip"] or row["recv_ip"])
             if args.sync_time:
+                sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
                 synced = send_time_sync(
                     control_sock=sock,
                     device_ip=device_ip,
                     control_port=args.discover_port,
+                    epoch=sync_epoch,
                     timeout_s=3.0,
                 )
                 if synced:
@@ -263,6 +265,8 @@ def run_discovery(args: argparse.Namespace) -> int:
                     log_root=file_log_root,
                     local_filename=local_name,
                     timeout_s=max(args.download_timeout, 30.0),
+                    tolerant_integrity=args.transfer_tolerant,
+                    mark_partial_received=args.mark_partial_received,
                 )
                 print(f"Saved file for {uid6}: {saved_path}")
             except Exception as exc:
@@ -273,10 +277,12 @@ def run_discovery(args: argparse.Namespace) -> int:
             uid = str(row["unique_id"])
             device_ip = str(row["device_ip"] or row["recv_ip"])
             if args.sync_time:
+                sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
                 synced = send_time_sync(
                     control_sock=sock,
                     device_ip=device_ip,
                     control_port=args.discover_port,
+                    epoch=sync_epoch,
                     timeout_s=3.0,
                 )
                 if synced:

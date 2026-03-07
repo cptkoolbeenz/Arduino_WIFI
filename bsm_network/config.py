@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
     parser.add_argument("--sync-time", action="store_true", help="Sync Arduino RTC from controller time before retrieval")
     parser.add_argument("--no-sync-time", action="store_false", dest="sync_time", help="Disable RTC sync command")
+    parser.add_argument(
+        "--time-offset-hours",
+        type=float,
+        default=-5,
+        help="Hours offset applied to controller epoch before SET_TIME (default: 0, UTC)",
+    )
     parser.add_argument("--download-command", default="DOWNLOAD_DATA", help="UDP command sent to each Arduino to trigger data burst (default: DOWNLOAD_DATA)")
     parser.add_argument("--download-lines", type=int, default=4, help="How many CSV payload lines to capture per Arduino (default: 4)")
     parser.add_argument("--download-timeout", type=float, default=120.0, help="Seconds to wait per Arduino when capturing payload lines (default: 120.0)")
@@ -39,6 +45,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file-list-timeout", type=float, default=10.0, help="Seconds to wait for LIST_FILES response per device (default: 10.0)")
     parser.add_argument("--file-output-dir", default="data/files", help="Directory for transferred files (default: data/files)")
     parser.add_argument("--file-log-dir", default="data/file_logs", help="Directory for per-device file transfer logs (default: data/file_logs)")
+    parser.add_argument(
+        "--transfer-tolerant",
+        action="store_true",
+        help="Allow partial file saves when EOF integrity checks fail (default: strict off)",
+    )
+    parser.add_argument(
+        "--mark-partial-received",
+        action="store_true",
+        help="Treat partial transfers as received so they are not retried (only used with --transfer-tolerant)",
+    )
     parser.add_argument("--scheduled", action="store_true", help="Run discover/transfer in a repeating time-window loop (opt-in)")
     parser.add_argument("--start-hour", type=int, default=10, help="Scheduled mode start hour, 0-23 local time (default: 10)")
     parser.add_argument("--end-hour", type=int, default=12, help="Scheduled mode end hour, 0-23 local time (default: 12)")

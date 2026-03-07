@@ -47,6 +47,12 @@ def _new_transfer_id(prefix: str = "T") -> str:
     return f"{prefix}{int(time.time() * 1000)}"
 
 
+def _partial_path(path: Path, transfer_id: str) -> Path:
+    stem = path.stem
+    suffix = path.suffix
+    return path.with_name(f"{stem}_PARTIAL_{transfer_id}{suffix}")
+
+
 def request_remote_file_list(
     control_sock: socket.socket,
     device_ip: str,
@@ -133,6 +139,8 @@ def transfer_file_protocol(
     log_root: Path | None = None,
     local_filename: str | None = None,
     timeout_s: float = 30.0,
+    tolerant_integrity: bool = False,
+    mark_partial_received: bool = False,
 ) -> Path:
     transfer_id = _new_transfer_id("T")
     transfer_start = time.monotonic()
@@ -187,10 +195,18 @@ def transfer_file_protocol(
     expected_offset = 0
     bytes_written = 0
     next_progress_report = 10
+    integrity_status = "verified"
 
     with out_path.open("wb") as out:
         while True:
-            header = _recv_until_newline(conn).decode("utf-8", errors="replace").strip()
+            try:
+                header = _recv_until_newline(conn).decode("utf-8", errors="replace").strip()
+            except (ConnectionError, TimeoutError, ValueError, socket.timeout) as exc:
+                if tolerant_integrity and bytes_written > 0:
+                    integrity_status = "partial_no_eof"
+                    print(f"[{device_ip}] WARNING: stream ended before valid EOF ({exc}); saving partial file.")
+                    break
+                raise
             parts = [p.strip() for p in header.split(",")]
             if not parts:
                 continue
@@ -230,18 +246,34 @@ def transfer_file_protocol(
                 file_crc = parts[3].lower()
                 local_crc = f"{(stream_crc32 & 0xFFFFFFFF):08x}"
                 if total_bytes != bytes_written or file_crc != local_crc:
+                    if tolerant_integrity:
+                        integrity_status = "partial_eof_mismatch"
+                        print(
+                            f"[{device_ip}] WARNING: EOF mismatch (remote bytes={total_bytes}, "
+                            f"local bytes={bytes_written}, remote crc={file_crc}, local crc={local_crc}); "
+                            "saving partial file."
+                        )
+                        break
                     raise ValueError("EOF integrity check failed (size/crc mismatch)")
                 print(f"[{device_ip}] EOF verified: bytes={total_bytes} crc32={local_crc}")
                 break
 
     conn.close()
+    if integrity_status != "verified":
+        partial_out_path = _partial_path(out_path, transfer_id)
+        out_path.rename(partial_out_path)
+        out_path = partial_out_path
+
     done_msg = f"DONE,{transfer_id}".encode("utf-8")
     control_sock.sendto(done_msg, (device_ip, control_port))
-    print(f"[{device_ip}] DONE sent. Saved -> {out_path}")
+    print(f"[{device_ip}] DONE sent. Saved ({integrity_status}) -> {out_path}")
     transfer_seconds = time.monotonic() - transfer_start
     print(f"[{device_ip}] Transfer time: {transfer_seconds:.2f}s")
 
-    if device_uid and log_root:
+    should_mark_received = integrity_status == "verified" or (
+        integrity_status != "verified" and mark_partial_received
+    )
+    if device_uid and log_root and should_mark_received:
         append_file_receive_log(
             log_root=log_root,
             device_uid=device_uid,

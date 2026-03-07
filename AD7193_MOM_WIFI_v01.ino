@@ -22,6 +22,7 @@
 #include <LiquidCrystal.h>
 #include <SD.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
 #include "Time.h"
@@ -62,6 +63,9 @@ String deviceID_6;
 bool wifiModeActive = false;
 bool wifiInitialized = false;
 bool sdReady = false;
+bool wifiSessionLatched = false;
+bool wifiSessionDoneRequested = false;
+unsigned long wifiLastActivityMs = 0;
 IPAddress targetIp;
 WiFiUDP udp;
 
@@ -70,10 +74,12 @@ const char LIST_FILES_MESSAGE[] = "LIST_FILES";
 const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
+const char DONE_MESSAGE[] = "DONE";
 
-const uint8_t START_HOUR = 10;
-const uint8_t END_HOUR = 12;
+const uint8_t START_HOUR = 14;
+const uint8_t END_HOUR = 16;
 const size_t FILE_CHUNK_SIZE = 1024;
+const unsigned long WIFI_SESSION_IDLE_TIMEOUT_MS = 180000UL;
 
 /////////////////////
 //  set constants
@@ -215,6 +221,9 @@ void enterWifiMode() {
   }
   udp.begin(UDP_LOCAL_PORT);
   wifiInitialized = true;
+  wifiSessionLatched = false;
+  wifiSessionDoneRequested = false;
+  wifiLastActivityMs = millis();
   setLcdStatusLine1("WiFi: waiting");
 }
 
@@ -223,6 +232,8 @@ void exitWifiMode() {
   udp.stop();
   WiFi.disconnect();
   wifiInitialized = false;
+  wifiSessionLatched = false;
+  wifiSessionDoneRequested = false;
   setLcdStatusLine1("Data:");
 }
 
@@ -390,6 +401,8 @@ void serviceWifiCommands() {
 
   IPAddress remoteIp = udp.remoteIP();
   uint16_t remotePort = udp.remotePort();
+  wifiSessionLatched = true;
+  wifiLastActivityMs = millis();
 
   if (strcmp(incoming, POLL_MESSAGE) == 0) {
     String response = "ID,";
@@ -438,12 +451,23 @@ void serviceWifiCommands() {
     unsigned long epoch = strtoul(fields[1], nullptr, 10);
     if (epoch > 0) {
       RTC.adjust(DateTime((uint32_t) epoch));
+      DateTime newRtc = RTC.now();
       sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
       Serial.print(F("RTC set from controller epoch: "));
       Serial.println(epoch);
+      Serial.print(F("RTC now: "));
+      Serial.println(newRtc.timestamp(DateTime::TIMESTAMP_FULL));
     } else {
       sendUdpMessage("ERR_TIME,BAD_EPOCH", remoteIp, remotePort);
     }
+    return;
+  }
+
+  if (fieldCount >= 1 && strcmp(fields[0], DONE_MESSAGE) == 0) {
+    String transferId = (fieldCount >= 2) ? String(fields[1]) : String("T0");
+    sendUdpMessage("ACK_DONE," + transferId, remoteIp, remotePort);
+    wifiSessionDoneRequested = true;
+    return;
   }
 }
 
@@ -577,6 +601,45 @@ void setup() {
   lcd.print("                "); 
 
   ///////////////////////////
+  // RTC - Setup - turn on and off with flag
+  //.    May 7, 2024 - disable 
+  ///////////////////////////
+
+  Serial.println("RTC setup");
+  Wire.begin();
+  delay(50);
+  if (!RTC.begin()) {  // initialize RTC
+    Serial.println("RTC failed");
+  } else {
+    if (!RTC.isrunning()) {
+      Serial.println("RTC is NOT running!");
+      // following line sets the RTC to the date & time this sketch was compiled
+      RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      Serial.print("RTC initialized to compile time. ");
+      Serial.print("RTC now: ");
+      Serial.println(String(RTC.now().timestamp(DateTime::TIMESTAMP_FULL)));
+      // Serial.print("new date: ");
+      // Serial.println(F(__DATE__));
+      lcd.print("                ");
+      lcd.setCursor(0, 0);
+      lcd.print("RTC time set!");
+      lcd.setCursor(1, 1);
+      lcd.print(String(RTC.now().timestamp(DateTime::TIMESTAMP_FULL)));
+      delay(3000);
+    } else {
+      // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+            lcd.print("                ");
+      lcd.setCursor(0, 0);
+      lcd.print("RTC Running!");
+      lcd.setCursor(1, 1);
+      lcd.print(String(RTC.now().timestamp(DateTime::TIMESTAMP_FULL)));
+      Serial.println("RTC is already initialized. Time: ");
+      Serial.println(String("TIMESTAMP:\t")+RTC.now().timestamp(DateTime::TIMESTAMP_FULL));
+      delay(3000);
+    }
+  }
+
+  ///////////////////////////
   // setup ADC AD7193 on PCB from Tacuna code
   ///////////////////////////
   scale.setSPI(SPI);
@@ -595,42 +658,6 @@ void setup() {
       scale.channelSelect(AD7193_CH_0);
       Serial.println(F("AD7193 Initialized!"));
     }
-
-
-  ///////////////////////////
-  // RTC - Setup - turn on and off with flag
-  //.    May 7, 2024 - disable 
-  ///////////////////////////
-
-  Serial.println("RTC setup");
-  if (!RTC.begin()) {  // initialize RTC
-    Serial.println("RTC failed");
-  } else {
-    if (!RTC.isrunning()) {
-      Serial.println("RTC is NOT running!");
-      // following line sets the RTC to the date & time this sketch was compiled
-      // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
-      Serial.print("NOT RUNNING AND NO Time set ");
-      // Serial.print("new date: ");
-      // Serial.println(F(__DATE__));
-      lcd.print("                ");
-      lcd.setCursor(0, 0);
-      lcd.print("RTC failed!");
-      lcd.setCursor(1, 1);
-      lcd.print("Disconnect!     ");
-      delay(10000);
-    } else {
-      // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
-            lcd.print("                ");
-      lcd.setCursor(0, 0);
-      lcd.print("RTC Running!");
-      lcd.setCursor(1, 1);
-      lcd.print(String(RTC.now().timestamp(DateTime::TIMESTAMP_FULL)));
-      Serial.println("RTC is already initialized. Time: ");
-      Serial.println(String("TIMESTAMP:\t")+RTC.now().timestamp(DateTime::TIMESTAMP_FULL));
-      delay(3000);
-    }
-  }
 
 
   ///////////////////////////
@@ -751,13 +778,27 @@ void loop() {
   if (inWifiWindow && !wifiModeActive) {
     enterWifiMode();
     wifiModeActive = wifiInitialized;
-  } else if (!inWifiWindow && wifiModeActive) {
+  } else if (!inWifiWindow && wifiModeActive && !wifiSessionLatched) {
     exitWifiMode();
     wifiModeActive = false;
   }
 
   if (wifiModeActive) {
     serviceWifiCommands();
+    if (!inWifiWindow) {
+      if (wifiSessionDoneRequested) {
+        Serial.println(F("WiFi session done, exiting WiFi mode."));
+        exitWifiMode();
+        wifiModeActive = false;
+        return;
+      }
+      if (wifiSessionLatched && (millis() - wifiLastActivityMs) > WIFI_SESSION_IDLE_TIMEOUT_MS) {
+        Serial.println(F("WiFi session idle timeout, exiting WiFi mode."));
+        exitWifiMode();
+        wifiModeActive = false;
+        return;
+      }
+    }
     return;
   }
 
