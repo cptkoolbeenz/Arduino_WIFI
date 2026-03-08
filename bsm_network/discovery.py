@@ -215,6 +215,36 @@ def run_discovery(args: argparse.Namespace) -> int:
     if args.post_poll_wait > 0:
         time.sleep(args.post_poll_wait)
 
+    if args.sync_time_only:
+        if not args.sync_time:
+            print("Sync-only mode requested but --no-sync-time is set; nothing to do.")
+            sock.close()
+            return 2
+
+        ok_count = 0
+        fail_count = 0
+        for row in rows:
+            uid = str(row["unique_id"])
+            device_ip = str(row["device_ip"] or row["recv_ip"])
+            sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
+            synced = send_time_sync(
+                control_sock=sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                epoch=sync_epoch,
+                timeout_s=3.0,
+            )
+            if synced:
+                ok_count += 1
+                print(f"{uid}: RTC sync OK")
+            else:
+                fail_count += 1
+                print(f"{uid}: RTC sync failed/timeout")
+
+        print(f"RTC sync-only summary: ok={ok_count}, failed={fail_count}")
+        sock.close()
+        return 0 if fail_count == 0 else 1
+
     if args.transfer_latest_file:
         file_output_root = Path(args.file_output_dir).expanduser()
         file_log_root = Path(args.file_log_dir).expanduser()

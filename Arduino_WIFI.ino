@@ -623,12 +623,29 @@ void serviceWifiCommands() {
     unsigned long epoch = strtoul(fields[1], nullptr, 10);
     if (epoch > 0) {
       RTC.adjust(DateTime((uint32_t) epoch));
-      DateTime newRtc = RTC.now();
-      sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
-      Serial.print(F("RTC set from controller epoch: "));
-      Serial.println(epoch);
-      Serial.print(F("RTC now: "));
-      Serial.println(newRtc.timestamp(DateTime::TIMESTAMP_FULL));
+      delay(50);
+      DateTime verified((uint32_t)0);
+      bool ok = readRtcStable(verified);
+      if (ok) {
+        uint32_t r = verified.unixtime();
+        uint32_t diff = (r >= epoch) ? (r - epoch) : (epoch - r);
+        if (diff <= 5UL) {
+          sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
+          Serial.print(F("RTC set from controller epoch: "));
+          Serial.println(epoch);
+          Serial.print(F("RTC now: "));
+          Serial.println(verified.timestamp(DateTime::TIMESTAMP_FULL));
+        } else {
+          sendUdpMessage("ERR_TIME,VERIFY_MISMATCH", remoteIp, remotePort);
+          Serial.print(F("RTC verify mismatch. epoch="));
+          Serial.print(epoch);
+          Serial.print(F(" rtc="));
+          Serial.println((unsigned long) r);
+        }
+      } else {
+        sendUdpMessage("ERR_TIME,VERIFY_FAILED", remoteIp, remotePort);
+        Serial.println(F("RTC verify failed after SET_TIME."));
+      }
     } else {
       sendUdpMessage("ERR_TIME,BAD_EPOCH", remoteIp, remotePort);
     }

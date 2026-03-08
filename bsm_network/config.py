@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-time", action="store_true", help="Sync Arduino RTC from controller time before retrieval")
     parser.add_argument("--no-sync-time", action="store_false", dest="sync_time", help="Disable RTC sync command")
     parser.add_argument(
+        "--sync-time-only",
+        action="store_true",
+        help="Discover devices and run RTC sync only (no data/file retrieval)",
+    )
+    parser.add_argument(
         "--time-offset-hours",
         type=float,
         default=DEFAULT_LOCAL_OFFSET,
