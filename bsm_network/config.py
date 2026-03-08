@@ -8,9 +8,9 @@ DEFAULT_BIND_IP = "192.168.1.8"
 DEFAULT_DISCOVER_BROADCAST_IP = "192.168.1.255"
 DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
-DEFAULT_LOCAL_OFFSET = -4
+DEFAULT_LOCAL_OFFSET = -5
 DEFAULT_HOST_LABEL = "Mac"
-DEFAULT_START_HOUR = 10
+DEFAULT_START_HOUR = 8
 DEFAULT_END_HOUR = 20
 DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-dir", default="data", help="Directory for per-device downloaded CSV files (default: data)")
     parser.add_argument("--transfer-latest-file", action="store_true", help="After discovery, list remote files and transfer the latest unsaved file")
     parser.add_argument("--no-transfer-latest-file", action="store_false", dest="transfer_latest_file", help="Disable latest-file transfer after discovery")
+    parser.add_argument(
+        "--transfer-latest-even-if-seen",
+        action="store_true",
+        help="Download the most recent remote file even if it was already received before",
+    )
     parser.add_argument("--file-list-timeout", type=float, default=10.0, help="Seconds to wait for LIST_FILES response per device (default: 10.0)")
     parser.add_argument("--file-output-dir", default="data/files", help="Directory for transferred files (default: data/files)")
     parser.add_argument("--file-log-dir", default="data/file_logs", help="Directory for per-device file transfer logs (default: data/file_logs)")
@@ -74,7 +79,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
     parser.add_argument("--out-window-sleep-sec", type=float, default=45.0, help="Seconds to sleep between time checks outside schedule window (default: 45)")
     parser.add_argument("--cloud-enabled", action="store_true", dest="cloud_enabled", help="Enable cloud upload window processing")
-    parser.add_argument("--no-cloud-enabled", action="store_false", dest="cloud_enabled", help="Disable cloud upload window processing")
     parser.add_argument("--cloud-start", default=DEFAULT_CLOUD_START, help=f"Cloud upload window start in HHMM local time (default: {DEFAULT_CLOUD_START})")
     parser.add_argument("--cloud-end", default=DEFAULT_CLOUD_END, help=f"Cloud upload window end in HHMM local time (default: {DEFAULT_CLOUD_END})")
     parser.add_argument("--cloud-cycle-interval-sec", type=float, default=300.0, help="Seconds between cloud upload cycles in cloud window (default: 300)")

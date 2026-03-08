@@ -123,17 +123,36 @@ def load_received_filenames(log_root: Path, device_uid: str) -> set[str]:
     return seen
 
 
-def build_local_filename(remote_filename: str, device_uid: str) -> str:
+def build_local_filename(remote_filename: str, device_uid: str, extra_tag: str = "") -> str:
     base = Path(remote_filename).name
     stem = Path(base).stem
     suffix = Path(base).suffix or ".TXT"
 
     uid6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    tag = ""
+    if extra_tag:
+        safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", extra_tag)
+        tag = f"_{safe_tag}"
     if len(stem) == 8 and stem.isdigit():
-        return f"DL_{stem}_{uid6}{suffix.upper()}"
+        return f"DL_{stem}_{uid6}{tag}{suffix.upper()}"
 
     safe_stem = stem.replace(" ", "_")
-    return f"DL_{safe_stem}_{uid6}{suffix.upper()}"
+    return f"DL_{safe_stem}_{uid6}{tag}{suffix.upper()}"
+
+
+def ensure_unique_filename(base_name: str, output_dir: Path) -> str:
+    candidate = output_dir / base_name
+    if not candidate.exists():
+        return base_name
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    idx = 2
+    while True:
+        alt = f"{stem}_{idx}{suffix}"
+        if not (output_dir / alt).exists():
+            return alt
+        idx += 1
 
 
 def select_most_recent_unsaved_file(remote_filenames: list[str], already_received: set[str]) -> str | None:
@@ -156,3 +175,21 @@ def select_most_recent_unsaved_file(remote_filenames: list[str], already_receive
         if name not in already_received:
             return name
     return None
+
+
+def select_most_recent_file(remote_filenames: list[str]) -> str | None:
+    if not remote_filenames:
+        return None
+
+    dated: list[tuple[str, str]] = []
+    undated: list[str] = []
+    for name in remote_filenames:
+        m = re.search(r"DL(\d{6})", name.upper())
+        if m:
+            dated.append((m.group(1), name))
+        else:
+            undated.append(name)
+
+    if dated:
+        return sorted(dated, key=lambda x: x[0], reverse=True)[0][1]
+    return sorted(undated, reverse=True)[0]

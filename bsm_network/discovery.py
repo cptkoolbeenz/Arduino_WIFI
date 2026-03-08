@@ -12,8 +12,10 @@ from pathlib import Path
 from .protocol import parse_payload, request_remote_file_list, send_time_sync, transfer_file_protocol
 from .records import (
     build_local_filename,
+    ensure_unique_filename,
     load_received_filenames,
     save_device_data_csv,
+    select_most_recent_file,
     select_most_recent_unsaved_file,
     write_discovery_csv,
 )
@@ -249,21 +251,30 @@ def run_discovery(args: argparse.Namespace) -> int:
                 continue
 
             seen = load_received_filenames(file_log_root, uid)
-            next_file = select_most_recent_unsaved_file(remote_files, seen)
+            if args.transfer_latest_even_if_seen:
+                next_file = select_most_recent_file(remote_files)
+            else:
+                next_file = select_most_recent_unsaved_file(remote_files, seen)
+
             if not next_file:
                 print(f"No new files to fetch for {uid6}.")
                 continue
             print(f"{uid6}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
 
             try:
-                local_name = build_local_filename(next_file, uid)
+                extra_tag = ""
+                if args.transfer_latest_even_if_seen:
+                    extra_tag = dt.datetime.now().strftime("R%Y%m%d_%H%M%S")
+                local_name = build_local_filename(next_file, uid, extra_tag=extra_tag)
+                out_dir = file_output_root / uid6
+                local_name = ensure_unique_filename(local_name, out_dir)
                 saved_path = transfer_file_protocol(
                     control_sock=sock,
                     device_ip=device_ip,
                     control_port=args.discover_port,
                     local_bind_ip=args.bind,
                     requested_filename=next_file,
-                    output_dir=file_output_root / uid6,
+                    output_dir=out_dir,
                     device_uid=uid,
                     log_root=file_log_root,
                     local_filename=local_name,

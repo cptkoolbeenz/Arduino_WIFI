@@ -21,26 +21,41 @@ def parse_payload(payload: str) -> dict[str, str | int] | None:
     return {"device_id": device_id, "unix_time": unix_time, "sample": sample}
 
 
-def _recv_until_newline(sock: socket.socket, limit: int = 512) -> bytes:
-    data = bytearray()
-    while len(data) < limit:
-        b = sock.recv(1)
-        if not b:
-            raise ConnectionError("Socket closed while waiting for newline-terminated header")
-        data.extend(b)
-        if b == b"\n":
-            return bytes(data)
-    raise ValueError("Header exceeded maximum length")
+class _BufferedSocketReader:
+    def __init__(self, sock: socket.socket, chunk_size: int = 4096):
+        self.sock = sock
+        self.buf = bytearray()
+        self.chunk_size = chunk_size
 
+    def recv_until_newline(self, limit: int = 512) -> bytes:
+        while True:
+            idx = self.buf.find(b"\n")
+            if idx != -1:
+                line = bytes(self.buf[: idx + 1])
+                del self.buf[: idx + 1]
+                if len(line) > limit:
+                    raise ValueError("Header exceeded maximum length")
+                return line
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    chunks = bytearray()
-    while len(chunks) < n:
-        part = sock.recv(n - len(chunks))
-        if not part:
-            raise ConnectionError("Socket closed during payload read")
-        chunks.extend(part)
-    return bytes(chunks)
+            if len(self.buf) >= limit:
+                raise ValueError("Header exceeded maximum length")
+
+            part = self.sock.recv(self.chunk_size)
+            if not part:
+                raise ConnectionError("Socket closed while waiting for newline-terminated header")
+            self.buf.extend(part)
+
+    def recv_exact(self, n: int) -> bytes:
+        if n <= 0:
+            return b""
+        while len(self.buf) < n:
+            part = self.sock.recv(max(self.chunk_size, n - len(self.buf)))
+            if not part:
+                raise ConnectionError("Socket closed during payload read")
+            self.buf.extend(part)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
 
 
 def _new_transfer_id(prefix: str = "T") -> str:
@@ -197,10 +212,11 @@ def transfer_file_protocol(
     next_progress_report = 10
     integrity_status = "verified"
 
+    reader = _BufferedSocketReader(conn)
     with out_path.open("wb") as out:
         while True:
             try:
-                header = _recv_until_newline(conn).decode("utf-8", errors="replace").strip()
+                header = reader.recv_until_newline().decode("utf-8", errors="replace").strip()
             except (ConnectionError, TimeoutError, ValueError, socket.timeout) as exc:
                 if tolerant_integrity and bytes_written > 0:
                     integrity_status = "partial_no_eof"
@@ -212,19 +228,18 @@ def transfer_file_protocol(
                 continue
 
             if parts[0] == "CHUNK":
-                if len(parts) != 6 or parts[1] != transfer_id:
+                # Support both:
+                # - CHUNK,<id>,<idx>,<offset>,<len>
+                # - CHUNK,<id>,<idx>,<offset>,<len>,<crc32>
+                if len(parts) < 5 or parts[1] != transfer_id:
                     continue
-                chunk_index = int(parts[2])
+                _chunk_index = int(parts[2])
                 offset = int(parts[3])
                 payload_len = int(parts[4])
-                crc_hex = parts[5].lower()
 
-                payload = _recv_exact(conn, payload_len)
-                crc_actual = f"{(zlib.crc32(payload) & 0xFFFFFFFF):08x}"
-                if offset != expected_offset or crc_actual != crc_hex:
-                    resume_msg = f"RESUME,{transfer_id},{expected_offset}".encode("utf-8")
-                    control_sock.sendto(resume_msg, (device_ip, control_port))
-                    continue
+                payload = reader.recv_exact(payload_len)
+                if offset != expected_offset:
+                    raise ValueError(f"Chunk offset mismatch: expected={expected_offset}, got={offset}")
 
                 out.write(payload)
                 stream_crc32 = zlib.crc32(payload, stream_crc32)
@@ -235,8 +250,6 @@ def transfer_file_protocol(
                     if pct >= next_progress_report:
                         print(f"[{device_ip}] Receiving {filename}: {pct}% ({bytes_written}/{file_size})")
                         next_progress_report += 10
-                ack_msg = f"ACK_CHUNK,{transfer_id},{chunk_index}".encode("utf-8")
-                control_sock.sendto(ack_msg, (device_ip, control_port))
                 continue
 
             if parts[0] == "EOF":
