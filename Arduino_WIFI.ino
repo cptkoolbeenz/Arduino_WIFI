@@ -25,6 +25,7 @@
 #include <Wire.h>
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
+#include <limits.h>
 #include "Time.h"
 #include "RTClib.h"
 #include "secrets.h"
@@ -75,6 +76,16 @@ const char SET_TIME_MESSAGE[] = "SET_TIME";
 const uint8_t START_HOUR = 7;
 const uint8_t END_HOUR = 19;
 const size_t FILE_CHUNK_SIZE = 4096;
+const uint32_t TRIM_CALIBRATION_SECONDS = 600UL;
+const uint32_t TRIM_START_GUARD_SECONDS = 3600UL;
+const uint32_t TRIM_PRE_EVENT_SECONDS = 180UL;
+const uint32_t TRIM_POST_EVENT_SECONDS = 600UL;
+const long TRIM_TRIGGER_MIN_DELTA = 2000L;
+const float TRIM_CAL_SPLIT_FRACTION = 0.35f;
+const float TRIM_DEBOUNCE_SECONDS = 0.5f;
+const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
+const int MAX_TRIM_INTERVALS = 128;
+const bool TRIM_USE_TODAY_FILENAME = false;  // false=default to yesterday's DL file, true=use today's DL file for testing
 
 /////////////////////
 //  set constants
@@ -99,6 +110,23 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
+
+struct TrimInterval {
+  uint32_t start_ts;
+  uint32_t end_ts;
+};
+
+struct CalibrationThresholds {
+  bool ok;
+  uint32_t firstTs;
+  long baselineMean;
+  long lowCalibrationMean;
+  long enterThreshold;
+  long exitThreshold;
+};
+
+TrimInterval trimIntervals[MAX_TRIM_INTERVALS];
+int trimIntervalCount = 0;
 
 String getChipIdHex() {
   const bsp_unique_id_t *uid = R_BSP_UniqueIdGet();
@@ -215,6 +243,419 @@ int splitCsv(char *input, char *fields[], int maxFields) {
     token = strtok_r(nullptr, ",", &savePtr);
   }
   return count;
+}
+
+bool readDataLine(File &f, char *buf, size_t n) {
+  if (!f.available()) return false;
+  size_t len = f.readBytesUntil('\n', buf, n - 1);
+  buf[len] = '\0';
+  while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+    buf[len - 1] = '\0';
+    len--;
+  }
+  return len > 0;
+}
+
+bool parseDataCsvLine(char *line, long &valueOut, uint32_t &tsOut) {
+  char *comma = strchr(line, ',');
+  if (!comma) return false;
+  *comma = '\0';
+  char *left = line;
+  char *right = comma + 1;
+  while (*left == ' ' || *left == '\t') left++;
+  while (*right == ' ' || *right == '\t') right++;
+
+  char *end1 = nullptr;
+  char *end2 = nullptr;
+  long value = strtol(left, &end1, 10);
+  unsigned long ts = strtoul(right, &end2, 10);
+  if (end1 == left || end2 == right || ts == 0UL) return false;
+  valueOut = value;
+  tsOut = (uint32_t) ts;
+  return true;
+}
+
+String trimFilenameFromRaw(const String &rawName) {
+  if (rawName.length() >= 2 && rawName[0] == 'D' && rawName[1] == 'L') {
+    String out = rawName;
+    out.setCharAt(0, 'T');
+    out.setCharAt(1, 'R');
+    return out;
+  }
+  return "TR_" + rawName;
+}
+
+String dlFilenameFromEpoch(uint32_t epoch) {
+  DateTime dt(epoch);
+  int yy = dt.year() % 100;
+  int mm = dt.month();
+  int dd = dt.day();
+  char name[13];
+  snprintf(name, sizeof(name), "DL%02d%02d%02d.TXT", yy, mm, dd);
+  return String(name);
+}
+
+String trimRawFilenameByDatePolicy() {
+  DateTime nowRtc = RTC.now();
+  if (!isRtcDateSane(nowRtc)) return "";
+
+  uint32_t nowEpoch = nowRtc.unixtime();
+  uint32_t dayOffset = TRIM_USE_TODAY_FILENAME ? 0UL : 86400UL;
+  if (nowEpoch <= dayOffset) return "";
+
+  return dlFilenameFromEpoch(nowEpoch - dayOffset);
+}
+
+String findLatestRawDlFilename() {
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return "";
+
+  String best = "";
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      String n = String(entry.name());
+      if (n.length() == 11 && n.startsWith("DL") && n.endsWith(".TXT")) {
+        if (best.length() == 0 || n > best) best = n;
+      }
+    }
+    entry.close();
+  }
+  root.close();
+  return best;
+}
+
+void addTrimInterval(uint32_t startTs, uint32_t endTs) {
+  if (endTs <= startTs) return;
+  if (trimIntervalCount == 0) {
+    trimIntervals[0].start_ts = startTs;
+    trimIntervals[0].end_ts = endTs;
+    trimIntervalCount = 1;
+    return;
+  }
+  TrimInterval &last = trimIntervals[trimIntervalCount - 1];
+  if (startTs <= last.end_ts) {
+    if (endTs > last.end_ts) last.end_ts = endTs;
+    return;
+  }
+  if (trimIntervalCount >= MAX_TRIM_INTERVALS) {
+    if (endTs > last.end_ts) last.end_ts = endTs;
+    return;
+  }
+  trimIntervals[trimIntervalCount].start_ts = startTs;
+  trimIntervals[trimIntervalCount].end_ts = endTs;
+  trimIntervalCount++;
+}
+
+CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputName) {
+  CalibrationThresholds r = {false, 0UL, 0L, 0L, 0L, 0L};
+  File in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return r;
+
+  char line[96];
+  long value = 0;
+  uint32_t ts = 0;
+  bool haveFirst = false;
+  long calMin = 0;
+  long calMax = 0;
+  uint32_t firstTs = 0;
+
+  while (readDataLine(in, line, sizeof(line))) {
+    if (!parseDataCsvLine(line, value, ts)) continue;
+    if (!haveFirst) {
+      haveFirst = true;
+      firstTs = ts;
+      calMin = value;
+      calMax = value;
+    }
+    if (ts > firstTs + TRIM_CALIBRATION_SECONDS) break;
+    if (value < calMin) calMin = value;
+    if (value > calMax) calMax = value;
+  }
+  in.close();
+  if (!haveFirst) return r;
+
+  long split = calMin + (long) ((float) (calMax - calMin) * TRIM_CAL_SPLIT_FRACTION);
+  if (split < calMin + TRIM_TRIGGER_MIN_DELTA) split = calMin + TRIM_TRIGGER_MIN_DELTA;
+
+  in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return r;
+
+  double baselineMean = 0.0;
+  uint32_t baselineN = 0;
+  bool inSeg = false;
+  long segVals[1200];
+  int segValsN = 0;
+  long lowMean = LONG_MAX;
+
+  while (readDataLine(in, line, sizeof(line))) {
+    if (!parseDataCsvLine(line, value, ts)) continue;
+    if (ts > firstTs + TRIM_CALIBRATION_SECONDS) break;
+
+    if (value <= split) {
+      baselineN++;
+      double delta = (double) value - baselineMean;
+      baselineMean += delta / (double) baselineN;
+    }
+
+    bool elevated = (value > split);
+    if (elevated) {
+      if (!inSeg) {
+        inSeg = true;
+        segValsN = 0;
+      }
+      if (segValsN < (int) (sizeof(segVals) / sizeof(segVals[0]))) {
+        segVals[segValsN++] = value;
+      }
+    } else if (inSeg) {
+      if (segValsN >= 20) {
+        int s = (int) (0.30f * (float) segValsN);
+        int e = (int) (0.70f * (float) segValsN);
+        if (e <= s) e = s + 1;
+        long long sum = 0;
+        int n = 0;
+        for (int i = s; i < e && i < segValsN; i++) {
+          sum += segVals[i];
+          n++;
+        }
+        if (n > 0) {
+          long m = (long) (sum / n);
+          if (m < lowMean) lowMean = m;
+        }
+      }
+      inSeg = false;
+      segValsN = 0;
+    }
+  }
+  if (inSeg && segValsN >= 20) {
+    int s = (int) (0.30f * (float) segValsN);
+    int e = (int) (0.70f * (float) segValsN);
+    if (e <= s) e = s + 1;
+    long long sum = 0;
+    int n = 0;
+    for (int i = s; i < e && i < segValsN; i++) {
+      sum += segVals[i];
+      n++;
+    }
+    if (n > 0) {
+      long m = (long) (sum / n);
+      if (m < lowMean) lowMean = m;
+    }
+  }
+  in.close();
+
+  if (baselineN < 10) return r;
+  long baseline = (long) baselineMean;
+  if (lowMean == LONG_MAX || lowMean <= baseline + TRIM_TRIGGER_MIN_DELTA) {
+    lowMean = baseline + TRIM_TRIGGER_MIN_DELTA;
+  }
+
+  r.ok = true;
+  r.firstTs = firstTs;
+  r.baselineMean = baseline;
+  r.lowCalibrationMean = lowMean;
+  r.enterThreshold = lowMean;
+  r.exitThreshold = lowMean;
+  return r;
+}
+
+bool buildTrimIntervalsForFile(const String &inputName, const CalibrationThresholds &cal) {
+  trimIntervalCount = 0;
+  File in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return false;
+
+  char line[96];
+  long value = 0;
+  uint32_t ts = 0;
+  uint32_t firstTs = 0;
+  uint32_t lastTs = 0;
+  bool haveFirst = false;
+  bool eventLatched = false;
+  bool captureActive = false;
+  uint32_t captureUntil = 0;
+  uint32_t currentCaptureStart = 0;
+  uint32_t aboveSince = 0;
+  uint32_t belowSince = 0;
+  uint32_t parsedRows = 0;
+  uint32_t nextProgress = TRIM_PROGRESS_ROWS;
+
+  while (readDataLine(in, line, sizeof(line))) {
+    if (!parseDataCsvLine(line, value, ts)) continue;
+    parsedRows++;
+    if (!haveFirst) {
+      haveFirst = true;
+      firstTs = ts;
+      addTrimInterval(firstTs, firstTs + TRIM_CALIBRATION_SECONDS);
+    }
+    lastTs = ts;
+
+    if (ts <= firstTs + TRIM_CALIBRATION_SECONDS) continue;
+    if (ts < firstTs + TRIM_START_GUARD_SECONDS) continue;
+
+    if (value >= cal.enterThreshold) {
+      if (aboveSince == 0) aboveSince = ts;
+      belowSince = 0;
+    } else if (value <= cal.exitThreshold) {
+      if (belowSince == 0) belowSince = ts;
+      aboveSince = 0;
+    } else {
+      aboveSince = 0;
+      belowSince = 0;
+    }
+
+    if (!eventLatched && aboveSince != 0 && (ts - aboveSince) >= (uint32_t) TRIM_DEBOUNCE_SECONDS) {
+      eventLatched = true;
+      uint32_t preStart = (ts > TRIM_PRE_EVENT_SECONDS) ? (ts - TRIM_PRE_EVENT_SECONDS) : firstTs;
+      if (preStart < firstTs) preStart = firstTs;
+      if (!captureActive) {
+        captureActive = true;
+        currentCaptureStart = preStart;
+      } else if (preStart < currentCaptureStart) {
+        currentCaptureStart = preStart;
+      }
+      captureUntil = ts + TRIM_POST_EVENT_SECONDS;
+      aboveSince = 0;
+    }
+
+    if (eventLatched && belowSince != 0 && (ts - belowSince) >= (uint32_t) TRIM_DEBOUNCE_SECONDS) {
+      eventLatched = false;
+      belowSince = 0;
+    }
+
+    if (captureActive && !eventLatched && ts >= captureUntil) {
+      addTrimInterval(currentCaptureStart, captureUntil);
+      captureActive = false;
+    }
+
+    if (parsedRows >= nextProgress) {
+      Serial.print(F("TRIM analyze rows="));
+      Serial.print(parsedRows);
+      Serial.print(F(" intervals="));
+      Serial.println(trimIntervalCount);
+      nextProgress += TRIM_PROGRESS_ROWS;
+    }
+  }
+  in.close();
+  if (!haveFirst) return false;
+  if (captureActive) {
+    uint32_t endTs = (lastTs > captureUntil) ? captureUntil : lastTs;
+    addTrimInterval(currentCaptureStart, endTs);
+  }
+  return true;
+}
+
+bool writeTrimmedFileFromIntervals(const String &inputName, const String &outputName) {
+  File in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return false;
+  SD.remove(outputName.c_str());
+  File out = SD.open(outputName.c_str(), FILE_WRITE);
+  if (!out) {
+    in.close();
+    return false;
+  }
+
+  char line[96];
+  long value = 0;
+  uint32_t ts = 0;
+  int idx = 0;
+  uint32_t total = 0;
+  uint32_t kept = 0;
+  uint32_t nextProgress = TRIM_PROGRESS_ROWS;
+
+  while (readDataLine(in, line, sizeof(line))) {
+    char parse[96];
+    strncpy(parse, line, sizeof(parse) - 1);
+    parse[sizeof(parse) - 1] = '\0';
+    if (!parseDataCsvLine(parse, value, ts)) continue;
+
+    total++;
+    while (idx < trimIntervalCount && ts > trimIntervals[idx].end_ts) idx++;
+    if (idx < trimIntervalCount && ts >= trimIntervals[idx].start_ts && ts <= trimIntervals[idx].end_ts) {
+      out.println(line);
+      kept++;
+    }
+    if (total >= nextProgress) {
+      Serial.print(F("TRIM write rows="));
+      Serial.print(total);
+      Serial.print(F(" kept="));
+      Serial.println(kept);
+      nextProgress += TRIM_PROGRESS_ROWS;
+    }
+  }
+  out.close();
+  in.close();
+  Serial.print(F("TRIM done rows="));
+  Serial.print(total);
+  Serial.print(F(" kept="));
+  Serial.println(kept);
+  return true;
+}
+
+bool ensureTrimmedFileReadyForWifi() {
+  if (!sdReady) return false;
+
+  String rawName = trimRawFilenameByDatePolicy();
+  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
+    rawName = myFilename;
+  }
+  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
+    rawName = findLatestRawDlFilename();
+  }
+  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
+    Serial.println(F("TRIM skip: no raw DL file found."));
+    return false;
+  }
+
+  Serial.print(F("TRIM raw target: "));
+  Serial.println(rawName);
+
+  String trimName = trimFilenameFromRaw(rawName);
+  if (SD.exists(trimName.c_str())) {
+    File f = SD.open(trimName.c_str(), FILE_READ);
+    unsigned long sz = f ? (unsigned long) f.size() : 0UL;
+    if (f) f.close();
+    if (sz > 0) {
+      Serial.print(F("TRIM ready: "));
+      Serial.println(trimName);
+      return true;
+    }
+  }
+
+  Serial.print(F("TRIM start raw="));
+  Serial.print(rawName);
+  Serial.print(F(" out="));
+  Serial.println(trimName);
+  setLcdStatusLine1("Trim: analyze");
+
+  CalibrationThresholds cal = deriveCalibrationThresholdsFromFile(rawName);
+  if (!cal.ok) {
+    Serial.println(F("TRIM fail: calibration thresholds"));
+    setLcdStatusLine1("Trim: fail cal");
+    return false;
+  }
+  Serial.print(F("TRIM thresholds baseline="));
+  Serial.print(cal.baselineMean);
+  Serial.print(F(" low="));
+  Serial.println(cal.lowCalibrationMean);
+
+  if (!buildTrimIntervalsForFile(rawName, cal)) {
+    Serial.println(F("TRIM fail: interval build"));
+    setLcdStatusLine1("Trim: fail int");
+    return false;
+  }
+  Serial.print(F("TRIM intervals="));
+  Serial.println(trimIntervalCount);
+
+  setLcdStatusLine1("Trim: writing");
+  if (!writeTrimmedFileFromIntervals(rawName, trimName)) {
+    Serial.println(F("TRIM fail: write"));
+    setLcdStatusLine1("Trim: fail wr");
+    return false;
+  }
+
+  setLcdStatusLine1("Trim: complete");
+  return true;
 }
 
 bool connectWiFi() {
@@ -996,6 +1437,10 @@ void loop() {
   bool inWifiWindow = IsBetweenHours(unixTs);
 
   if (inWifiWindow && !wifiModeActive) {
+    if (!ensureTrimmedFileReadyForWifi()) {
+      delay(1000);
+      return;
+    }
     enterWifiMode();
     wifiModeActive = wifiInitialized;
   } else if (!inWifiWindow && wifiModeActive) {
