@@ -282,9 +282,13 @@ def run_discovery(args: argparse.Namespace) -> int:
 
             seen = load_received_filenames(file_log_root, uid)
             if args.transfer_latest_even_if_seen:
-                next_file = select_most_recent_file(remote_files)
+                next_file = select_most_recent_file(remote_files, prefer_prefix=args.prefer_file_prefix)
             else:
-                next_file = select_most_recent_unsaved_file(remote_files, seen)
+                next_file = select_most_recent_unsaved_file(
+                    remote_files,
+                    seen,
+                    prefer_prefix=args.prefer_file_prefix,
+                )
 
             if not next_file:
                 print(f"No new files to fetch for {uid6}.")

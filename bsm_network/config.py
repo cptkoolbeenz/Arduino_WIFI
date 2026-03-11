@@ -8,12 +8,13 @@ DEFAULT_BIND_IP = "192.168.1.8"
 DEFAULT_DISCOVER_BROADCAST_IP = "192.168.1.255"
 DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
-DEFAULT_LOCAL_OFFSET = -5
+DEFAULT_LOCAL_OFFSET = -4 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
 DEFAULT_HOST_LABEL = "Mac"
-DEFAULT_START_HOUR = 21
-DEFAULT_END_HOUR = 23
+DEFAULT_START_HOUR = 17
+DEFAULT_END_HOUR = 22
 DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
+DEFAULT_PREFER_FILE_PREFIX = "TR"
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-dir", default="data", help="Directory for per-device downloaded CSV files (default: data)")
     parser.add_argument("--transfer-latest-file", action="store_true", help="After discovery, list remote files and transfer the latest unsaved file")
     parser.add_argument("--no-transfer-latest-file", action="store_false", dest="transfer_latest_file", help="Disable latest-file transfer after discovery")
+    parser.add_argument(
+        "--prefer-file-prefix",
+        choices=["TR", "DL", "ANY"],
+        default=DEFAULT_PREFER_FILE_PREFIX,
+        help=f"Preferred remote file prefix when selecting latest file (default: {DEFAULT_PREFER_FILE_PREFIX})",
+    )
     parser.add_argument(
         "--transfer-latest-even-if-seen",
         action="store_true",

@@ -133,11 +133,12 @@ def build_local_filename(remote_filename: str, device_uid: str, extra_tag: str =
     if extra_tag:
         safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", extra_tag)
         tag = f"_{safe_tag}"
+    file_prefix = "TR" if stem.upper().startswith("TR") else "DL"
     if len(stem) == 8 and stem.isdigit():
-        return f"DL_{stem}_{uid6}{tag}{suffix.upper()}"
+        return f"{file_prefix}_{stem}_{uid6}{tag}{suffix.upper()}"
 
     safe_stem = stem.replace(" ", "_")
-    return f"DL_{safe_stem}_{uid6}{tag}{suffix.upper()}"
+    return f"{file_prefix}_{safe_stem}_{uid6}{tag}{suffix.upper()}"
 
 
 def ensure_unique_filename(base_name: str, output_dir: Path) -> str:
@@ -155,41 +156,85 @@ def ensure_unique_filename(base_name: str, output_dir: Path) -> str:
         idx += 1
 
 
-def select_most_recent_unsaved_file(remote_filenames: list[str], already_received: set[str]) -> str | None:
-    dated: list[tuple[str, str]] = []
+def _normalize_prefer_prefix(prefer_prefix: str) -> str:
+    p = (prefer_prefix or "TR").upper()
+    return p if p in {"TR", "DL", "ANY"} else "TR"
+
+
+def _dated_groups(remote_filenames: list[str]) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str], list[tuple[str, str, str]]]:
+    tr_dated: list[tuple[str, str]] = []
+    dl_dated: list[tuple[str, str]] = []
     undated: list[str] = []
+    all_dated: list[tuple[str, str, str]] = []
     for name in remote_filenames:
-        m = re.search(r"DL(\\d{6})", name.upper())
+        upper = name.upper()
+        m = re.search(r"(TR|DL)(\d{6})", upper)
         if m:
-            dated.append((m.group(1), name))
+            yymmdd = m.group(2)
+            prefix = m.group(1)
+            all_dated.append((yymmdd, prefix, name))
+            if prefix == "TR":
+                tr_dated.append((yymmdd, name))
+            else:
+                dl_dated.append((yymmdd, name))
         else:
             undated.append(name)
+    return tr_dated, dl_dated, undated, all_dated
 
-    # Prefer files with parseable YYMMDD token, newest date first.
-    for _, name in sorted(dated, key=lambda x: x[0], reverse=True):
-        if name not in already_received:
-            return name
 
-    # Fallback for any legacy/unexpected naming.
+def select_most_recent_unsaved_file(
+    remote_filenames: list[str],
+    already_received: set[str],
+    prefer_prefix: str = "TR",
+) -> str | None:
+    prefer = _normalize_prefer_prefix(prefer_prefix)
+    tr_dated, dl_dated, undated, all_dated = _dated_groups(remote_filenames)
+
+    if prefer == "ANY":
+        for _, _, name in sorted(all_dated, key=lambda x: x[0], reverse=True):
+            if name not in already_received:
+                return name
+    elif prefer == "DL":
+        for _, name in sorted(dl_dated, key=lambda x: x[0], reverse=True):
+            if name not in already_received:
+                return name
+        for _, name in sorted(tr_dated, key=lambda x: x[0], reverse=True):
+            if name not in already_received:
+                return name
+    else:
+        # Default: TR first, then DL.
+        for _, name in sorted(tr_dated, key=lambda x: x[0], reverse=True):
+            if name not in already_received:
+                return name
+        for _, name in sorted(dl_dated, key=lambda x: x[0], reverse=True):
+            if name not in already_received:
+                return name
+
     for name in sorted(undated, reverse=True):
         if name not in already_received:
             return name
     return None
 
 
-def select_most_recent_file(remote_filenames: list[str]) -> str | None:
+def select_most_recent_file(remote_filenames: list[str], prefer_prefix: str = "TR") -> str | None:
     if not remote_filenames:
         return None
 
-    dated: list[tuple[str, str]] = []
-    undated: list[str] = []
-    for name in remote_filenames:
-        m = re.search(r"DL(\d{6})", name.upper())
-        if m:
-            dated.append((m.group(1), name))
-        else:
-            undated.append(name)
+    prefer = _normalize_prefer_prefix(prefer_prefix)
+    tr_dated, dl_dated, undated, all_dated = _dated_groups(remote_filenames)
 
-    if dated:
-        return sorted(dated, key=lambda x: x[0], reverse=True)[0][1]
+    if prefer == "ANY":
+        if all_dated:
+            return sorted(all_dated, key=lambda x: x[0], reverse=True)[0][2]
+    elif prefer == "DL":
+        if dl_dated:
+            return sorted(dl_dated, key=lambda x: x[0], reverse=True)[0][1]
+        if tr_dated:
+            return sorted(tr_dated, key=lambda x: x[0], reverse=True)[0][1]
+    else:
+        if tr_dated:
+            return sorted(tr_dated, key=lambda x: x[0], reverse=True)[0][1]
+        if dl_dated:
+            return sorted(dl_dated, key=lambda x: x[0], reverse=True)[0][1]
+
     return sorted(undated, reverse=True)[0]

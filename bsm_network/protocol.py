@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import time
 import zlib
+import re
 from pathlib import Path
 
 from .records import append_file_receive_log
@@ -58,6 +59,25 @@ class _BufferedSocketReader:
         return out
 
 
+class _ResumeRequested(Exception):
+    def __init__(self, offset: int, reason: str):
+        super().__init__(reason)
+        self.offset = offset
+        self.reason = reason
+
+
+def _parse_tcp_disconnected_offset(err_line: str, transfer_id: str) -> int | None:
+    # Expected shape:
+    # ERROR,<transfer_id>,TCP_DISCONNECTED,<offset>
+    m = re.match(rf"^ERROR,{re.escape(transfer_id)},TCP_DISCONNECTED,(\d+)$", err_line.strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def _new_transfer_id(prefix: str = "T") -> str:
     return f"{prefix}{int(time.time() * 1000)}"
 
@@ -66,6 +86,54 @@ def _partial_path(path: Path, transfer_id: str) -> Path:
     stem = path.stem
     suffix = path.suffix
     return path.with_name(f"{stem}_PARTIAL_{transfer_id}{suffix}")
+
+
+def _open_transfer_stream(
+    control_sock: socket.socket,
+    server: socket.socket,
+    device_ip: str,
+    control_port: int,
+    transfer_id: str,
+    requested_filename: str,
+    tcp_port: int,
+    start_offset: int,
+    timeout_s: float,
+) -> tuple[socket.socket, str, int, int]:
+    start_msg = f"START_FILE,{transfer_id},{requested_filename},{tcp_port},{start_offset}".encode("utf-8")
+    control_sock.sendto(start_msg, (device_ip, control_port))
+    print(f"[{device_ip}] START_FILE sent (tcp_port={tcp_port}, offset={start_offset})")
+
+    file_size = None
+    chunk_size = None
+    filename = requested_filename
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+
+        line = data.decode("utf-8", errors="replace").strip()
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0] == "ERROR" and parts[1] == transfer_id:
+            raise RuntimeError(line)
+        if len(parts) != 5 or parts[0] != "FILE_INFO" or parts[1] != transfer_id:
+            continue
+        filename = parts[2]
+        file_size = int(parts[3])
+        chunk_size = int(parts[4])
+        print(f"[{device_ip}] FILE_INFO: name={filename} size={file_size} chunk={chunk_size}")
+        break
+
+    if file_size is None or chunk_size is None:
+        raise TimeoutError("Did not receive FILE_INFO for transfer")
+
+    conn, addr = server.accept()
+    conn.settimeout(timeout_s)
+    print(f"[{device_ip}] TCP connected from {addr[0]}:{addr[1]}")
+    return conn, filename, file_size, chunk_size
 
 
 def request_remote_file_list(
@@ -169,109 +237,158 @@ def transfer_file_protocol(
     server.settimeout(timeout_s)
     tcp_port = server.getsockname()[1]
 
-    start_msg = f"START_FILE,{transfer_id},{requested_filename},{tcp_port}".encode("utf-8")
-    control_sock.sendto(start_msg, (device_ip, control_port))
-    print(f"[{device_ip}] START_FILE sent (tcp_port={tcp_port})")
-
-    file_size = None
-    chunk_size = None
-    filename = requested_filename
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            data, (src_ip, _) = control_sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-        if src_ip != device_ip:
-            continue
-
-        line = data.decode("utf-8", errors="replace").strip()
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 5 or parts[0] != "FILE_INFO" or parts[1] != transfer_id:
-            continue
-        filename = parts[2]
-        file_size = int(parts[3])
-        chunk_size = int(parts[4])
-        print(f"[{device_ip}] FILE_INFO: name={filename} size={file_size} chunk={chunk_size}")
-        break
-
-    if file_size is None or chunk_size is None:
-        server.close()
-        raise TimeoutError("Did not receive FILE_INFO for transfer")
-
-    conn, addr = server.accept()
-    conn.settimeout(timeout_s)
-    server.close()
-    print(f"[{device_ip}] TCP connected from {addr[0]}:{addr[1]}")
-
-    final_name = local_filename if local_filename else filename
+    final_name = local_filename if local_filename else requested_filename
     out_path = output_dir / final_name
     stream_crc32 = 0
     expected_offset = 0
     bytes_written = 0
     next_progress_report = 10
     integrity_status = "verified"
+    file_size = None
+    filename = requested_filename
+    max_resume_attempts = 8
+    resume_attempts = 0
 
-    reader = _BufferedSocketReader(conn)
     with out_path.open("wb") as out:
-        while True:
+        completed = False
+        while not completed:
+            conn = None
             try:
-                header = reader.recv_until_newline().decode("utf-8", errors="replace").strip()
-            except (ConnectionError, TimeoutError, ValueError, socket.timeout) as exc:
-                if tolerant_integrity and bytes_written > 0:
-                    integrity_status = "partial_no_eof"
-                    print(f"[{device_ip}] WARNING: stream ended before valid EOF ({exc}); saving partial file.")
-                    break
-                raise
-            parts = [p.strip() for p in header.split(",")]
-            if not parts:
-                continue
+                conn, filename, session_file_size, _chunk_size = _open_transfer_stream(
+                    control_sock=control_sock,
+                    server=server,
+                    device_ip=device_ip,
+                    control_port=control_port,
+                    transfer_id=transfer_id,
+                    requested_filename=requested_filename,
+                    tcp_port=tcp_port,
+                    start_offset=expected_offset,
+                    timeout_s=timeout_s,
+                )
+                if file_size is None:
+                    file_size = session_file_size
+                elif file_size != session_file_size:
+                    raise ValueError(f"FILE_INFO size changed during resume: {file_size} -> {session_file_size}")
 
-            if parts[0] == "CHUNK":
-                # Support both:
-                # - CHUNK,<id>,<idx>,<offset>,<len>
-                # - CHUNK,<id>,<idx>,<offset>,<len>,<crc32>
-                if len(parts) < 5 or parts[1] != transfer_id:
-                    continue
-                _chunk_index = int(parts[2])
-                offset = int(parts[3])
-                payload_len = int(parts[4])
+                reader = _BufferedSocketReader(conn)
+                while True:
+                    try:
+                        header = reader.recv_until_newline().decode("utf-8", errors="replace").strip()
+                    except (ConnectionError, TimeoutError, ValueError, socket.timeout) as exc:
+                        raise _ResumeRequested(expected_offset, f"stream interrupted: {exc}") from exc
 
-                payload = reader.recv_exact(payload_len)
-                if offset != expected_offset:
-                    raise ValueError(f"Chunk offset mismatch: expected={expected_offset}, got={offset}")
+                    parts = [p.strip() for p in header.split(",")]
+                    if not parts:
+                        continue
 
-                out.write(payload)
-                stream_crc32 = zlib.crc32(payload, stream_crc32)
-                expected_offset += payload_len
-                bytes_written += payload_len
-                if file_size > 0:
-                    pct = int((bytes_written * 100) / file_size)
-                    if pct >= next_progress_report:
-                        print(f"[{device_ip}] Receiving {filename}: {pct}% ({bytes_written}/{file_size})")
-                        next_progress_report += 10
-                continue
+                    if parts[0] == "CHUNK":
+                        # Support both:
+                        # - CHUNK,<id>,<idx>,<offset>,<len>
+                        # - CHUNK,<id>,<idx>,<offset>,<len>,<crc32>
+                        if len(parts) < 5 or parts[1] != transfer_id:
+                            continue
+                        _chunk_index = int(parts[2])
+                        offset = int(parts[3])
+                        payload_len = int(parts[4])
+                        payload = reader.recv_exact(payload_len)
 
-            if parts[0] == "EOF":
-                if len(parts) != 4 or parts[1] != transfer_id:
-                    continue
-                total_bytes = int(parts[2])
-                file_crc = parts[3].lower()
-                local_crc = f"{(stream_crc32 & 0xFFFFFFFF):08x}"
-                if total_bytes != bytes_written or file_crc != local_crc:
-                    if tolerant_integrity:
-                        integrity_status = "partial_eof_mismatch"
+                        if offset < expected_offset:
+                            # Duplicate chunk after resume; ignore.
+                            continue
+                        if offset > expected_offset:
+                            raise _ResumeRequested(
+                                expected_offset,
+                                f"Chunk offset mismatch: expected={expected_offset}, got={offset}",
+                            )
+
+                        out.write(payload)
+                        stream_crc32 = zlib.crc32(payload, stream_crc32)
+                        expected_offset += payload_len
+                        bytes_written += payload_len
+                        if file_size and file_size > 0:
+                            pct = int((bytes_written * 100) / file_size)
+                            if pct >= next_progress_report:
+                                print(f"[{device_ip}] Receiving {filename}: {pct}% ({bytes_written}/{file_size})")
+                                next_progress_report += 10
+                        continue
+
+                    if parts[0] == "EOF":
+                        if len(parts) != 4 or parts[1] != transfer_id:
+                            continue
+                        total_bytes = int(parts[2])
+                        file_crc = parts[3].lower()
+                        local_crc = f"{(stream_crc32 & 0xFFFFFFFF):08x}"
+                        if total_bytes != bytes_written:
+                            raise _ResumeRequested(
+                                expected_offset,
+                                f"EOF size mismatch (remote={total_bytes}, local={bytes_written})",
+                            )
+                        if file_crc != local_crc:
+                            if tolerant_integrity:
+                                integrity_status = "partial_eof_mismatch"
+                                print(
+                                    f"[{device_ip}] WARNING: EOF mismatch (remote crc={file_crc}, local crc={local_crc}); "
+                                    "saving partial file."
+                                )
+                                completed = True
+                                break
+                            raise ValueError("EOF integrity check failed (crc mismatch)")
+                        print(f"[{device_ip}] EOF verified: bytes={total_bytes} crc32={local_crc}")
+                        completed = True
+                        break
+
+            except _ResumeRequested as exc:
+                resume_attempts += 1
+                if resume_attempts > max_resume_attempts:
+                    if tolerant_integrity and bytes_written > 0:
+                        integrity_status = "partial_resume_exhausted"
                         print(
-                            f"[{device_ip}] WARNING: EOF mismatch (remote bytes={total_bytes}, "
-                            f"local bytes={bytes_written}, remote crc={file_crc}, local crc={local_crc}); "
+                            f"[{device_ip}] WARNING: resume attempts exhausted at offset={expected_offset}; "
                             "saving partial file."
                         )
+                        completed = True
                         break
-                    raise ValueError("EOF integrity check failed (size/crc mismatch)")
-                print(f"[{device_ip}] EOF verified: bytes={total_bytes} crc32={local_crc}")
-                break
+                    raise TimeoutError(
+                        f"Resume failed after {max_resume_attempts} attempts at offset={expected_offset}: {exc.reason}"
+                    ) from exc
+                print(
+                    f"[{device_ip}] Resume attempt {resume_attempts}/{max_resume_attempts} "
+                    f"from offset={exc.offset} ({exc.reason})"
+                )
+                time.sleep(0.25)
+                continue
+            except RuntimeError as exc:
+                # Arduino may report a transport drop via UDP ERROR while we are trying to resume.
+                err_line = str(exc)
+                drop_offset = _parse_tcp_disconnected_offset(err_line, transfer_id)
+                if drop_offset is not None:
+                    expected_offset = max(expected_offset, drop_offset)
+                    resume_attempts += 1
+                    if resume_attempts > max_resume_attempts:
+                        if tolerant_integrity and bytes_written > 0:
+                            integrity_status = "partial_resume_exhausted"
+                            print(
+                                f"[{device_ip}] WARNING: resume attempts exhausted after TCP_DISCONNECTED at "
+                                f"offset={expected_offset}; saving partial file."
+                            )
+                            completed = True
+                            break
+                        raise TimeoutError(
+                            f"Resume failed after {max_resume_attempts} TCP_DISCONNECTED events at "
+                            f"offset={expected_offset}"
+                        ) from exc
+                    print(
+                        f"[{device_ip}] Resume attempt {resume_attempts}/{max_resume_attempts} "
+                        f"from offset={expected_offset} (remote TCP_DISCONNECTED)"
+                    )
+                    time.sleep(0.25)
+                    continue
+                raise
+            finally:
+                if conn is not None:
+                    conn.close()
+    server.close()
 
-    conn.close()
     if integrity_status != "verified":
         partial_out_path = _partial_path(out_path, transfer_id)
         out_path.rename(partial_out_path)
