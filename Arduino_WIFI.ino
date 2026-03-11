@@ -61,6 +61,12 @@ long int strain;  // value of the scale at any point in time
 int tCounter = 0;  // Count # loops we to thru - must be global because don't want to initialize each time
 String deviceId;
 String deviceID_6;
+bool startupCalWindowInitialized = false;
+bool startupCalWindowComplete = false;
+uint32_t startupCalWindowEndTs = 0;
+bool bootedInWifiWindow = false;
+bool wifiSessionArmed = false;
+bool wifiIdleAnnounced = false;
 bool wifiModeActive = false;
 bool wifiInitialized = false;
 bool sdReady = false;
@@ -73,10 +79,11 @@ const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
 
-const uint8_t START_HOUR = 7;
-const uint8_t END_HOUR = 19;
+const uint8_t START_HOUR = 17;
+const uint8_t END_HOUR = 21;
 const size_t FILE_CHUNK_SIZE = 4096;
-const uint32_t TRIM_CALIBRATION_SECONDS = 600UL;
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL; // seconds to allow calibration time at startup
+const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
 const uint32_t TRIM_START_GUARD_SECONDS = 3600UL;
 const uint32_t TRIM_PRE_EVENT_SECONDS = 180UL;
 const uint32_t TRIM_POST_EVENT_SECONDS = 600UL;
@@ -85,7 +92,7 @@ const float TRIM_CAL_SPLIT_FRACTION = 0.35f;
 const float TRIM_DEBOUNCE_SECONDS = 0.5f;
 const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
 const int MAX_TRIM_INTERVALS = 128;
-const bool TRIM_USE_TODAY_FILENAME = false;  // false=default to yesterday's DL file, true=use today's DL file for testing
+const bool TRIM_USE_TODAY_FILENAME = true;  // false=default to yesterday's DL file, true=use today's DL file for testing
 
 /////////////////////
 //  set constants
@@ -226,6 +233,19 @@ void setLcdStatusLine1(const String &status) {
   String text = status;
   while (text.length() < 16) text += " ";
   lcd.print(text.substring(0, 16));
+}
+
+void setLcdUidLine(bool showCalTag) {
+  if (!printLCD) return;
+  lcd.setCursor(0, 1);
+  String line2 = "UID: " + deviceID_6;
+  if (showCalTag) {
+    while (line2.length() < 13) line2 += " ";
+    line2 += "CAL";
+  } else {
+    while (line2.length() < 16) line2 += " ";
+  }
+  lcd.print(line2.substring(0, 16));
 }
 
 void sendUdpMessage(const String &msg, const IPAddress &ip, uint16_t port) {
@@ -1397,8 +1417,7 @@ void setup() {
   } else {
     lcd.setCursor(0, 0);
     lcd.print("Data:           ");
-    lcd.setCursor(0, 1);
-    lcd.print("UID: " + deviceID_6 + "      ");
+    setLcdUidLine(false);
     lcd.setCursor(6, 0);
     lcd.print(Get_Data());  // do this while we are messing with closing the datafile
   }
@@ -1425,8 +1444,7 @@ void setup() {
   if (printLCD) {
     lcd.setCursor(0, 0);
     lcd.print("Data:           ");
-    lcd.setCursor(0, 1);
-    lcd.print("UID: " + deviceID_6 + "      ");
+    setLcdUidLine(false);
   }
 }
 
@@ -1436,23 +1454,74 @@ void loop() {
   uint32_t unixTs = Get_TimeStamp();
   bool inWifiWindow = IsBetweenHours(unixTs);
 
-  if (inWifiWindow && !wifiModeActive) {
+  // Always capture 10 minutes of raw data after each reboot before any WiFi workflow.
+  if (!startupCalWindowInitialized) {
+    startupCalWindowInitialized = true;
+    startupCalWindowComplete = false;
+    startupCalWindowEndTs = unixTs + STARTUP_CAL_CAPTURE_SECONDS;
+    bootedInWifiWindow = inWifiWindow;
+    wifiSessionArmed = bootedInWifiWindow;  // WiFi session only allowed after reboot that occurred in WiFi window.
+    Serial.print(F("Startup capture begin. bootedInWifiWindow="));
+    Serial.println(bootedInWifiWindow ? F("YES") : F("NO"));
+    if (printLCD) {
+      setLcdStatusLine1("Data:");
+      setLcdUidLine(true);
+    }
+  }
+
+  if (!startupCalWindowComplete) {
+    runAcquisitionCycle(unixTs);
+    if (unixTs >= startupCalWindowEndTs) {
+      startupCalWindowComplete = true;
+      Serial.println(F("Startup capture complete."));
+      if (printLCD) {
+        setLcdStatusLine1("Data:");
+        setLcdUidLine(false);
+      }
+    }
+    return;
+  }
+
+  // If already in live WiFi mode, keep servicing commands.
+  if (wifiModeActive) {
+    if (!inWifiWindow) {
+      exitWifiMode();
+      wifiModeActive = false;
+      wifiIdleAnnounced = false;
+    } else {
+      serviceWifiCommands();
+    }
+    return;
+  }
+
+  // In WiFi window: acquisition must remain stopped.
+  if (inWifiWindow) {
+    if (!wifiSessionArmed) {
+      if (!wifiIdleAnnounced) {
+        Serial.println(F("WiFi window active. Waiting for reboot-armed session."));
+        wifiIdleAnnounced = true;
+      }
+      if (printLCD) setLcdStatusLine1("WiFi: reboot req");
+      delay(250);
+      return;
+    }
+
+    // Reboot-armed path: trim first, then open WiFi listener.
     if (!ensureTrimmedFileReadyForWifi()) {
       delay(1000);
       return;
     }
     enterWifiMode();
     wifiModeActive = wifiInitialized;
-  } else if (!inWifiWindow && wifiModeActive) {
-    exitWifiMode();
-    wifiModeActive = false;
-  }
-
-  if (wifiModeActive) {
-    serviceWifiCommands();
+    if (wifiModeActive) {
+      wifiSessionArmed = false;  // consume one armed session per reboot
+      wifiIdleAnnounced = false;
+    }
     return;
   }
 
+  // Outside WiFi window: normal acquisition.
+  wifiIdleAnnounced = false;
   runAcquisitionCycle(unixTs);
 }
 
