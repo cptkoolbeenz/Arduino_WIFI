@@ -30,8 +30,7 @@
 #include "RTClib.h"
 #include "secrets.h"
 
-// Define variables
-// --------------------
+// Runtime state and hardware handles.
 File myFile;
 String myFilename;
 
@@ -58,15 +57,18 @@ LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 PRDC_AD7193 scale;
 long int strain;  // value of the scale at any point in time
 
-int tCounter = 0;  // Count # loops we to thru - must be global because don't want to initialize each time
+// Main loop cycle counter (debug/visibility only).
+int tCounter = 0;
 String deviceId;
 String deviceID_6;
+// Startup calibration-window state machine flags.
 bool startupCalWindowInitialized = false;
 bool startupCalWindowComplete = false;
 uint32_t startupCalWindowEndTs = 0;
 bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
 bool wifiIdleAnnounced = false;
+// WiFi/SD transport state flags.
 bool wifiModeActive = false;
 bool wifiInitialized = false;
 bool sdReady = false;
@@ -79,26 +81,41 @@ const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
 
+// Time window for WiFi phase (hours in local controller time).
 const uint8_t START_HOUR = 17;
 const uint8_t END_HOUR = 21;
+// TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL; // seconds to allow calibration time at startup
+// Mandatory raw-capture period immediately after reboot.
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL;
+// Duration from file start treated as calibration section for trim logic.
 const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
+// Optional guard from file start before event detection can begin.
 const uint32_t TRIM_START_GUARD_SECONDS = 3600UL;
+// Seconds of context retained before event trigger time.
 const uint32_t TRIM_PRE_EVENT_SECONDS = 180UL;
+// Seconds retained after event trigger time.
 const uint32_t TRIM_POST_EVENT_SECONDS = 600UL;
+// Minimum threshold distance above baseline used in trim detection.
 const long TRIM_TRIGGER_MIN_DELTA = 2000L;
+// Fraction used to split calibration values into baseline vs elevated segments.
 const float TRIM_CAL_SPLIT_FRACTION = 0.35f;
+// Debounce hold time in seconds for event enter/exit state.
 const float TRIM_DEBOUNCE_SECONDS = 0.5f;
+// Progress logging frequency while analyzing/writing trim files.
 const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
+// Maximum merged keep-intervals stored in RAM for trim pass.
 const int MAX_TRIM_INTERVALS = 128;
-const bool TRIM_USE_TODAY_FILENAME = true;  // false=default to yesterday's DL file, true=use today's DL file for testing
+// Raw file selection policy for trim phase.
+// false: default to yesterday's DL file
+// true : use today's DL file (test mode)
+const bool TRIM_USE_TODAY_FILENAME = true;
 
 /////////////////////
 //  set constants
 /////////////////////
 // set the samples to average when getting data - thru 2025 was 80 which gave 56.9hz - use 70 -> 59 at home
-const int myAVG = 70;
+const int myAVG = 80;
 
 // initialize variables for SD -- use chipSelect = 4 without RTC board
 const int chipSelect = 10;  // for the Wigoneer board and Adafruit board
@@ -118,11 +135,13 @@ const bool debug = false;
 // flag for countdown
 const bool countdown = true;
 
+// Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
   uint32_t start_ts;
   uint32_t end_ts;
 };
 
+// Calibration-derived thresholds for trim event detection.
 struct CalibrationThresholds {
   bool ok;
   uint32_t firstTs;
@@ -135,6 +154,10 @@ struct CalibrationThresholds {
 TrimInterval trimIntervals[MAX_TRIM_INTERVALS];
 int trimIntervalCount = 0;
 
+/***********************
+ * Returns the MCU unique ID as a 32-hex-character string.
+ * @return Device unique identifier (uppercase hex).
+ ***********************/
 String getChipIdHex() {
   const bsp_unique_id_t *uid = R_BSP_UniqueIdGet();
   char id[33];
@@ -149,6 +172,11 @@ String getChipIdHex() {
   return String(id);
 }
 
+/***********************
+ * Validates RTC date range to reject invalid/uninitialized reads.
+ * @param dt RTC date-time to validate.
+ * @return True when date components are in expected ranges.
+ ***********************/
 bool isRtcDateSane(const DateTime &dt) {
   int y = dt.year();
   int m = dt.month();
@@ -156,6 +184,11 @@ bool isRtcDateSane(const DateTime &dt) {
   return (y >= 2024 && y <= 2099 && m >= 1 && m <= 12 && d >= 1 && d <= 31);
 }
 
+/***********************
+ * Reads RTC repeatedly until values are stable/sane.
+ * @param out Populated with a stable DateTime on success.
+ * @return True if a stable/sane time was obtained; false otherwise.
+ ***********************/
 bool readRtcStable(DateTime &out) {
   DateTime prev((uint32_t)0);
   bool hasPrev = false;
@@ -182,6 +215,11 @@ bool readRtcStable(DateTime &out) {
   return false;
 }
 
+/***********************
+ * Attempts RTC.begin() with retries.
+ * @param attempts Number of begin attempts.
+ * @return True if RTC initialized; false if all attempts fail.
+ ***********************/
 bool beginRtcWithRetry(uint8_t attempts = 3) {
   for (uint8_t i = 0; i < attempts; ++i) {
     if (RTC.begin()) return true;
@@ -190,6 +228,10 @@ bool beginRtcWithRetry(uint8_t attempts = 3) {
   return false;
 }
 
+/***********************
+ * Attempts to recover a stuck I2C bus by pulsing SCL.
+ * Used after reset when peripherals may still be powered.
+ ***********************/
 void recoverI2CBus() {
   // Attempt to recover a stuck I2C bus after MCU reset while peripherals remain powered.
   pinMode(SDA, INPUT_PULLUP);
@@ -210,6 +252,13 @@ void recoverI2CBus() {
   }
 }
 
+/***********************
+ * Incremental CRC32 update helper.
+ * @param crc Current CRC state.
+ * @param data Byte buffer.
+ * @param len Number of bytes.
+ * @return Updated CRC32 value.
+ ***********************/
 uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
   crc = ~crc;
   for (size_t i = 0; i < len; ++i) {
@@ -221,12 +270,21 @@ uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
   return ~crc;
 }
 
+/***********************
+ * Formats CRC32 value as 8-char uppercase hex.
+ * @param value CRC32 value.
+ * @return Hex string.
+ ***********************/
 String crc32Hex(uint32_t value) {
   char out[9];
   snprintf(out, sizeof(out), "%08lX", (unsigned long) value);
   return String(out);
 }
 
+/***********************
+ * Writes status text to LCD line 1 (padded/truncated to 16 chars).
+ * @param status Text to show.
+ ***********************/
 void setLcdStatusLine1(const String &status) {
   if (!printLCD) return;
   lcd.setCursor(0, 0);
@@ -235,6 +293,10 @@ void setLcdStatusLine1(const String &status) {
   lcd.print(text.substring(0, 16));
 }
 
+/***********************
+ * Writes UID line to LCD line 2, optionally appending CAL tag.
+ * @param showCalTag True to show trailing "CAL", false to clear it.
+ ***********************/
 void setLcdUidLine(bool showCalTag) {
   if (!printLCD) return;
   lcd.setCursor(0, 1);
@@ -248,12 +310,25 @@ void setLcdUidLine(bool showCalTag) {
   lcd.print(line2.substring(0, 16));
 }
 
+/***********************
+ * Sends one UDP text message.
+ * @param msg Message payload.
+ * @param ip Destination IP.
+ * @param port Destination UDP port.
+ ***********************/
 void sendUdpMessage(const String &msg, const IPAddress &ip, uint16_t port) {
   udp.beginPacket(ip, port);
   udp.print(msg);
   udp.endPacket();
 }
 
+/***********************
+ * CSV splitter in-place using strtok_r.
+ * @param input Mutable C-string to split.
+ * @param fields Output pointers to tokens.
+ * @param maxFields Capacity of fields[].
+ * @return Number of parsed fields.
+ ***********************/
 int splitCsv(char *input, char *fields[], int maxFields) {
   int count = 0;
   char *savePtr = nullptr;
@@ -265,6 +340,13 @@ int splitCsv(char *input, char *fields[], int maxFields) {
   return count;
 }
 
+/***********************
+ * Reads one newline-terminated data line from SD file.
+ * @param f Open SD File.
+ * @param buf Output buffer.
+ * @param n Buffer size.
+ * @return True when a non-empty line was read.
+ ***********************/
 bool readDataLine(File &f, char *buf, size_t n) {
   if (!f.available()) return false;
   size_t len = f.readBytesUntil('\n', buf, n - 1);
@@ -276,6 +358,13 @@ bool readDataLine(File &f, char *buf, size_t n) {
   return len > 0;
 }
 
+/***********************
+ * Parses "value, unix_time" CSV row.
+ * @param line Mutable CSV line.
+ * @param valueOut Parsed sample value.
+ * @param tsOut Parsed unix timestamp.
+ * @return True when parsing succeeds.
+ ***********************/
 bool parseDataCsvLine(char *line, long &valueOut, uint32_t &tsOut) {
   char *comma = strchr(line, ',');
   if (!comma) return false;
@@ -295,6 +384,11 @@ bool parseDataCsvLine(char *line, long &valueOut, uint32_t &tsOut) {
   return true;
 }
 
+/***********************
+ * Converts raw filename prefix DL->TR.
+ * @param rawName Raw filename (typically DL*.TXT).
+ * @return Trim filename.
+ ***********************/
 String trimFilenameFromRaw(const String &rawName) {
   if (rawName.length() >= 2 && rawName[0] == 'D' && rawName[1] == 'L') {
     String out = rawName;
@@ -305,6 +399,11 @@ String trimFilenameFromRaw(const String &rawName) {
   return "TR_" + rawName;
 }
 
+/***********************
+ * Builds DL filename from epoch date.
+ * @param epoch Unix epoch seconds.
+ * @return Filename in DLYYMMDD.TXT format.
+ ***********************/
 String dlFilenameFromEpoch(uint32_t epoch) {
   DateTime dt(epoch);
   int yy = dt.year() % 100;
@@ -315,6 +414,10 @@ String dlFilenameFromEpoch(uint32_t epoch) {
   return String(name);
 }
 
+/***********************
+ * Chooses trim target raw filename by date policy.
+ * @return Selected DL filename or empty string if unavailable.
+ ***********************/
 String trimRawFilenameByDatePolicy() {
   DateTime nowRtc = RTC.now();
   if (!isRtcDateSane(nowRtc)) return "";
@@ -326,6 +429,10 @@ String trimRawFilenameByDatePolicy() {
   return dlFilenameFromEpoch(nowEpoch - dayOffset);
 }
 
+/***********************
+ * Scans SD root and returns latest DL*.TXT by lexical date token.
+ * @return Latest matching filename or empty string.
+ ***********************/
 String findLatestRawDlFilename() {
   File root = SD.open("/");
   if (!root || !root.isDirectory()) return "";
@@ -346,6 +453,11 @@ String findLatestRawDlFilename() {
   return best;
 }
 
+/***********************
+ * Adds/merges a keep-interval for trim output.
+ * @param startTs Interval start timestamp.
+ * @param endTs Interval end timestamp.
+ ***********************/
 void addTrimInterval(uint32_t startTs, uint32_t endTs) {
   if (endTs <= startTs) return;
   if (trimIntervalCount == 0) {
@@ -368,6 +480,11 @@ void addTrimInterval(uint32_t startTs, uint32_t endTs) {
   trimIntervalCount++;
 }
 
+/***********************
+ * Derives baseline/low thresholds from file calibration section.
+ * @param inputName Raw SD filename to analyze.
+ * @return CalibrationThresholds with ok=false when derivation fails.
+ ***********************/
 CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputName) {
   CalibrationThresholds r = {false, 0UL, 0L, 0L, 0L, 0L};
   File in = SD.open(inputName.c_str(), FILE_READ);
@@ -480,6 +597,12 @@ CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputNam
   return r;
 }
 
+/***********************
+ * Builds merged trim keep-intervals using event detection rules.
+ * @param inputName Raw SD filename.
+ * @param cal Thresholds derived from calibration section.
+ * @return True on success.
+ ***********************/
 bool buildTrimIntervalsForFile(const String &inputName, const CalibrationThresholds &cal) {
   trimIntervalCount = 0;
   File in = SD.open(inputName.c_str(), FILE_READ);
@@ -565,6 +688,12 @@ bool buildTrimIntervalsForFile(const String &inputName, const CalibrationThresho
   return true;
 }
 
+/***********************
+ * Writes trimmed file by copying rows that fall inside keep-intervals.
+ * @param inputName Source raw filename.
+ * @param outputName Destination trim filename.
+ * @return True on successful write.
+ ***********************/
 bool writeTrimmedFileFromIntervals(const String &inputName, const String &outputName) {
   File in = SD.open(inputName.c_str(), FILE_READ);
   if (!in) return false;
@@ -612,6 +741,11 @@ bool writeTrimmedFileFromIntervals(const String &inputName, const String &output
   return true;
 }
 
+/***********************
+ * Ensures a TR file exists and is ready before WiFi upload session.
+ * If TR exists and non-empty, skip re-trim; otherwise build it.
+ * @return True when TR file is ready for transfer.
+ ***********************/
 bool ensureTrimmedFileReadyForWifi() {
   if (!sdReady) return false;
 
@@ -678,6 +812,10 @@ bool ensureTrimmedFileReadyForWifi() {
   return true;
 }
 
+/***********************
+ * Connects STA WiFi with retries.
+ * @return True when connected and local IP assigned.
+ ***********************/
 bool connectWiFi() {
   int status = WiFi.status();
   if (status == WL_NO_MODULE) {
@@ -712,6 +850,10 @@ bool connectWiFi() {
   return true;
 }
 
+/***********************
+ * Resolves UDP target host/IP from secrets configuration.
+ * @return True when targetIp is valid.
+ ***********************/
 bool resolveTargetIp() {
 #ifdef UDP_TARGET_HOST
   if (WiFi.hostByName(UDP_TARGET_HOST, targetIp) == 1) {
@@ -726,6 +868,9 @@ bool resolveTargetIp() {
   return false;
 }
 
+/***********************
+ * Prints WiFi diagnostics to Serial/LCD.
+ ***********************/
 void showWiFiInfo() {
   Serial.print(F("SSID: "));
   Serial.println(WiFi.SSID());
@@ -760,6 +905,9 @@ void showWiFiInfo() {
   delay(1200);
 }
 
+/***********************
+ * One-time startup WiFi self-check (connect, print info, disconnect).
+ ***********************/
 void runStartupWiFiCheck() {
   Serial.println(F("Startup WiFi check..."));
   if (!connectWiFi()) {
@@ -815,6 +963,9 @@ void runStartupWiFiCheck() {
   Serial.println(F("Startup WiFi check done."));
 }
 
+/***********************
+ * Enters active WiFi command mode (connect + UDP bind).
+ ***********************/
 void enterWifiMode() {
   Serial.println(F("Entering WiFi mode"));
   setLcdStatusLine1("WiFi: connect");
@@ -831,6 +982,9 @@ void enterWifiMode() {
   setLcdStatusLine1("WiFi: waiting");
 }
 
+/***********************
+ * Leaves WiFi command mode and returns to local data state.
+ ***********************/
 void exitWifiMode() {
   Serial.println(F("Exiting WiFi mode"));
   udp.stop();
@@ -839,6 +993,12 @@ void exitWifiMode() {
   setLcdStatusLine1("Data:");
 }
 
+/***********************
+ * Sends remote file list over UDP control channel.
+ * @param transferId Transfer correlation ID.
+ * @param replyIp Destination IP for replies.
+ * @param replyPort Destination UDP port for replies.
+ ***********************/
 void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t replyPort) {
   if (!sdReady) {
     sendUdpMessage("ERROR," + transferId + ",SD_NOT_READY,SD init failed", replyIp, replyPort);
@@ -880,6 +1040,16 @@ void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t r
   sendUdpMessage("FILE_LIST_END," + transferId, replyIp, replyPort);
 }
 
+/***********************
+ * Streams one remote file over TCP using CHUNK headers.
+ * @param transferId Transfer correlation ID.
+ * @param filename Remote filename requested by controller.
+ * @param controllerIp Controller IP for TCP connect.
+ * @param controllerTcpPort Controller TCP listening port.
+ * @param startOffset Byte offset for resume/start.
+ * @param replyIp UDP reply IP.
+ * @param replyPort UDP reply port.
+ ***********************/
 void sendFileOverTcp(
   const String &transferId,
   const String &filename,
@@ -1020,6 +1190,10 @@ void sendFileOverTcp(
   setLcdStatusLine1("Xfer: done");
 }
 
+/***********************
+ * Handles inbound UDP control commands while in WiFi mode.
+ * Commands include polling, list files, start file transfer, and RTC sync.
+ ***********************/
 void serviceWifiCommands() {
   if (!wifiInitialized) return;
   int packetSize = udp.parsePacket();
@@ -1114,6 +1288,10 @@ void serviceWifiCommands() {
   }
 }
 
+/***********************
+ * Performs one acquisition batch and appends it to current data file.
+ * @param unixTs Timestamp value recorded for this acquisition batch.
+ ***********************/
 void runAcquisitionCycle(uint32_t unixTs) {
   unsigned long sampleValue;
   File dataFile = SD.open(myFilename, FILE_WRITE);
@@ -1151,6 +1329,10 @@ void runAcquisitionCycle(uint32_t unixTs) {
 ////////////////////
 //  Get_Data - encapsulate data access to test different ideas - for now, very simple - would it be faster if we didn't use it at all?
 ////
+/***********************
+ * Reads averaged ADC sample from load cell front-end.
+ * @return Averaged ADC reading.
+ ***********************/
 long int Get_Data() {
   // return (scale.read()); // different mode of the amplifier? From chris Lange
   return scale.continuousReadAverage(myAVG);
@@ -1159,6 +1341,10 @@ long int Get_Data() {
 ////////////////////
 //  Get_TimeStamp - encapsulate data in case we change libraries
 ////
+/***********************
+ * Reads current RTC unix timestamp.
+ * @return Unix time in seconds.
+ ***********************/
 long int Get_TimeStamp() {
   /* GET CURRENT TIME FROM RTC */
   currenttime = RTC.now();
@@ -1169,6 +1355,10 @@ long int Get_TimeStamp() {
 ////////////////////
 //  Get_TimeStampString - encapsulate data in case we change the way we record time
 ////
+/***********************
+ * Reads current RTC time string.
+ * @return RTC time string in HH:MM:SS style.
+ ***********************/
 String Get_TimeStampString() {
   /* GET CURRENT TIME FROM RTC */
   currenttime = RTC.now();
@@ -1178,6 +1368,13 @@ String Get_TimeStampString() {
 ////////////////////
 //  Get_TimeStampString - encapsulate data in case we change the way we record time
 ////
+/***********************
+ * Checks whether current unix timestamp is inside configured WiFi window.
+ * @param unixTs Unix timestamp to test.
+ * @param startHour Window start hour [0..23].
+ * @param endHour Window end hour [0..23], exclusive when start<end.
+ * @return True when timestamp falls within window semantics.
+ ***********************/
 bool IsBetweenHours(uint32_t unixTs, uint8_t startHour = START_HOUR, uint8_t endHour = END_HOUR) {
   uint32_t secOfDay = unixTs % 86400UL;
   uint32_t start = (uint32_t)startHour * 3600UL;
@@ -1189,6 +1386,10 @@ bool IsBetweenHours(uint32_t unixTs, uint8_t startHour = START_HOUR, uint8_t end
 ///////////////////
 // File name function - based on RTC time - so that we have a new filename for every day "DL_MM_DD.txt"
 /////////
+/***********************
+ * Builds daily data filename from RTC date.
+ * @return Filename in DLYYMMDD.TXT format.
+ ***********************/
 String rtnFilename() {
   DateTime nowRtc = RTC.now();
   if (!isRtcDateSane(nowRtc)) {
@@ -1205,6 +1406,10 @@ String rtnFilename() {
 }
 
 
+/***********************
+ * Arduino initialization entrypoint.
+ * Sets up peripherals, RTC, SD, diagnostics, and initial display state.
+ ***********************/
 void setup() {
 
   ////////// 
@@ -1449,6 +1654,13 @@ void setup() {
 }
 
 
+/***********************
+ * Main runtime state machine.
+ * - startup calibration capture window
+ * - no-acquisition WiFi window behavior
+ * - optional trim + WiFi command mode
+ * - normal acquisition outside WiFi window
+ ***********************/
 void loop() {
   tCounter = tCounter + 1;
   uint32_t unixTs = Get_TimeStamp();
