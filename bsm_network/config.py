@@ -10,11 +10,12 @@ DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
 DEFAULT_LOCAL_OFFSET = -4 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
 DEFAULT_HOST_LABEL = "Mac"
-DEFAULT_START_HOUR = 17
-DEFAULT_END_HOUR = 22
+DEFAULT_START_HOUR = 10
+DEFAULT_END_HOUR = 18
 DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
 DEFAULT_PREFER_FILE_PREFIX = "TR"
+DEFAULT_FILE_DAY = "yesterday"
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(
         discover=True,
         transfer_latest_file=True,
-        sync_time=True,
+        sync_time=False,
         cloud_enabled=True,
     )
     parser.add_argument("--bind", default=DEFAULT_BIND_IP, help=f"Local interface/IP to bind (default: {DEFAULT_BIND_IP})")
@@ -71,6 +72,12 @@ def parse_args() -> argparse.Namespace:
         "--transfer-latest-even-if-seen",
         action="store_true",
         help="Download the most recent remote file even if it was already received before",
+    )
+    parser.add_argument(
+        "--file-day",
+        choices=["yesterday", "today", "latest"],
+        default=DEFAULT_FILE_DAY,
+        help=f"Which remote file day to target during transfer (default: {DEFAULT_FILE_DAY})",
     )
     parser.add_argument("--file-list-timeout", type=float, default=10.0, help="Seconds to wait for LIST_FILES response per device (default: 10.0)")
     parser.add_argument("--file-output-dir", default="data/files", help="Directory for transferred files (default: data/files)")

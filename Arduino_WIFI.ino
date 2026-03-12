@@ -68,6 +68,7 @@ uint32_t startupCalWindowEndTs = 0;
 bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
 bool wifiIdleAnnounced = false;
+uint32_t wifiOutWindowSinceTs = 0;
 // WiFi/SD transport state flags.
 bool wifiModeActive = false;
 bool wifiInitialized = false;
@@ -82,16 +83,17 @@ const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
 
 // Time window for WiFi phase (hours in local controller time).
-const uint8_t START_HOUR = 17;
-const uint8_t END_HOUR = 21;
+const uint8_t START_HOUR = 7;
+const uint8_t END_HOUR = 17;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL;
+// Set to 300s for normal time to reach WiFi mode quickly after reboot.
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 300UL;
 // Duration from file start treated as calibration section for trim logic.
-const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
+const uint32_t TRIM_CALIBRATION_SECONDS = 300UL;
 // Optional guard from file start before event detection can begin.
-const uint32_t TRIM_START_GUARD_SECONDS = 3600UL;
+const uint32_t TRIM_START_GUARD_SECONDS = TRIM_CALIBRATION_SECONDS;
 // Seconds of context retained before event trigger time.
 const uint32_t TRIM_PRE_EVENT_SECONDS = 180UL;
 // Seconds retained after event trigger time.
@@ -106,6 +108,8 @@ const float TRIM_DEBOUNCE_SECONDS = 0.5f;
 const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
 // Maximum merged keep-intervals stored in RAM for trim pass.
 const int MAX_TRIM_INTERVALS = 128;
+// Require this many seconds continuously outside the WiFi window before leaving WiFi mode.
+const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
 // Raw file selection policy for trim phase.
 // false: default to yesterday's DL file
 // true : use today's DL file (test mode)
@@ -1697,10 +1701,22 @@ void loop() {
   // If already in live WiFi mode, keep servicing commands.
   if (wifiModeActive) {
     if (!inWifiWindow) {
-      exitWifiMode();
-      wifiModeActive = false;
-      wifiIdleAnnounced = false;
+      if (wifiOutWindowSinceTs == 0) {
+        wifiOutWindowSinceTs = unixTs;
+        Serial.println(F("WiFi out-of-window detected; debounce started."));
+      }
+      bool exitNow = (unixTs >= wifiOutWindowSinceTs + WIFI_EXIT_DEBOUNCE_SECONDS);
+      if (exitNow) {
+        exitWifiMode();
+        wifiModeActive = false;
+        wifiIdleAnnounced = false;
+        wifiOutWindowSinceTs = 0;
+      } else {
+        // Keep processing commands during debounce window to tolerate transient RTC/window glitches.
+        serviceWifiCommands();
+      }
     } else {
+      wifiOutWindowSinceTs = 0;
       serviceWifiCommands();
     }
     return;
@@ -1728,6 +1744,7 @@ void loop() {
     if (wifiModeActive) {
       wifiSessionArmed = false;  // consume one armed session per reboot
       wifiIdleAnnounced = false;
+      wifiOutWindowSinceTs = 0;
     }
     return;
   }

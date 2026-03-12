@@ -20,6 +20,18 @@ from .records import (
     write_discovery_csv,
 )
 
+def _resolve_target_yymmdd(args: argparse.Namespace) -> str | None:
+    mode = (getattr(args, "file_day", "yesterday") or "yesterday").lower()
+    if mode == "latest":
+        return None
+
+    now_ref = dt.datetime.utcnow() + dt.timedelta(hours=float(args.time_offset_hours))
+    if mode == "today":
+        target = now_ref
+    else:
+        target = now_ref - dt.timedelta(days=1)
+    return target.strftime("%y%m%d")
+
 
 def detect_lan_ip() -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -248,6 +260,12 @@ def run_discovery(args: argparse.Namespace) -> int:
     if args.transfer_latest_file:
         file_output_root = Path(args.file_output_dir).expanduser()
         file_log_root = Path(args.file_log_dir).expanduser()
+        target_yymmdd = _resolve_target_yymmdd(args)
+        day_mode = (getattr(args, "file_day", "yesterday") or "yesterday").lower()
+        if target_yymmdd:
+            print(f"Transfer selection mode: {day_mode} ({target_yymmdd}), prefix={args.prefer_file_prefix}")
+        else:
+            print(f"Transfer selection mode: latest available, prefix={args.prefer_file_prefix}")
         for row in rows:
             uid = str(row["unique_id"])
             uid6 = (uid[-6:] if len(uid) >= 6 else uid).upper()
@@ -282,12 +300,17 @@ def run_discovery(args: argparse.Namespace) -> int:
 
             seen = load_received_filenames(file_log_root, uid)
             if args.transfer_latest_even_if_seen:
-                next_file = select_most_recent_file(remote_files, prefer_prefix=args.prefer_file_prefix)
+                next_file = select_most_recent_file(
+                    remote_files,
+                    prefer_prefix=args.prefer_file_prefix,
+                    target_yymmdd=target_yymmdd,
+                )
             else:
                 next_file = select_most_recent_unsaved_file(
                     remote_files,
                     seen,
                     prefer_prefix=args.prefer_file_prefix,
+                    target_yymmdd=target_yymmdd,
                 )
 
             if not next_file:

@@ -8,17 +8,41 @@ import subprocess
 from pathlib import Path
 
 
-def _load_sent_set(sent_log: Path) -> set[str]:
+def _logical_key_from_relative_path(relative_path: str) -> str:
+    rel = relative_path.replace("\\", "/").strip("/")
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) < 2:
+        return f"PATH:{rel}"
+
+    uid6 = parts[0].upper()
+    stem = Path(parts[-1]).stem.upper()
+    # Expected local naming: TR_<REMOTE_STEM>_<UID6>[_TAG].TXT or DL_...
+    # Deduping key should be by device + source file stem, not local retry tag.
+    tokens = stem.split("_")
+    if len(tokens) >= 3:
+        source_stem = tokens[1]
+        uid_from_name = tokens[2]
+        if uid_from_name:
+            uid6 = uid_from_name.upper()
+        if source_stem:
+            return f"{uid6}:{source_stem}"
+
+    return f"PATH:{rel}"
+
+
+def _load_sent_set(sent_log: Path) -> tuple[set[str], set[str]]:
     if not sent_log.exists():
-        return set()
-    sent: set[str] = set()
+        return set(), set()
+    sent_rel: set[str] = set()
+    sent_keys: set[str] = set()
     with sent_log.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rel = (row.get("relative_path") or "").strip()
             if rel:
-                sent.add(rel)
-    return sent
+                sent_rel.add(rel)
+                sent_keys.add(_logical_key_from_relative_path(rel))
+    return sent_rel, sent_keys
 
 
 def _append_sent(sent_log: Path, relative_path: str, size_bytes: int) -> None:
@@ -64,11 +88,12 @@ def run_cloud_upload_cycle(args: argparse.Namespace) -> int:
         print("Cloud cycle: no local files found.")
         return 0
 
-    sent = _load_sent_set(sent_log)
+    sent_rel, sent_keys = _load_sent_set(sent_log)
     pending: list[Path] = []
     for p in files:
         rel = p.relative_to(source_root).as_posix()
-        if rel not in sent:
+        key = _logical_key_from_relative_path(rel)
+        if rel not in sent_rel and key not in sent_keys:
             pending.append(p)
 
     if not pending:

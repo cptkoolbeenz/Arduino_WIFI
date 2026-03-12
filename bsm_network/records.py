@@ -186,9 +186,36 @@ def select_most_recent_unsaved_file(
     remote_filenames: list[str],
     already_received: set[str],
     prefer_prefix: str = "TR",
+    target_yymmdd: str | None = None,
 ) -> str | None:
     prefer = _normalize_prefer_prefix(prefer_prefix)
     tr_dated, dl_dated, undated, all_dated = _dated_groups(remote_filenames)
+
+    if target_yymmdd:
+        target = target_yymmdd.strip()
+        tr_target = [name for yymmdd, name in tr_dated if yymmdd == target]
+        dl_target = [name for yymmdd, name in dl_dated if yymmdd == target]
+        any_target = [name for yymmdd, _, name in all_dated if yymmdd == target]
+        if prefer == "ANY":
+            for name in sorted(any_target, reverse=True):
+                if name not in already_received:
+                    return name
+            return None
+        if prefer == "DL":
+            for name in sorted(dl_target, reverse=True):
+                if name not in already_received:
+                    return name
+            for name in sorted(tr_target, reverse=True):
+                if name not in already_received:
+                    return name
+            return None
+        for name in sorted(tr_target, reverse=True):
+            if name not in already_received:
+                return name
+        for name in sorted(dl_target, reverse=True):
+            if name not in already_received:
+                return name
+        return None
 
     if prefer == "ANY":
         for _, _, name in sorted(all_dated, key=lambda x: x[0], reverse=True):
@@ -216,12 +243,35 @@ def select_most_recent_unsaved_file(
     return None
 
 
-def select_most_recent_file(remote_filenames: list[str], prefer_prefix: str = "TR") -> str | None:
+def select_most_recent_file(
+    remote_filenames: list[str],
+    prefer_prefix: str = "TR",
+    target_yymmdd: str | None = None,
+) -> str | None:
     if not remote_filenames:
         return None
 
     prefer = _normalize_prefer_prefix(prefer_prefix)
     tr_dated, dl_dated, undated, all_dated = _dated_groups(remote_filenames)
+
+    if target_yymmdd:
+        target = target_yymmdd.strip()
+        tr_target = [name for yymmdd, name in tr_dated if yymmdd == target]
+        dl_target = [name for yymmdd, name in dl_dated if yymmdd == target]
+        any_target = [name for yymmdd, _, name in all_dated if yymmdd == target]
+        if prefer == "ANY":
+            return sorted(any_target, reverse=True)[0] if any_target else None
+        if prefer == "DL":
+            if dl_target:
+                return sorted(dl_target, reverse=True)[0]
+            if tr_target:
+                return sorted(tr_target, reverse=True)[0]
+            return None
+        if tr_target:
+            return sorted(tr_target, reverse=True)[0]
+        if dl_target:
+            return sorted(dl_target, reverse=True)[0]
+        return None
 
     if prefer == "ANY":
         if all_dated:
