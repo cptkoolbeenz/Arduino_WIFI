@@ -211,6 +211,232 @@ def send_time_sync(
     return False
 
 
+def ping_device(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 2.0,
+) -> str:
+    msg = b"PING"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("PONG,"):
+            return line
+    raise TimeoutError(f"PING timeout for {device_ip}")
+
+
+def get_device_status(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 2.0,
+) -> dict[str, str]:
+    msg = b"GET_STATUS"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("STATUS,"):
+            parts = line.split(",")
+            status = {}
+            for part in parts[1:]:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    status[key] = value
+            return status
+    raise TimeoutError(f"GET_STATUS timeout for {device_ip}")
+
+
+def get_device_config(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 2.0,
+) -> dict[str, str]:
+    msg = b"GET_CONFIG"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("CONFIG,"):
+            parts = line.split(",")
+            config = {}
+            for part in parts[1:]:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    config[key] = value
+            return config
+    raise TimeoutError(f"GET_CONFIG timeout for {device_ip}")
+
+
+def get_device_diagnostics(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 2.0,
+) -> dict[str, str]:
+    msg = b"GET_DIAGNOSTICS"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("DIAG,"):
+            parts = line.split(",")
+            diag = {}
+            for part in parts[1:]:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    diag[key] = value
+            return diag
+    raise TimeoutError(f"GET_DIAGNOSTICS timeout for {device_ip}")
+
+
+def get_last_data(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 2.0,
+) -> dict[str, str]:
+    msg = b"GET_LAST_DATA"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("LAST_DATA,"):
+            parts = line.split(",")
+            data_dict = {}
+            for part in parts[1:]:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    data_dict[key] = value
+            return data_dict
+    raise TimeoutError(f"GET_LAST_DATA timeout for {device_ip}")
+
+
+def set_device_config(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    config_updates: dict[str, str],
+    timeout_s: float = 3.0,
+) -> bool:
+    params = ",".join(f"{k}={v}" for k, v in config_updates.items())
+    msg = f"SET_CONFIG,{params}".encode("utf-8")
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_CONFIG"):
+            return True
+        if line.startswith("ERR_CONFIG"):
+            return False
+    return False
+
+
+def reboot_device(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 3.0,
+) -> bool:
+    msg = b"REBOOT"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_REBOOT"):
+            return True
+    return False
+
+
+def enter_data_mode(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 3.0,
+) -> bool:
+    msg = b"ENTER_DATA_MODE"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_ENTER_DATA_MODE"):
+            return True
+    return False
+
+
+def clear_device_errors(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 3.0,
+) -> bool:
+    msg = b"CLEAR_ERRORS"
+    control_sock.sendto(msg, (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_CLEAR_ERRORS"):
+            return True
+    return False
+
+
 def transfer_file_protocol(
     control_sock: socket.socket,
     device_ip: str,
@@ -230,9 +456,20 @@ def transfer_file_protocol(
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{device_ip}] Transfer start: id={transfer_id} file={requested_filename}")
 
+    requested_bind = (local_bind_ip or "").strip() or "0.0.0.0"
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((local_bind_ip, 0))
+    try:
+        server.bind((requested_bind, 0))
+    except OSError as exc:
+        if requested_bind != "0.0.0.0":
+            server.bind(("0.0.0.0", 0))
+            print(
+                f"[{device_ip}] Warning: transfer bind to {requested_bind} failed ({exc}). "
+                "Using 0.0.0.0."
+            )
+        else:
+            raise
     server.listen(1)
     server.settimeout(timeout_s)
     tcp_port = server.getsockname()[1]

@@ -187,6 +187,7 @@ def select_most_recent_unsaved_file(
     already_received: set[str],
     prefer_prefix: str = "TR",
     target_yymmdd: str | None = None,
+    tr_only: bool = False,
 ) -> str | None:
     prefer = _normalize_prefer_prefix(prefer_prefix)
     tr_dated, dl_dated, undated, all_dated = _dated_groups(remote_filenames)
@@ -212,6 +213,8 @@ def select_most_recent_unsaved_file(
         for name in sorted(tr_target, reverse=True):
             if name not in already_received:
                 return name
+        if tr_only:
+            return None
         for name in sorted(dl_target, reverse=True):
             if name not in already_received:
                 return name
@@ -233,6 +236,8 @@ def select_most_recent_unsaved_file(
         for _, name in sorted(tr_dated, key=lambda x: x[0], reverse=True):
             if name not in already_received:
                 return name
+        if tr_only:
+            return None
         for _, name in sorted(dl_dated, key=lambda x: x[0], reverse=True):
             if name not in already_received:
                 return name
@@ -247,6 +252,7 @@ def select_most_recent_file(
     remote_filenames: list[str],
     prefer_prefix: str = "TR",
     target_yymmdd: str | None = None,
+    tr_only: bool = False,
 ) -> str | None:
     if not remote_filenames:
         return None
@@ -269,6 +275,8 @@ def select_most_recent_file(
             return None
         if tr_target:
             return sorted(tr_target, reverse=True)[0]
+        if tr_only:
+            return None
         if dl_target:
             return sorted(dl_target, reverse=True)[0]
         return None
@@ -284,6 +292,8 @@ def select_most_recent_file(
     else:
         if tr_dated:
             return sorted(tr_dated, key=lambda x: x[0], reverse=True)[0][1]
+        if tr_only:
+            return None
         if dl_dated:
             return sorted(dl_dated, key=lambda x: x[0], reverse=True)[0][1]
 

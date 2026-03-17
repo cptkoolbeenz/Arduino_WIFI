@@ -155,14 +155,32 @@ def run_discovery(args: argparse.Namespace) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.bind((args.bind, args.port))
+    requested_bind = (args.bind or "").strip() or "0.0.0.0"
+    bound_bind = requested_bind
+    try:
+        sock.bind((requested_bind, args.port))
+    except OSError as exc:
+        if requested_bind != "0.0.0.0":
+            try:
+                sock.bind(("0.0.0.0", args.port))
+                bound_bind = "0.0.0.0"
+                print(
+                    f"Warning: bind to {requested_bind}:{args.port} failed ({exc}). "
+                    "Falling back to 0.0.0.0."
+                )
+            except OSError:
+                sock.close()
+                raise
+        else:
+            sock.close()
+            raise
     sock.settimeout(0.2)
 
     poll_message = b"POLL_UID"
     if args.discover_ip:
         discover_ips = [args.discover_ip]
     else:
-        auto_ip = detect_broadcast_ip(args.bind)
+        auto_ip = detect_broadcast_ip(bound_bind)
         discover_ips = [auto_ip]
         if auto_ip != "255.255.255.255":
             discover_ips.append("255.255.255.255")
@@ -172,7 +190,7 @@ def run_discovery(args: argparse.Namespace) -> int:
     print(f"{args.host_label} discovery started.")
     print(
         f"Polling {', '.join(f'udp://{ip}:{args.discover_port}' for ip in discover_ips)} "
-        f"from local udp://{args.bind}:{args.port}"
+        f"from local udp://{bound_bind}:{args.port}"
     )
     print(
         f"Waiting up to {args.discover_timeout:.1f}s for replies @ "
@@ -263,9 +281,15 @@ def run_discovery(args: argparse.Namespace) -> int:
         target_yymmdd = _resolve_target_yymmdd(args)
         day_mode = (getattr(args, "file_day", "yesterday") or "yesterday").lower()
         if target_yymmdd:
-            print(f"Transfer selection mode: {day_mode} ({target_yymmdd}), prefix={args.prefer_file_prefix}")
+            print(
+                f"Transfer selection mode: {day_mode} ({target_yymmdd}), "
+                f"prefix={args.prefer_file_prefix}, tr_only={args.tr_only}"
+            )
         else:
-            print(f"Transfer selection mode: latest available, prefix={args.prefer_file_prefix}")
+            print(
+                f"Transfer selection mode: latest available, "
+                f"prefix={args.prefer_file_prefix}, tr_only={args.tr_only}"
+            )
         for row in rows:
             uid = str(row["unique_id"])
             uid6 = (uid[-6:] if len(uid) >= 6 else uid).upper()
@@ -304,6 +328,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                     remote_files,
                     prefer_prefix=args.prefer_file_prefix,
                     target_yymmdd=target_yymmdd,
+                    tr_only=args.tr_only,
                 )
             else:
                 next_file = select_most_recent_unsaved_file(
@@ -311,6 +336,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                     seen,
                     prefer_prefix=args.prefer_file_prefix,
                     target_yymmdd=target_yymmdd,
+                    tr_only=args.tr_only,
                 )
 
             if not next_file:
@@ -329,7 +355,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                     control_sock=sock,
                     device_ip=device_ip,
                     control_port=args.discover_port,
-                    local_bind_ip=args.bind,
+                    local_bind_ip=bound_bind,
                     requested_filename=next_file,
                     output_dir=out_dir,
                     device_uid=uid,

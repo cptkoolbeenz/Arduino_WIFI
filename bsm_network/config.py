@@ -69,6 +69,18 @@ def parse_args() -> argparse.Namespace:
         help=f"Preferred remote file prefix when selecting latest file (default: {DEFAULT_PREFER_FILE_PREFIX})",
     )
     parser.add_argument(
+        "--tr-only",
+        action="store_true",
+        default=True,
+        help="When prefix preference is TR, do not fall back to DL files (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-tr-only",
+        action="store_false",
+        dest="tr_only",
+        help="Allow fallback to DL when no eligible TR file exists",
+    )
+    parser.add_argument(
         "--transfer-latest-even-if-seen",
         action="store_true",
         help="Download the most recent remote file even if it was already received before",

@@ -31,10 +31,23 @@ def main() -> int:
 
     suggested_ip = detect_lan_ip()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((args.bind, args.port))
+    requested_bind = (args.bind or "").strip() or "0.0.0.0"
+    bound_bind = requested_bind
+    try:
+        sock.bind((requested_bind, args.port))
+    except OSError as exc:
+        if requested_bind != "0.0.0.0":
+            sock.bind(("0.0.0.0", args.port))
+            bound_bind = "0.0.0.0"
+            print(
+                f"Warning: bind to {requested_bind}:{args.port} failed ({exc}). "
+                "Falling back to 0.0.0.0."
+            )
+        else:
+            raise
 
     print(f"{args.host_label} UDP listener ready.")
-    print(f"Listening on udp://{args.bind}:{args.port}")
+    print(f"Listening on udp://{bound_bind}:{args.port}")
     print(f"Set Arduino UDP_TARGET_IP to: {suggested_ip}")
     print(f"Set Arduino UDP_TARGET_PORT to: {args.port}")
     if csv_path:
