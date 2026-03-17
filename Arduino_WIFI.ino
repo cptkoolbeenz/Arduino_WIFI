@@ -69,22 +69,37 @@ bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
 bool wifiIdleAnnounced = false;
 uint32_t wifiOutWindowSinceTs = 0;
-// WiFi/SD transport state flags.
-bool wifiModeActive = false;
-bool wifiInitialized = false;
-bool sdReady = false;
-IPAddress targetIp;
-WiFiUDP udp;
+// Error tracking for diagnostics
+uint32_t i2cErrorCount = 0;
+uint32_t rtcErrorCount = 0;
+uint32_t sdErrorCount = 0;
 
 const char POLL_MESSAGE[] = "POLL_UID";
 const char LIST_FILES_MESSAGE[] = "LIST_FILES";
 const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
+const char GET_TIME_MESSAGE[] = "GET_TIME";
+const char PING_MESSAGE[] = "PING";
+const char GET_STATUS_MESSAGE[] = "GET_STATUS";
+const char GET_CONFIG_MESSAGE[] = "GET_CONFIG";
+const char GET_DIAGNOSTICS_MESSAGE[] = "GET_DIAGNOSTICS";
+const char GET_LAST_DATA_MESSAGE[] = "GET_LAST_DATA";
+const char SET_CONFIG_MESSAGE[] = "SET_CONFIG";
+const char REBOOT_MESSAGE[] = "REBOOT";
+const char ENTER_DATA_MODE_MESSAGE[] = "ENTER_DATA_MODE";
+const char GET_LOGS_MESSAGE[] = "GET_LOGS";
+const char CLEAR_ERRORS_MESSAGE[] = "CLEAR_ERRORS";
+
+// Cached RTC time support
+uint32_t rtcBaseUnixTs = 0;          // Unix time from last successful RTC read
+uint32_t rtcBaseMs = 0;              // millis() at last successful RTC read
+const uint32_t RTC_REFRESH_INTERVAL_MS = 6000;   // refresh RTC every ~6 seconds
+uint32_t rtcFallbackUnixTs = 0;      // startup-derived fallback epoch if RTC read glitches
 
 // Time window for WiFi phase (hours in local controller time).
-const uint8_t START_HOUR = 7;
-const uint8_t END_HOUR = 17;
+uint8_t START_HOUR = 7;
+uint8_t END_HOUR = 14;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
@@ -113,7 +128,7 @@ const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
 // Raw file selection policy for trim phase.
 // false: default to yesterday's DL file
 // true : use today's DL file (test mode)
-const bool TRIM_USE_TODAY_FILENAME = true;
+const bool TRIM_USE_TODAY_FILENAME = false;
 
 /////////////////////
 //  set constants
@@ -157,6 +172,13 @@ struct CalibrationThresholds {
 
 TrimInterval trimIntervals[MAX_TRIM_INTERVALS];
 int trimIntervalCount = 0;
+
+// WiFi and UDP globals
+WiFiUDP udp;
+bool sdReady = false;
+IPAddress targetIp;
+bool wifiInitialized = false;
+bool wifiModeActive = false;
 
 /***********************
  * Returns the MCU unique ID as a 32-hex-character string.
@@ -230,6 +252,23 @@ bool beginRtcWithRetry(uint8_t attempts = 3) {
     delay(100);
   }
   return false;
+}
+
+/***********************
+ * Refreshes cached timestamp base from RTC.
+ * Call after successful RTC set operations so Get_TimeStamp() uses fresh time.
+ * @return True when cache updated from a stable RTC read.
+ ***********************/
+bool Update_TimeStamp_Cache_From_RTC() {
+  DateTime nowRtc((uint32_t)0);
+  if (!readRtcStable(nowRtc)) {
+    return false;
+  }
+  rtcBaseUnixTs = nowRtc.unixtime();
+  rtcBaseMs = millis();
+  // Keep fallback close to a recently-verified RTC value.
+  rtcFallbackUnixTs = rtcBaseUnixTs;
+  return true;
 }
 
 /***********************
@@ -1228,6 +1267,39 @@ void serviceWifiCommands() {
     return;
   }
 
+  if (strcmp(incoming, GET_TIME_MESSAGE) == 0) {
+    DateTime nowRtc((uint32_t)0);
+    bool ok = false;
+    // Retry stable RTC reads first.
+    for (uint8_t i = 0; i < 3 && !ok; ++i) {
+      ok = readRtcStable(nowRtc);
+      if (!ok) delay(40);
+    }
+    // If still failing, do a lightweight I2C/RTC recovery and try once more.
+    if (!ok) {
+      recoverI2CBus();
+      Wire.end();
+      delay(10);
+      Wire.begin();
+      Wire.setClock(50000);
+      delay(50);
+      if (beginRtcWithRetry(2)) {
+        ok = readRtcStable(nowRtc);
+      }
+    }
+    if (ok) {
+      String response = "TIME,";
+      response += String((unsigned long) nowRtc.unixtime());
+      response += ",";
+      response += nowRtc.timestamp(DateTime::TIMESTAMP_FULL);
+      sendUdpMessage(response, remoteIp, remotePort);
+    } else {
+      Serial.println(F("GET_TIME failed: RTC read/recovery unsuccessful."));
+      sendUdpMessage("ERR_TIME,READ_FAILED", remoteIp, remotePort);
+    }
+    return;
+  }
+
   char parseBuf[192];
   strncpy(parseBuf, incoming, sizeof(parseBuf) - 1);
   parseBuf[sizeof(parseBuf) - 1] = '\0';
@@ -1269,6 +1341,7 @@ void serviceWifiCommands() {
         uint32_t r = verified.unixtime();
         uint32_t diff = (r >= epoch) ? (r - epoch) : (epoch - r);
         if (diff <= 5UL) {
+          Update_TimeStamp_Cache_From_RTC();
           sendUdpMessage("ACK_TIME," + String(epoch), remoteIp, remotePort);
           Serial.print(F("RTC set from controller epoch: "));
           Serial.println(epoch);
@@ -1288,6 +1361,114 @@ void serviceWifiCommands() {
     } else {
       sendUdpMessage("ERR_TIME,BAD_EPOCH", remoteIp, remotePort);
     }
+    return;
+  }
+
+  // PING: Simple connectivity check
+  if (strcmp(incoming, PING_MESSAGE) == 0) {
+    sendUdpMessage("PONG," + deviceId, remoteIp, remotePort);
+    return;
+  }
+
+  // GET_STATUS: Report device status (uptime, mode, SD space, last data timestamp)
+  if (strcmp(incoming, GET_STATUS_MESSAGE) == 0) {
+    uint32_t uptime = millis() / 1000;
+    String mode = wifiModeActive ? "WIFI" : "DATA";
+    uint32_t sdFree = 0; // TODO: SD.totalBytes() may not be available in all libraries
+    uint32_t lastTs = 0; // TODO: Get_TimeStamp() may hang if RTC bad
+    String response = "STATUS,UPTIME=" + String(uptime) + ",MODE=" + mode + ",SD_FREE_KB=" + String(sdFree) + ",LAST_DATA_TS=" + String(lastTs) + ",BATTERY=N/A";
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  // GET_CONFIG: Report current configuration (hours, device ID)
+  if (strcmp(incoming, GET_CONFIG_MESSAGE) == 0) {
+    String response = "CONFIG,START_HOUR=" + String(START_HOUR) + ",END_HOUR=" + String(END_HOUR) + ",DEVICE_ID=" + deviceId;
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  // GET_DIAGNOSTICS: Report error counts and health status
+  if (strcmp(incoming, GET_DIAGNOSTICS_MESSAGE) == 0) {
+    DateTime now((uint32_t)0);
+    bool rtcOk = readRtcStable(now);
+    String response = "DIAG,RTC_OK=" + String(rtcOk ? 1 : 0) + ",RTC_ERRORS=" + String(rtcErrorCount) + ",I2C_ERRORS=" + String(i2cErrorCount) + ",SD_ERRORS=" + String(sdErrorCount);
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  // GET_LAST_DATA: Report current sensor reading and timestamp
+  if (strcmp(incoming, GET_LAST_DATA_MESSAGE) == 0) {
+    long data = 0; // TODO: Get_Data() may hang if ADC not ready
+    uint32_t ts = 0; // TODO: Get_TimeStamp() may hang if RTC bad
+    String response = "LAST_DATA,VALUE=" + String(data) + ",TS=" + String(ts);
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  // SET_CONFIG: Set configuration parameters (e.g., SET_CONFIG,START_HOUR=8,END_HOUR=16)
+  if (fieldCount >= 2 && strcmp(fields[0], SET_CONFIG_MESSAGE) == 0) {
+    bool updated = false;
+    for (int i = 1; i < fieldCount; ++i) {
+      char *param = fields[i];
+      char *eq = strchr(param, '=');
+      if (eq) {
+        *eq = '\0';
+        char *key = param;
+        char *value = eq + 1;
+        if (strcmp(key, "START_HOUR") == 0) {
+          uint8_t val = (uint8_t)atoi(value);
+          if (val < 24) {
+            START_HOUR = val;
+            updated = true;
+          }
+        } else if (strcmp(key, "END_HOUR") == 0) {
+          uint8_t val = (uint8_t)atoi(value);
+          if (val < 24) {
+            END_HOUR = val;
+            updated = true;
+          }
+        }
+      }
+    }
+    if (updated) {
+      sendUdpMessage("ACK_CONFIG", remoteIp, remotePort);
+      Serial.println(F("Config updated via SET_CONFIG"));
+    } else {
+      sendUdpMessage("ERR_CONFIG,INVALID_PARAMS", remoteIp, remotePort);
+    }
+    return;
+  }
+
+  // REBOOT: Reboot the device
+  if (strcmp(incoming, REBOOT_MESSAGE) == 0) {
+    sendUdpMessage("ACK_REBOOT", remoteIp, remotePort);
+    Serial.println(F("Rebooting via REBOOT command"));
+    delay(1000);
+    NVIC_SystemReset();
+    return;
+  }
+
+  // ENTER_DATA_MODE: Exit WiFi mode and return to data collection
+  if (strcmp(incoming, ENTER_DATA_MODE_MESSAGE) == 0) {
+    exitWifiMode();
+    sendUdpMessage("ACK_ENTER_DATA_MODE", remoteIp, remotePort);
+    return;
+  }
+
+  // GET_LOGS: Retrieve recent logs (not implemented, respond with not supported)
+  if (strcmp(incoming, GET_LOGS_MESSAGE) == 0) {
+    sendUdpMessage("LOGS,NOT_SUPPORTED", remoteIp, remotePort);
+    return;
+  }
+
+  // CLEAR_ERRORS: Reset error counters
+  if (strcmp(incoming, CLEAR_ERRORS_MESSAGE) == 0) {
+    i2cErrorCount = 0;
+    rtcErrorCount = 0;
+    sdErrorCount = 0;
+    sendUdpMessage("ACK_CLEAR_ERRORS", remoteIp, remotePort);
+    Serial.println(F("Error counters cleared"));
     return;
   }
 }
@@ -1349,11 +1530,54 @@ long int Get_Data() {
  * Reads current RTC unix timestamp.
  * @return Unix time in seconds.
  ***********************/
-long int Get_TimeStamp() {
+long int OLD_Get_TimeStamp() {
   /* GET CURRENT TIME FROM RTC */
   currenttime = RTC.now();
   // convert to raw unix value for return - could give options
   return (currenttime.unixtime());
+}
+
+/***********************
+ * Get_TimeStamp - cached RTC read
+ * Reads RTC only every ~6 seconds, then uses millis() to advance time
+ * between reads. Returns Unix time in seconds.
+ * should prevent I2C problems that cause RTC failure
+ ***********************/
+uint32_t Get_TimeStamp() {
+  uint32_t nowMs = millis();
+
+  // Refresh from RTC on first call, or every RTC_REFRESH_INTERVAL_MS
+  if (rtcBaseUnixTs == 0 || (nowMs - rtcBaseMs >= RTC_REFRESH_INTERVAL_MS)) {
+
+    // Retry a few times in case I2C is temporarily flaky
+    bool gotRtc = false;
+    for (int i = 0; i < 3; i++) {
+      currenttime = RTC.now();
+
+      // Basic sanity check: reject obviously bad reads
+      if (currenttime.year() >= 2024) {
+        rtcBaseUnixTs = currenttime.unixtime();
+        rtcBaseMs = nowMs;
+        gotRtc = true;
+        break;
+      }
+
+      delay(5);
+    }
+
+    // If first read attempts fail and cache is still empty, return a safe
+    // startup-derived fallback instead of near-1970 time.
+    if (!gotRtc && rtcBaseUnixTs == 0) {
+      if (rtcFallbackUnixTs == 0) {
+        // Last-resort fallback: compile-time epoch.
+        rtcFallbackUnixTs = DateTime(F(__DATE__), F(__TIME__)).unixtime();
+      }
+      return rtcFallbackUnixTs + (nowMs / 1000UL);
+    }
+  }
+
+  // Advance cached Unix time using elapsed millis since last RTC read
+  return rtcBaseUnixTs + ((nowMs - rtcBaseMs) / 1000);
 }
 
 ////////////////////
@@ -1480,6 +1704,7 @@ void setup() {
   Wire.end();
   delay(10);
   Wire.begin();
+  Wire.setClock(50000);
   delay(200);
   if (!beginRtcWithRetry(3)) {
     Serial.println("RTC failed after retries.");
@@ -1515,6 +1740,10 @@ void setup() {
     Serial.print("RTC running. TIMESTAMP:\t");
     Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
   }
+
+  rtcFallbackUnixTs = rtcNow.unixtime();
+  // Prime cached timestamp base after startup RTC validation.
+  Update_TimeStamp_Cache_From_RTC();
 
   lcd.print("                ");
   lcd.setCursor(0, 0);
