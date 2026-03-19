@@ -14,7 +14,10 @@
     --- Time the speed HZ before any testing - 51.59 hz (summer were 56.9hz - card difference)
     --- Added time check in loop so it only saves data in day time (default 7AM, 8PM)
     --- Time the speed HZ with time check added - 51.56 - NO TIME ADDED for the check
-*/
+
+    May 20, 2026
+    --- Added check for empty DL file to prevent endless failed loop in trim process when no raw files are present. If no raw files, will skip trim and proceed to WiFi mode with empty file, which controller can handle as a no-data day.
+    */
 
 // libraries needed
 
@@ -99,12 +102,12 @@ uint32_t rtcFallbackUnixTs = 0;      // startup-derived fallback epoch if RTC re
 
 // Time window for WiFi phase (hours in local controller time).
 uint8_t START_HOUR = 7;
-uint8_t END_HOUR = 14;
+uint8_t END_HOUR = 16;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
-// Set to 300s for normal time to reach WiFi mode quickly after reboot.
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 300UL;
+// Set to 300s for normal time to reach WiFi mode quickly after reboot. 60 for testing
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 60UL; // 300UL;
 // Duration from file start treated as calibration section for trim logic.
 const uint32_t TRIM_CALIBRATION_SECONDS = 300UL;
 // Optional guard from file start before event detection can begin.
@@ -533,6 +536,12 @@ CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputNam
   File in = SD.open(inputName.c_str(), FILE_READ);
   if (!in) return r;
 
+  if (in.size() == 0) {
+    in.close();
+    Serial.println(F("TRIM fail: empty file"));
+    return r;
+  }
+
   char line[96];
   long value = 0;
   uint32_t ts = 0;
@@ -806,6 +815,17 @@ bool ensureTrimmedFileReadyForWifi() {
 
   Serial.print(F("TRIM raw target: "));
   Serial.println(rawName);
+
+  // Check if raw file is empty; if so, skip trimming and proceed
+  File rawFile = SD.open(rawName.c_str(), FILE_READ);
+  if (rawFile) {
+    if (rawFile.size() == 0) {
+      rawFile.close();
+      Serial.println(F("TRIM skip: empty raw file, proceeding without trim"));
+      return true;
+    }
+    rawFile.close();
+  }
 
   String trimName = trimFilenameFromRaw(rawName);
   if (SD.exists(trimName.c_str())) {
@@ -1633,7 +1653,6 @@ String rtnFilename() {
   return String(name);
 }
 
-
 /***********************
  * Arduino initialization entrypoint.
  * Sets up peripherals, RTC, SD, diagnostics, and initial display state.
@@ -1789,8 +1808,9 @@ void setup() {
 
     while (1)
       ;
+  } else {
     Serial.println("card initialized.");  // confirm that it is good to go
-  }                                       // end of checking for card and initializing
+  }
 
 
 
@@ -1965,6 +1985,7 @@ void loop() {
 
     // Reboot-armed path: trim first, then open WiFi listener.
     if (!ensureTrimmedFileReadyForWifi()) {
+      wifiSessionArmed = false;  // consume even on failure to prevent endless retry
       delay(1000);
       return;
     }
