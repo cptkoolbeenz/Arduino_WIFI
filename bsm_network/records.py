@@ -30,6 +30,9 @@ def write_discovery_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
             f,
             fieldnames=[
                 "unique_id",
+                "network_uid",
+                "network_hostname",
+                "wifi_mac",
                 "device_ip",
                 "udp_target_ip",
                 "udp_target_port",

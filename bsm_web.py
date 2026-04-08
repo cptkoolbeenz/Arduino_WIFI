@@ -205,15 +205,16 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
         return "(No devices discovered yet)"
 
     lines = []
-    lines.append("status   unique_id                              device_ip      recv_ip        last_seen")
-    lines.append("------   ------------------------------------   -----------   -----------    -------------------")
+    lines.append("status   unique_id                              network_uid       device_ip      recv_ip        last_seen")
+    lines.append("------   ------------------------------------   ---------------   -----------   -----------    -------------------")
     for row in rows:
         status = row.get("status", "UNKNOWN")
         uid = row.get("unique_id", "")
+        net_uid = row.get("network_uid", "")
         dev_ip = row.get("device_ip", "")
         recv_ip = row.get("recv_ip", "")
         last_seen_raw = row.get("last_seen", "")
-        lines.append(f"{status:<6}   {uid:<36}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw}")
+        lines.append(f"{status:<6}   {uid:<36}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw}")
     return "\n".join(lines)
 
 

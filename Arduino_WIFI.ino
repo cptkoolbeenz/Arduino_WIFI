@@ -88,6 +88,7 @@ const char GET_STATUS_MESSAGE[] = "GET_STATUS";
 const char GET_CONFIG_MESSAGE[] = "GET_CONFIG";
 const char GET_DIAGNOSTICS_MESSAGE[] = "GET_DIAGNOSTICS";
 const char GET_LAST_DATA_MESSAGE[] = "GET_LAST_DATA";
+const char GET_NET_UID_MESSAGE[] = "GET_NET_UID";
 const char SET_CONFIG_MESSAGE[] = "SET_CONFIG";
 const char REBOOT_MESSAGE[] = "REBOOT";
 const char ENTER_DATA_MODE_MESSAGE[] = "ENTER_DATA_MODE";
@@ -182,6 +183,7 @@ bool sdReady = false;
 IPAddress targetIp;
 bool wifiInitialized = false;
 bool wifiModeActive = false;
+String networkHostname;
 
 /***********************
  * Returns the MCU unique ID as a 32-hex-character string.
@@ -199,6 +201,47 @@ String getChipIdHex() {
     (unsigned long) uid->unique_id_words[3]
   );
   return String(id);
+}
+
+/***********************
+ * Returns the ESP32-S3 station MAC address as uppercase hex.
+ * @return MAC string without separators, e.g. AABBCCDDEEFF.
+ ***********************/
+String getWifiMacHex() {
+  uint8_t mac[6] = {0};
+  WiFi.macAddress(mac);
+  char buf[13];
+  snprintf(
+    buf, sizeof(buf),
+    "%02X%02X%02X%02X%02X%02X",
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+  );
+  return String(buf);
+}
+
+/***********************
+ * Builds a stable network UID for external controller use.
+ * Format mirrors common controller naming style.
+ * @return UID like ESP32S3-ABCDE (fallback: ESP32S3-<deviceID_6>).
+ ***********************/
+String getNetworkUid() {
+  String macHex = getWifiMacHex();
+  if (macHex.length() >= 5) {
+    return "ESP32S3-" + macHex.substring(macHex.length() - 5);
+  }
+  return "ESP32S3-" + deviceID_6;
+}
+
+/***********************
+ * Builds hostname advertised to WiFi/DHCP controllers (e.g., UniFi).
+ * Includes both network UID and MCU short ID for easier field matching.
+ ***********************/
+String buildNetworkHostname() {
+  String host = getNetworkUid() + "-" + deviceID_6;
+  if (host.length() > 31) {
+    host = host.substring(0, 31);
+  }
+  return host;
 }
 
 /***********************
@@ -892,6 +935,16 @@ bool connectWiFi() {
     return false;
   }
 
+  // Use for naming, the 6-character UID string.
+  if (networkHostname.length() == 0) {
+    networkHostname = buildNetworkHostname();
+  }
+  Serial.print("Hostname: ");
+  Serial.println(networkHostname);
+  // Set hostname before WiFi.begin() so controller lists device consistently.
+  WiFi.setHostname(networkHostname.c_str());
+  delay(1000); // Short delay to ensure hostname is set before connection attempts
+  
   while (status != WL_CONNECTED) {
     if (strlen(SECRET_PASS) == 0) {
       status = WiFi.begin(SECRET_SSID);
@@ -979,6 +1032,7 @@ void showWiFiInfo() {
  ***********************/
 void runStartupWiFiCheck() {
   Serial.println(F("Startup WiFi check..."));
+
   if (!connectWiFi()) {
     Serial.println(F("Startup WiFi check failed: no connection."));
     if (printLCD) {
@@ -1289,6 +1343,25 @@ void serviceWifiCommands() {
     response += UDP_TARGET_IP;
     response += ",";
     response += String(UDP_TARGET_PORT);
+    response += ",";
+    response += getNetworkUid();
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  if (strcmp(incoming, GET_NET_UID_MESSAGE) == 0) {
+    String netUid = getNetworkUid();
+    String response = "NET_UID,";
+    response += netUid;
+    response += ",HOST=";
+    response += networkHostname;
+    response += ",MAC=";
+    response += getWifiMacHex();
+    Serial.print(F("GET_NET_UID -> "));
+    Serial.print(netUid);
+    Serial.print(F(" (HOST="));
+    Serial.print(networkHostname);
+    Serial.println(F(")"));
     sendUdpMessage(response, remoteIp, remotePort);
     return;
   }
@@ -1683,6 +1756,9 @@ void setup() {
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
   deviceID_6 = (deviceId.length() >= 6) ? deviceId.substring(deviceId.length() - 6) : deviceId;
+  networkHostname = buildNetworkHostname();
+ 
+
   Serial.print("Device ID: ");
   Serial.println(deviceId);
 

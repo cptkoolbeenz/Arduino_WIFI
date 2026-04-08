@@ -106,7 +106,59 @@ def parse_id_response(payload: str) -> dict[str, str | int] | None:
         "device_ip": device_ip,
         "udp_target_ip": udp_target_ip,
         "udp_target_port": udp_target_port,
+        "network_uid": parts[5] if len(parts) > 5 else "",
     }
+
+
+def parse_net_uid_response(payload: str) -> dict[str, str] | None:
+    if not payload.startswith("NET_UID,"):
+        return None
+    parts = [p.strip() for p in payload.split(",")]
+    if len(parts) < 2:
+        return None
+    network_uid = parts[1]
+    if not network_uid:
+        return None
+
+    network_hostname = ""
+    wifi_mac = ""
+    for token in parts[2:]:
+        if token.startswith("HOST="):
+            network_hostname = token[5:]
+        elif token.startswith("MAC="):
+            wifi_mac = token[4:]
+    return {
+        "network_uid": network_uid,
+        "network_hostname": network_hostname,
+        "wifi_mac": wifi_mac,
+    }
+
+
+def request_network_uid(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 1.0,
+) -> dict[str, str] | None:
+    original_timeout = control_sock.gettimeout()
+    try:
+        control_sock.settimeout(timeout_s)
+        control_sock.sendto(b"GET_NET_UID", (device_ip, control_port))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                data, (src_ip, _src_port) = control_sock.recvfrom(2048)
+            except socket.timeout:
+                return None
+            if src_ip != device_ip:
+                continue
+            payload = data.decode("utf-8", errors="replace").strip()
+            parsed = parse_net_uid_response(payload)
+            if parsed is not None:
+                return parsed
+        return None
+    finally:
+        control_sock.settimeout(original_timeout)
 
 
 def collect_device_lines(
@@ -220,6 +272,9 @@ def run_discovery(args: argparse.Namespace) -> int:
             "device_ip": parsed["device_ip"],
             "udp_target_ip": parsed["udp_target_ip"],
             "udp_target_port": parsed["udp_target_port"],
+            "network_uid": parsed.get("network_uid", ""),
+            "network_hostname": "",
+            "wifi_mac": "",
             "recv_ip": src_ip,
             "recv_port": src_port,
             "last_seen": dt.datetime.now().isoformat(timespec="seconds"),
@@ -231,10 +286,27 @@ def run_discovery(args: argparse.Namespace) -> int:
         return 1
 
     rows = [discovered[uid] for uid in sorted(discovered)]
-    print(f"Discovered {len(rows)} Arduino device(s):")
-    print("unique_id, udp_target_ip, device_ip, recv_ip")
     for row in rows:
-        print(f"{row['unique_id']}, {row['udp_target_ip']}, {row['device_ip']}, {row['recv_ip']}")
+        device_ip = str(row["device_ip"] or row["recv_ip"])
+        net = request_network_uid(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=args.discover_port,
+            timeout_s=1.0,
+        )
+        if not net:
+            continue
+        row["network_uid"] = net.get("network_uid", "") or row.get("network_uid", "")
+        row["network_hostname"] = net.get("network_hostname", "")
+        row["wifi_mac"] = net.get("wifi_mac", "")
+
+    print(f"Discovered {len(rows)} Arduino device(s):")
+    print("unique_id, network_uid, udp_target_ip, device_ip, recv_ip")
+    for row in rows:
+        print(
+            f"{row['unique_id']}, {row.get('network_uid', '')}, "
+            f"{row['udp_target_ip']}, {row['device_ip']}, {row['recv_ip']}"
+        )
 
     if args.discover_csv:
         csv_path = Path(args.discover_csv).expanduser()
