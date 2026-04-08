@@ -102,12 +102,12 @@ uint32_t rtcFallbackUnixTs = 0;      // startup-derived fallback epoch if RTC re
 
 // Time window for WiFi phase (hours in local controller time).
 uint8_t START_HOUR = 7;
-uint8_t END_HOUR = 16;
+uint8_t END_HOUR = 19;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
-// Set to 300s for normal time to reach WiFi mode quickly after reboot. 60 for testing
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 60UL; // 300UL;
+// Set to 300s for normal time to reach WiFi mode quickly after reboot. 10 for testing
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 10UL; // 300UL;
 // Duration from file start treated as calibration section for trim logic.
 const uint32_t TRIM_CALIBRATION_SECONDS = 300UL;
 // Optional guard from file start before event detection can begin.
@@ -811,6 +811,12 @@ bool ensureTrimmedFileReadyForWifi() {
   if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
     Serial.println(F("TRIM skip: no raw DL file found."));
     return false;
+  }
+
+  // If TRIM_USE_TODAY_FILENAME is false and we're using today's file, skip trimming
+  if (!TRIM_USE_TODAY_FILENAME && rawName == myFilename) {
+    Serial.println(F("TRIM skip: TRIM_USE_TODAY_FILENAME is false, not trimming today's file."));
+    return true;  // Proceed without trimming
   }
 
   Serial.print(F("TRIM raw target: "));

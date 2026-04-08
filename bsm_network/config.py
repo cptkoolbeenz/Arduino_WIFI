@@ -4,7 +4,8 @@ import argparse
 
 # Network defaults used by CLI flags below.
 # Edit these in one place when moving to a different local network.
-DEFAULT_BIND_IP = "192.168.1.8"
+# DEFAULT_BIND_IP = "192.168.1.8"
+DEFAULT_BIND_IP = "0.0.0.0" # will connect to all interfaces, but discovery will only work if the default route is on the same subnet as the Arduinos (e.g. if connected to a VPN that routes all traffic through it, discovery will fail since the broadcast will go out the VPN interface instead of the local subnet interface)
 DEFAULT_DISCOVER_BROADCAST_IP = "192.168.1.255"
 DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
