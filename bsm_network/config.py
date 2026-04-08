@@ -5,11 +5,11 @@ import argparse
 # Network defaults used by CLI flags below.
 # Edit these in one place when moving to a different local network.
 # DEFAULT_BIND_IP = "192.168.1.8"
-DEFAULT_BIND_IP = "0.0.0.0" # will connect to all interfaces, but discovery will only work if the default route is on the same subnet as the Arduinos (e.g. if connected to a VPN that routes all traffic through it, discovery will fail since the broadcast will go out the VPN interface instead of the local subnet interface)
-DEFAULT_DISCOVER_BROADCAST_IP = "192.168.1.255"
+DEFAULT_BIND_IP = "192.168.10.1" # will connect to all interfaces, but discovery will only work if the default route is on the same subnet as the Arduinos (e.g. if connected to a VPN that routes all traffic through it, discovery will fail since the broadcast will go out the VPN interface instead of the local subnet interface)
+DEFAULT_DISCOVER_BROADCAST_IP = "192.168.10.255"
 DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
-DEFAULT_LOCAL_OFFSET = -4 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
+DEFAULT_LOCAL_OFFSET = -3 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
 DEFAULT_HOST_LABEL = "Mac"
 DEFAULT_START_HOUR = 10
 DEFAULT_END_HOUR = 18
