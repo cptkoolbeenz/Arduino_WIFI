@@ -972,8 +972,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    host = "192.168.10.1"
-    port = 8080
+    host = "0.0.0.0"
+    port = 5000
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"BSM web control ready: http://{host}:{port}")
 
