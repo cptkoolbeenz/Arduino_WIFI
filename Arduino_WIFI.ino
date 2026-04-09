@@ -245,6 +245,40 @@ String buildNetworkHostname() {
 }
 
 /***********************
+ * Returns a 4-hex suffix derived from ESP32 network UID.
+ * @return Last 4 chars of network UID token.
+ ***********************/
+String getNetworkUidSuffix4() {
+  String netUid = getNetworkUid();
+  int dash = netUid.lastIndexOf('-');
+  String token = (dash >= 0) ? netUid.substring(dash + 1) : netUid;
+  if (token.length() >= 4) {
+    return token.substring(token.length() - 4);
+  }
+  return token;
+}
+
+/***********************
+ * Builds LCD UID line content.
+ * Mode:
+ * - R4   => UID: <deviceID_6>
+ * - ESP  => UID: <esp4>
+ * - BOTH => UID: <deviceID_6>-<esp4>
+ * Default (unknown/empty): R4
+ ***********************/
+String getLcdUidLineBase(const String &modeIn) {
+  String mode = modeIn;
+  mode.toUpperCase();
+  if (mode == "ESP") {
+    return "UID: " + getNetworkUidSuffix4();
+  }
+  if (mode == "BOTH") {
+    return "UID: " + deviceID_6 + "-" + getNetworkUidSuffix4();
+  }
+  return "UID: " + deviceID_6;
+}
+
+/***********************
  * Validates RTC date range to reject invalid/uninitialized reads.
  * @param dt RTC date-time to validate.
  * @return True when date components are in expected ranges.
@@ -389,10 +423,12 @@ void setLcdStatusLine1(const String &status) {
 void setLcdUidLine(bool showCalTag) {
   if (!printLCD) return;
   lcd.setCursor(0, 1);
-  String line2 = "UID: " + deviceID_6;
+  String line2 = getLcdUidLineBase("BOTH");
   if (showCalTag) {
-    while (line2.length() < 13) line2 += " ";
-    line2 += "CAL";
+    if (line2.length() <= 13) {
+      while (line2.length() < 13) line2 += " ";
+      line2 += "CAL";
+    }
   } else {
     while (line2.length() < 16) line2 += " ";
   }
@@ -1023,7 +1059,9 @@ void showWiFiInfo() {
   lcd.print(UDP_TARGET_PORT);
   lcd.print("   ");
   lcd.setCursor(0, 1);
-  lcd.print("UID: " + deviceID_6 + "      ");
+  String uidLine = getLcdUidLineBase("BOTH");
+  while (uidLine.length() < 16) uidLine += " ";
+  lcd.print(uidLine.substring(0, 16));
   delay(1200);
 }
 
