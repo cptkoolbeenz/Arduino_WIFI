@@ -89,6 +89,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         transfer_latest_file=True,
         sync_time=False,
         cloud_enabled=True,
+        scheduled=True,
     )
     parser.add_argument("--bind", default=DEFAULT_BIND_IP, help=f"Local interface/IP to bind (default: {DEFAULT_BIND_IP})")
     parser.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"UDP port to listen on (default: {DEFAULT_LISTEN_PORT})")
@@ -167,6 +168,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Treat partial transfers as received so they are not retried (only used with --transfer-tolerant)",
     )
     parser.add_argument("--scheduled", action="store_true", help="Run discover/transfer in a repeating time-window loop (opt-in)")
+    parser.add_argument("--no-scheduled", action="store_false", dest="scheduled", help="Disable scheduled mode")
     parser.add_argument("--start-hour", type=int, default=DEFAULT_START_HOUR, help=f"Scheduled mode start hour, 0-23 local time (default: {DEFAULT_START_HOUR})")
     parser.add_argument("--end-hour", type=int, default=DEFAULT_END_HOUR, help=f"Scheduled mode end hour, 0-23 local time (default: {DEFAULT_END_HOUR})")
     parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
