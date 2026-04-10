@@ -172,6 +172,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cycle-interval-sec", type=float, default=180.0, help="Seconds between cycles while inside schedule window (default: 180)")
     parser.add_argument("--out-window-sleep-sec", type=float, default=45.0, help="Seconds to sleep between time checks outside schedule window (default: 45)")
     parser.add_argument("--cloud-enabled", action="store_true", dest="cloud_enabled", help="Enable cloud upload window processing")
+    parser.add_argument("--no-cloud-enabled", action="store_false", dest="cloud_enabled", help="Disable cloud upload window processing")
     parser.add_argument("--cloud-start", default=DEFAULT_CLOUD_START, help=f"Cloud upload window start in HHMM local time (default: {DEFAULT_CLOUD_START})")
     parser.add_argument("--cloud-end", default=DEFAULT_CLOUD_END, help=f"Cloud upload window end in HHMM local time (default: {DEFAULT_CLOUD_END})")
     parser.add_argument("--cloud-cycle-interval-sec", type=float, default=300.0, help="Seconds between cloud upload cycles in cloud window (default: 300)")
