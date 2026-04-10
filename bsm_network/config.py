@@ -17,9 +17,70 @@ DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
 DEFAULT_PREFER_FILE_PREFIX = "TR"
 DEFAULT_FILE_DAY = "yesterday"
+DEFAULT_DISCOVER_CSV = "data/discovered_devices.csv"
+DEFAULT_WEB_HOST = "0.0.0.0"
+DEFAULT_WEB_PORT = 5000
 
 
-def parse_args() -> argparse.Namespace:
+def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
+    return [
+        "--scheduled",
+        "--discover",
+        "--discover-csv",
+        discover_csv,
+        "--transfer-latest-file",
+        "--prefer-file-prefix",
+        "TR",
+        "--file-day",
+        "yesterday",
+        "--no-sync-time",
+        "--transfer-tolerant",
+        "--cloud-enabled",
+    ]
+
+
+def build_poll_now_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
+    return [
+        "--discover",
+        "--discover-csv",
+        discover_csv,
+        "--no-transfer-latest-file",
+        "--no-sync-time",
+        "--no-cloud-enabled",
+        "--post-poll-wait",
+        "0",
+    ]
+
+
+def build_force_upload_argv(device_ip: str, discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
+    return [
+        "--discover",
+        "--discover-attempts",
+        "3",
+        "--discover-timeout",
+        "8",
+        "--discover-interval",
+        "0.3",
+        "--post-poll-wait",
+        "0",
+        "--discover-csv",
+        discover_csv,
+        "--transfer-latest-file",
+        "--prefer-file-prefix",
+        "TR",
+        "--file-day",
+        "latest",
+        "--transfer-latest-even-if-seen",
+        "--no-sync-time",
+        "--transfer-tolerant",
+        "--mark-partial-received",
+        "--no-cloud-enabled",
+        "--discover-ip",
+        device_ip,
+    ]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="UDP listener/controller for Arduino BSM payloads"
     )
@@ -124,4 +185,4 @@ def parse_args() -> argparse.Namespace:
         help="Local destination directory for cloud sync clients (alternative to rclone remote)",
     )
     parser.add_argument("--cloud-once", action="store_true", help="Run one immediate cloud upload cycle and exit")
-    return parser.parse_args()
+    return parser.parse_args(argv)

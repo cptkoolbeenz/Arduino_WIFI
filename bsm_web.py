@@ -11,12 +11,36 @@ import sys
 import threading
 import datetime as dt
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from urllib.parse import parse_qs
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DISCOVER_CONTROL_PORT = 8888
+from bsm_network.config import (
+    DEFAULT_DISCOVER_CSV,
+    DEFAULT_DISCOVER_PORT,
+    DEFAULT_WEB_HOST,
+    DEFAULT_WEB_PORT,
+    build_force_upload_argv,
+    build_normal_ops_argv,
+    build_poll_now_argv,
+    parse_args,
+)
+from bsm_network.discovery import run_discovery
+from bsm_network.protocol import (
+    clear_device_errors as protocol_clear_device_errors,
+    enter_data_mode as protocol_enter_data_mode,
+    get_device_config as protocol_get_device_config,
+    get_device_diagnostics as protocol_get_device_diagnostics,
+    get_device_status as protocol_get_device_status,
+    get_last_data as protocol_get_last_data,
+    ping_device as protocol_ping_device,
+    reboot_device as protocol_reboot_device,
+    set_device_config as protocol_set_device_config,
+)
+
+DISCOVER_CONTROL_PORT = DEFAULT_DISCOVER_PORT
 WEB_SET_TIME_OFFSET_HOURS = -4.0
 TZ_PRESET_OFFSETS: dict[str, float] = {
     "ast": -4.0,
@@ -45,19 +69,10 @@ NORMAL_OPS_CMD = [
     sys.executable,
     "-u",
     "bsm_network.py",
-    "--scheduled",
-    "--discover",
-    "--discover-csv",
-    "data/discovered_devices.csv",
-    "--transfer-latest-file",
-    "--prefer-file-prefix",
-    "TR",
-    "--file-day",
-    "yesterday",
-    "--no-sync-time",
-    "--transfer-tolerant",
-    "--cloud-enabled",
+    *build_normal_ops_argv(DEFAULT_DISCOVER_CSV),
 ]
+
+POLL_NOW_ARGS = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
 
 
 class ProcessManager:
@@ -65,7 +80,9 @@ class ProcessManager:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
         self._log_path = Path("data/web_normal_ops.log")
-        self._force_proc: subprocess.Popen[str] | None = None
+        self._force_thread: threading.Thread | None = None
+        self._force_task_id: int = 0
+        self._force_active_id: int | None = None
         self._force_log_path = Path("data/web_force_upload.log")
 
     def status(self) -> tuple[bool, int | None]:
@@ -79,12 +96,13 @@ class ProcessManager:
 
     def force_status(self) -> tuple[bool, int | None]:
         with self._lock:
-            if self._force_proc is None:
+            if self._force_thread is None:
                 return False, None
-            if self._force_proc.poll() is not None:
-                self._force_proc = None
+            if not self._force_thread.is_alive():
+                self._force_thread = None
+                self._force_active_id = None
                 return False, None
-            return True, self._force_proc.pid
+            return True, self._force_active_id
 
     def start(self) -> str:
         with self._lock:
@@ -126,56 +144,68 @@ class ProcessManager:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return "Stop Normal Ops before force upload (port/bind conflict)."
-            if self._force_proc is not None and self._force_proc.poll() is None:
-                return f"Force upload already running (PID {self._force_proc.pid})."
+            if self._force_thread is not None and self._force_thread.is_alive():
+                active_id = self._force_active_id if self._force_active_id is not None else 0
+                return f"Force upload already running (task {active_id})."
+            self._force_task_id += 1
+            task_id = self._force_task_id
+            self._force_active_id = task_id
+            args_list = build_force_upload_argv(device_ip=device_ip, discover_csv=DEFAULT_DISCOVER_CSV)
 
+        def _run_force_upload() -> None:
             self._force_log_path.parent.mkdir(parents=True, exist_ok=True)
-            logf = self._force_log_path.open("a", encoding="utf-8")
             stamp = dt.datetime.now().isoformat(timespec="seconds")
-            logf.write(f"\n=== Force upload start {stamp} uid={uid} ip={device_ip} ===\n")
-            logf.flush()
+            with self._force_log_path.open("a", encoding="utf-8") as logf:
+                logf.write(f"\n=== Force upload start {stamp} task={task_id} uid={uid} ip={device_ip} ===\n")
+                logf.flush()
+                rc = 1
+                try:
+                    args = parse_args(args_list)
+                    with redirect_stdout(logf), redirect_stderr(logf):
+                        rc = run_discovery(args)
+                except Exception as exc:  # noqa: BLE001
+                    logf.write(f"Force upload failed: {exc}\n")
+                end_stamp = dt.datetime.now().isoformat(timespec="seconds")
+                logf.write(f"=== Force upload end {end_stamp} task={task_id} rc={rc} ===\n")
+            with self._lock:
+                if self._force_active_id == task_id:
+                    self._force_active_id = None
 
-            cmd = [
-                sys.executable,
-                "-u",
-                "bsm_network.py",
-                "--discover",
-                "--discover-ip",
-                device_ip,
-                "--discover-attempts",
-                "3",
-                "--discover-timeout",
-                "8",
-                "--discover-interval",
-                "0.3",
-                "--post-poll-wait",
-                "0",
-                "--discover-csv",
-                "data/discovered_devices.csv",
-                "--transfer-latest-file",
-                "--prefer-file-prefix",
-                "TR",
-                "--file-day",
-                "latest",
-                "--transfer-latest-even-if-seen",
-                "--no-sync-time",
-                "--transfer-tolerant",
-                "--mark-partial-received",
-                "--no-cloud-enabled",
-            ]
-            self._force_proc = subprocess.Popen(
-                cmd,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            return f"Force upload started for {uid} ({device_ip}) (PID {self._force_proc.pid})."
+        thread = threading.Thread(target=_run_force_upload, name=f"force-upload-{task_id}", daemon=True)
+        with self._lock:
+            self._force_thread = thread
+        thread.start()
+        return f"Force upload started for {uid} ({device_ip}) (task {task_id})."
+
+    def poll_now(self) -> str:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return "Stop Normal Ops before manual poll (port/bind conflict)."
+            if self._force_thread is not None and self._force_thread.is_alive():
+                return "Wait for force upload to finish before manual poll (port/bind conflict)."
+            log_path = self._log_path
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().isoformat(timespec="seconds")
+        with log_path.open("a", encoding="utf-8") as logf:
+            logf.write(f"\n=== Manual Poll start {stamp} ===\n")
+            logf.flush()
+            try:
+                args = parse_args(POLL_NOW_ARGS)
+                with redirect_stdout(logf), redirect_stderr(logf):
+                    rc = run_discovery(args)
+            except Exception as exc:  # noqa: BLE001
+                logf.write(f"Manual poll failed to run: {exc}\n")
+                return f"Manual poll failed: {exc}"
+            end_stamp = dt.datetime.now().isoformat(timespec="seconds")
+            logf.write(f"=== Manual Poll end {end_stamp} rc={rc} ===\n")
+        if rc == 0:
+            return "Manual poll completed. Device list refreshed."
+        return f"Manual poll finished with non-zero status (rc={rc}). Check log output."
 
     def shutdown(self) -> None:
         self.stop()
-        with self._lock:
-            if self._force_proc is not None and self._force_proc.poll() is None:
-                self._force_proc.terminate()
+        return
 
 
 MANAGER = ProcessManager()
@@ -315,13 +345,14 @@ def ping_device(device_ip: str, timeout_s: float = 2.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        sock.sendto(b"PING", (device_ip, DISCOVER_CONTROL_PORT))
-        data, (src_ip, _src_port) = sock.recvfrom(2048)
-        if src_ip != device_ip:
-            return f"PING got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-        line = data.decode("utf-8", errors="replace").strip()
+        line = protocol_ping_device(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
         return f"PING OK from {device_ip}: {line}"
-    except socket.timeout:
+    except TimeoutError:
         return f"PING timeout from {device_ip} after {timeout_s:.1f}s"
     except Exception as exc:  # noqa: BLE001
         return f"PING failed for {device_ip}: {exc}"
@@ -333,13 +364,15 @@ def query_device_status(device_ip: str, timeout_s: float = 2.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        sock.sendto(b"GET_STATUS", (device_ip, DISCOVER_CONTROL_PORT))
-        data, (src_ip, _src_port) = sock.recvfrom(2048)
-        if src_ip != device_ip:
-            return f"GET_STATUS got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-        line = data.decode("utf-8", errors="replace").strip()
-        return f"GET_STATUS OK from {device_ip}: {line}"
-    except socket.timeout:
+        status = protocol_get_device_status(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        payload = ",".join(f"{k}={v}" for k, v in status.items())
+        return f"GET_STATUS OK from {device_ip}: STATUS,{payload}"
+    except TimeoutError:
         return f"GET_STATUS timeout from {device_ip} after {timeout_s:.1f}s"
     except Exception as exc:  # noqa: BLE001
         return f"GET_STATUS failed for {device_ip}: {exc}"
@@ -351,13 +384,15 @@ def query_device_config(device_ip: str, timeout_s: float = 2.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        sock.sendto(b"GET_CONFIG", (device_ip, DISCOVER_CONTROL_PORT))
-        data, (src_ip, _src_port) = sock.recvfrom(2048)
-        if src_ip != device_ip:
-            return f"GET_CONFIG got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-        line = data.decode("utf-8", errors="replace").strip()
-        return f"GET_CONFIG OK from {device_ip}: {line}"
-    except socket.timeout:
+        config = protocol_get_device_config(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        payload = ",".join(f"{k}={v}" for k, v in config.items())
+        return f"GET_CONFIG OK from {device_ip}: CONFIG,{payload}"
+    except TimeoutError:
         return f"GET_CONFIG timeout from {device_ip} after {timeout_s:.1f}s"
     except Exception as exc:  # noqa: BLE001
         return f"GET_CONFIG failed for {device_ip}: {exc}"
@@ -369,13 +404,15 @@ def query_device_diagnostics(device_ip: str, timeout_s: float = 2.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        sock.sendto(b"GET_DIAGNOSTICS", (device_ip, DISCOVER_CONTROL_PORT))
-        data, (src_ip, _src_port) = sock.recvfrom(2048)
-        if src_ip != device_ip:
-            return f"GET_DIAGNOSTICS got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-        line = data.decode("utf-8", errors="replace").strip()
-        return f"GET_DIAGNOSTICS OK from {device_ip}: {line}"
-    except socket.timeout:
+        diag = protocol_get_device_diagnostics(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        payload = ",".join(f"{k}={v}" for k, v in diag.items())
+        return f"GET_DIAGNOSTICS OK from {device_ip}: DIAG,{payload}"
+    except TimeoutError:
         return f"GET_DIAGNOSTICS timeout from {device_ip} after {timeout_s:.1f}s"
     except Exception as exc:  # noqa: BLE001
         return f"GET_DIAGNOSTICS failed for {device_ip}: {exc}"
@@ -387,13 +424,15 @@ def query_last_data(device_ip: str, timeout_s: float = 2.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        sock.sendto(b"GET_LAST_DATA", (device_ip, DISCOVER_CONTROL_PORT))
-        data, (src_ip, _src_port) = sock.recvfrom(2048)
-        if src_ip != device_ip:
-            return f"GET_LAST_DATA got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-        line = data.decode("utf-8", errors="replace").strip()
-        return f"GET_LAST_DATA OK from {device_ip}: {line}"
-    except socket.timeout:
+        data_dict = protocol_get_last_data(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        payload = ",".join(f"{k}={v}" for k, v in data_dict.items())
+        return f"GET_LAST_DATA OK from {device_ip}: LAST_DATA,{payload}"
+    except TimeoutError:
         return f"GET_LAST_DATA timeout from {device_ip} after {timeout_s:.1f}s"
     except Exception as exc:  # noqa: BLE001
         return f"GET_LAST_DATA failed for {device_ip}: {exc}"
@@ -404,25 +443,17 @@ def query_last_data(device_ip: str, timeout_s: float = 2.0) -> str:
 def set_device_config(device_ip: str, config_updates: dict[str, str], timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        params = ",".join(f"{k}={v}" for k, v in config_updates.items())
-        msg = f"SET_CONFIG,{params}".encode("utf-8")
         sock.settimeout(timeout_s)
-        first_line = ""
-        for attempt in range(2):
-            sock.sendto(msg, (device_ip, DISCOVER_CONTROL_PORT))
-            data, (src_ip, _src_port) = sock.recvfrom(2048)
-            if src_ip != device_ip:
-                return f"SET_CONFIG got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-            line = data.decode("utf-8", errors="replace").strip()
-            if attempt == 0:
-                first_line = line
-                continue
-            if line.startswith("ACK_CONFIG"):
-                return f"SET_CONFIG OK for {device_ip}: {line}"
-            return f"SET_CONFIG error from {device_ip}: {line} (after initial: {first_line})"
-        return f"SET_CONFIG error from {device_ip}: {first_line}"
-    except socket.timeout:
-        return f"SET_CONFIG timeout from {device_ip} after {timeout_s:.1f}s"
+        ok = protocol_set_device_config(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            config_updates=config_updates,
+            timeout_s=timeout_s,
+        )
+        if ok:
+            return f"SET_CONFIG OK for {device_ip}"
+        return f"SET_CONFIG failed/timeout from {device_ip}"
     except Exception as exc:  # noqa: BLE001
         return f"SET_CONFIG failed for {device_ip}: {exc}"
     finally:
@@ -433,22 +464,15 @@ def reboot_device(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        first_line = ""
-        for attempt in range(2):
-            sock.sendto(b"REBOOT", (device_ip, DISCOVER_CONTROL_PORT))
-            data, (src_ip, _src_port) = sock.recvfrom(2048)
-            if src_ip != device_ip:
-                return f"REBOOT got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-            line = data.decode("utf-8", errors="replace").strip()
-            if attempt == 0:
-                first_line = line
-                continue
-            if line.startswith("ACK_REBOOT"):
-                return f"REBOOT OK for {device_ip}: {line}"
-            return f"REBOOT error from {device_ip}: {line} (after initial: {first_line})"
-        return f"REBOOT error from {device_ip}: {first_line}"
-    except socket.timeout:
-        return f"REBOOT timeout from {device_ip} after {timeout_s:.1f}s"
+        ok = protocol_reboot_device(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        if ok:
+            return f"REBOOT OK for {device_ip}"
+        return f"REBOOT failed/timeout for {device_ip}"
     except Exception as exc:  # noqa: BLE001
         return f"REBOOT failed for {device_ip}: {exc}"
     finally:
@@ -459,22 +483,15 @@ def enter_data_mode(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        first_line = ""
-        for attempt in range(2):
-            sock.sendto(b"ENTER_DATA_MODE", (device_ip, DISCOVER_CONTROL_PORT))
-            data, (src_ip, _src_port) = sock.recvfrom(2048)
-            if src_ip != device_ip:
-                return f"ENTER_DATA_MODE got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-            line = data.decode("utf-8", errors="replace").strip()
-            if attempt == 0:
-                first_line = line
-                continue
-            if line.startswith("ACK_ENTER_DATA_MODE"):
-                return f"ENTER_DATA_MODE OK for {device_ip}: {line}"
-            return f"ENTER_DATA_MODE error from {device_ip}: {line} (after initial: {first_line})"
-        return f"ENTER_DATA_MODE error from {device_ip}: {first_line}"
-    except socket.timeout:
-        return f"ENTER_DATA_MODE timeout from {device_ip} after {timeout_s:.1f}s"
+        ok = protocol_enter_data_mode(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        if ok:
+            return f"ENTER_DATA_MODE OK for {device_ip}"
+        return f"ENTER_DATA_MODE failed/timeout for {device_ip}"
     except Exception as exc:  # noqa: BLE001
         return f"ENTER_DATA_MODE failed for {device_ip}: {exc}"
     finally:
@@ -485,22 +502,15 @@ def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
-        first_line = ""
-        for attempt in range(2):
-            sock.sendto(b"CLEAR_ERRORS", (device_ip, DISCOVER_CONTROL_PORT))
-            data, (src_ip, _src_port) = sock.recvfrom(2048)
-            if src_ip != device_ip:
-                return f"CLEAR_ERRORS got reply from unexpected source: {src_ip} ({data.decode('utf-8', errors='replace').strip()})"
-            line = data.decode("utf-8", errors="replace").strip()
-            if attempt == 0:
-                first_line = line
-                continue
-            if line.startswith("ACK_CLEAR_ERRORS"):
-                return f"CLEAR_ERRORS OK for {device_ip}: {line}"
-            return f"CLEAR_ERRORS error from {device_ip}: {line} (after initial: {first_line})"
-        return f"CLEAR_ERRORS error from {device_ip}: {first_line}"
-    except socket.timeout:
-        return f"CLEAR_ERRORS timeout from {device_ip} after {timeout_s:.1f}s"
+        ok = protocol_clear_device_errors(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        if ok:
+            return f"CLEAR_ERRORS OK for {device_ip}"
+        return f"CLEAR_ERRORS failed/timeout for {device_ip}"
     except Exception as exc:  # noqa: BLE001
         return f"CLEAR_ERRORS failed for {device_ip}: {exc}"
     finally:
@@ -511,7 +521,7 @@ def render_page(message: str = "") -> bytes:
     running, pid = MANAGER.status()
     forcing, force_pid = MANAGER.force_status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
-    force_state = f"RUNNING (PID {force_pid})" if forcing else "IDLE"
+    force_state = f"RUNNING (Task {force_pid})" if forcing else "IDLE"
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     online = [d for d in devices if d.get("status") == "ONLINE"]
     last_offset, last_preset = get_last_set_time_state()
@@ -679,6 +689,9 @@ def render_page(message: str = "") -> bytes:
     <form method="post" action="/stop">
       <button type="submit">Stop Normal Ops</button>
     </form>
+    <form method="post" action="/poll-now">
+      <button type="submit">Poll Now</button>
+    </form>
     {force_form_html}
     <div id="devicebox">Loading Arduino status...</div>
     <div id="logbox">Loading log...</div>
@@ -779,6 +792,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/stop":
             msg = MANAGER.stop()
+            self._send_html(render_page(msg))
+            return
+        if self.path == "/poll-now":
+            msg = MANAGER.poll_now()
             self._send_html(render_page(msg))
             return
         if self.path == "/force-upload":
@@ -972,8 +989,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    host = "0.0.0.0"
-    port = 5000
+    host = DEFAULT_WEB_HOST
+    port = DEFAULT_WEB_PORT
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"BSM web control ready: http://{host}:{port}")
 
