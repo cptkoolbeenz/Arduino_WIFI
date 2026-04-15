@@ -14,11 +14,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .db import (
+    clear_transfer_active,
     find_unique_ids_by_short_uid,
     init_db,
     log_discovery_event,
     log_slot_event,
     log_transfer_event,
+    set_transfer_active,
+    self_test_db_writes,
     upsert_device,
 )
 from .protocol import parse_payload, request_remote_file_list, send_time_sync, transfer_file_protocol
@@ -438,6 +441,9 @@ def _transfer_latest_file_for_device(
     target_yymmdd: str | None,
     file_output_root: Path,
     file_log_root: Path,
+    db_enabled: bool = False,
+    db_path: Path | None = None,
+    run_id: str = "",
 ) -> dict[str, str | float]:
     started = time.monotonic()
     uid = str(row["unique_id"])
@@ -520,21 +526,44 @@ def _transfer_latest_file_for_device(
         out_dir = file_output_root / display_id
         local_name = ensure_unique_filename(local_name, out_dir)
 
-        saved_path = transfer_file_protocol(
-            control_sock=control_sock,
-            device_ip=device_ip,
-            control_port=args.discover_port,
-            local_bind_ip=bind_ip,
-            requested_filename=next_file,
-            output_dir=out_dir,
-            device_uid=uid,
-            device_short_uid=short_uid,
-            log_root=file_log_root,
-            local_filename=local_name,
-            timeout_s=max(args.download_timeout, 30.0),
-            tolerant_integrity=args.transfer_tolerant,
-            mark_partial_received=args.mark_partial_received,
-        )
+        active_marked = False
+        if db_enabled and db_path is not None:
+            try:
+                set_transfer_active(
+                    db_path=db_path,
+                    unique_id=uid,
+                    run_id=run_id,
+                    ap_id=ap_id,
+                    device_ip=device_ip,
+                    source_filename=next_file,
+                )
+                active_marked = True
+            except Exception as exc:
+                print(f"Warning: DB write failed (set active transfer): {exc}")
+
+        try:
+            saved_path = transfer_file_protocol(
+                control_sock=control_sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                local_bind_ip=bind_ip,
+                requested_filename=next_file,
+                output_dir=out_dir,
+                device_uid=uid,
+                device_short_uid=short_uid,
+                log_root=file_log_root,
+                local_filename=local_name,
+                timeout_s=max(args.download_timeout, 30.0),
+                tolerant_integrity=args.transfer_tolerant,
+                mark_partial_received=args.mark_partial_received,
+            )
+        finally:
+            if active_marked and db_path is not None:
+                try:
+                    clear_transfer_active(db_path=db_path, unique_id=uid)
+                except Exception as exc:
+                    print(f"Warning: DB write failed (clear active transfer): {exc}")
+
         base_result["saved_path"] = str(saved_path)
         base_result["status"] = "saved"
         base_result["message"] = f"Saved file for {display_id}: {saved_path}"
@@ -560,6 +589,11 @@ def run_discovery(args: argparse.Namespace) -> int:
     if db_enabled:
         try:
             init_db(db_path)
+            ok, err = self_test_db_writes(db_path)
+            if not ok:
+                print(f"Warning: DB self-test failed for '{db_path}': {err}")
+                print("Warning: disabling DB logging for this run.")
+                db_enabled = False
         except Exception as exc:
             print(f"Warning: failed to initialize DB '{db_path}': {exc}")
             db_enabled = False
@@ -644,7 +678,11 @@ def run_discovery(args: argparse.Namespace) -> int:
         sock.close()
         print("No Arduino IDs discovered.")
         if db_enabled:
-            log_discovery_event(db_path=db_path, run_id=run_id, status="none", message="No Arduino IDs discovered.")
+            try:
+                log_discovery_event(db_path=db_path, run_id=run_id, status="none", message="No Arduino IDs discovered.")
+            except Exception as exc:
+                print(f"Warning: DB write failed; disabling DB logging for this run: {exc}")
+                db_enabled = False
         return 1
 
     rows = [discovered[uid] for uid in sorted(discovered)]
@@ -682,19 +720,28 @@ def run_discovery(args: argparse.Namespace) -> int:
         if short_uid:
             short_uid_to_uids.setdefault(short_uid, []).append(uid)
             if db_enabled:
-                existing = [x for x in find_unique_ids_by_short_uid(db_path, short_uid) if x and x != uid]
+                try:
+                    existing = [x for x in find_unique_ids_by_short_uid(db_path, short_uid) if x and x != uid]
+                except Exception as exc:
+                    print(f"Warning: DB read failed; disabling DB logging for this run: {exc}")
+                    db_enabled = False
+                    existing = []
                 if existing:
                     row["short_uid_collision"] = 1
                     row["short_uid_collision_note"] = "Existing: " + ",".join(sorted(set(existing)))
                     msg = f"Short UID collision for {uid}: {short_uid} already used by {','.join(sorted(set(existing)))}"
                     print(f"Warning: {msg}")
-                    log_discovery_event(
-                        db_path=db_path,
-                        run_id=run_id,
-                        status="short_uid_collision",
-                        row=row,
-                        message=msg,
-                    )
+                    try:
+                        log_discovery_event(
+                            db_path=db_path,
+                            run_id=run_id,
+                            status="short_uid_collision",
+                            row=row,
+                            message=msg,
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed; disabling DB logging for this run: {exc}")
+                        db_enabled = False
 
         if source == "default":
             if uid not in default_warned:
@@ -720,24 +767,32 @@ def run_discovery(args: argparse.Namespace) -> int:
             msg = f"Short UID collision in current discovery run: {short_uid} -> {joined}"
             print(f"Warning: {msg}")
             if db_enabled:
-                log_discovery_event(
-                    db_path=db_path,
-                    run_id=run_id,
-                    status="short_uid_collision",
-                    row=row,
-                    message=msg,
-                )
+                try:
+                    log_discovery_event(
+                        db_path=db_path,
+                        run_id=run_id,
+                        status="short_uid_collision",
+                        row=row,
+                        message=msg,
+                    )
+                except Exception as exc:
+                    print(f"Warning: DB write failed; disabling DB logging for this run: {exc}")
+                    db_enabled = False
 
     for row in rows:
         if db_enabled:
-            upsert_device(db_path, row)
-            log_discovery_event(
-                db_path=db_path,
-                run_id=run_id,
-                status="discovered",
-                row=row,
-                message="Device discovered and mapped.",
-            )
+            try:
+                upsert_device(db_path, row)
+                log_discovery_event(
+                    db_path=db_path,
+                    run_id=run_id,
+                    status="discovered",
+                    row=row,
+                    message="Device discovered and mapped.",
+                )
+            except Exception as exc:
+                print(f"Warning: DB write failed; disabling DB logging for this run: {exc}")
+                db_enabled = False
 
     print(f"Discovered {len(rows)} Arduino device(s):")
     print("unique_id, short_uid, network_uid, udp_target_ip, device_ip, recv_ip")
@@ -825,15 +880,18 @@ def run_discovery(args: argparse.Namespace) -> int:
             running_total, running_by_ap = slot_manager.snapshot()
             print(f"{uid}: acquired slot ap={ap_id} running_total={running_total} running_by_ap={running_by_ap}")
             if db_enabled:
-                log_slot_event(
-                    db_path=db_path,
-                    run_id=run_id,
-                    unique_id=uid,
-                    ap_id=ap_id,
-                    action="acquire",
-                    running_total=running_total,
-                    running_on_ap=int(running_by_ap.get(ap_id, 0)),
-                )
+                try:
+                    log_slot_event(
+                        db_path=db_path,
+                        run_id=run_id,
+                        unique_id=uid,
+                        ap_id=ap_id,
+                        action="acquire",
+                        running_total=running_total,
+                        running_on_ap=int(running_by_ap.get(ap_id, 0)),
+                    )
+                except Exception as exc:
+                    print(f"Warning: DB write failed (slot acquire): {exc}")
             try:
                 return _transfer_latest_file_for_device(
                     row=row,
@@ -842,21 +900,27 @@ def run_discovery(args: argparse.Namespace) -> int:
                     target_yymmdd=target_yymmdd,
                     file_output_root=file_output_root,
                     file_log_root=file_log_root,
+                    db_enabled=db_enabled,
+                    db_path=db_path,
+                    run_id=run_id,
                 )
             finally:
                 slot_manager.release(ap_id)
                 running_total, running_by_ap = slot_manager.snapshot()
                 print(f"{uid}: released slot ap={ap_id} running_total={running_total} running_by_ap={running_by_ap}")
                 if db_enabled:
-                    log_slot_event(
-                        db_path=db_path,
-                        run_id=run_id,
-                        unique_id=uid,
-                        ap_id=ap_id,
-                        action="release",
-                        running_total=running_total,
-                        running_on_ap=int(running_by_ap.get(ap_id, 0)),
-                    )
+                    try:
+                        log_slot_event(
+                            db_path=db_path,
+                            run_id=run_id,
+                            unique_id=uid,
+                            ap_id=ap_id,
+                            action="release",
+                            running_total=running_total,
+                            running_on_ap=int(running_by_ap.get(ap_id, 0)),
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed (slot release): {exc}")
 
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = [pool.submit(_worker, row) for row in rows]
@@ -874,7 +938,10 @@ def run_discovery(args: argparse.Namespace) -> int:
                 transfer_results.append(result)
                 print(str(result.get("message", "")))
                 if db_enabled:
-                    log_transfer_event(db_path=db_path, run_id=run_id, result=result)
+                    try:
+                        log_transfer_event(db_path=db_path, run_id=run_id, result=result)
+                    except Exception as exc:
+                        print(f"Warning: DB write failed (transfer event): {exc}")
 
         status_counts = Counter(str(r.get("status", "")) for r in transfer_results)
         ap_saved_counts = Counter(str(r.get("ap_id", default_ap)) for r in transfer_results if str(r.get("status", "")) == "saved")

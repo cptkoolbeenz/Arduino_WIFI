@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from .cloud import run_cloud_upload_cycle
-from .db import init_db, log_scheduler_cycle
+from .db import init_db, log_scheduler_cycle, self_test_db_writes
 from .discovery import run_discovery
 
 
@@ -64,6 +64,11 @@ def run_scheduled(args: argparse.Namespace) -> int:
     if db_enabled:
         try:
             init_db(db_path)
+            ok, err = self_test_db_writes(db_path)
+            if not ok:
+                print(f"Warning: DB self-test failed for '{db_path}': {err}")
+                print("Warning: disabling DB logging for scheduled mode.")
+                db_enabled = False
         except Exception as exc:
             print(f"Warning: failed to initialize DB '{db_path}': {exc}")
             db_enabled = False
@@ -103,13 +108,17 @@ def run_scheduled(args: argparse.Namespace) -> int:
                 print(f"[{now_local.isoformat(timespec='seconds')}] Starting discovery cycle #{discovery_cycle_count}")
                 rc = run_discovery(args)
                 if db_enabled:
-                    log_scheduler_cycle(
-                        db_path=db_path,
-                        cycle_type="discovery",
-                        cycle_index=discovery_cycle_count,
-                        rc=rc,
-                        message="Scheduled discovery cycle complete.",
-                    )
+                    try:
+                        log_scheduler_cycle(
+                            db_path=db_path,
+                            cycle_type="discovery",
+                            cycle_index=discovery_cycle_count,
+                            rc=rc,
+                            message="Scheduled discovery cycle complete.",
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed; disabling DB logging for scheduled mode: {exc}")
+                        db_enabled = False
                 end_time = dt.datetime.now().isoformat(timespec="seconds")
                 print(f"[{end_time}] Discovery cycle #{discovery_cycle_count} complete (rc={rc})")
                 time.sleep(max(args.cycle_interval_sec, 1.0))
@@ -118,13 +127,17 @@ def run_scheduled(args: argparse.Namespace) -> int:
                 print(f"[{now_local.isoformat(timespec='seconds')}] Starting cloud cycle #{cloud_cycle_count}")
                 rc = run_cloud_upload_cycle(args)
                 if db_enabled:
-                    log_scheduler_cycle(
-                        db_path=db_path,
-                        cycle_type="cloud",
-                        cycle_index=cloud_cycle_count,
-                        rc=rc,
-                        message="Scheduled cloud cycle complete.",
-                    )
+                    try:
+                        log_scheduler_cycle(
+                            db_path=db_path,
+                            cycle_type="cloud",
+                            cycle_index=cloud_cycle_count,
+                            rc=rc,
+                            message="Scheduled cloud cycle complete.",
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed; disabling DB logging for scheduled mode: {exc}")
+                        db_enabled = False
                 end_time = dt.datetime.now().isoformat(timespec="seconds")
                 print(f"[{end_time}] Cloud cycle #{cloud_cycle_count} complete (rc={rc})")
                 time.sleep(max(args.cloud_cycle_interval_sec, 1.0))

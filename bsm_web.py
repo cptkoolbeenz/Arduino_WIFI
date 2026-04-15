@@ -28,7 +28,7 @@ from bsm_network.config import (
     build_poll_now_argv,
     parse_args,
 )
-from bsm_network.db import read_devices_snapshot
+from bsm_network.db import is_transfer_active, read_devices_snapshot
 from bsm_network.discovery import run_discovery
 from bsm_network.protocol import (
     clear_device_errors as protocol_clear_device_errors,
@@ -509,6 +509,20 @@ def enter_data_mode(device_ip: str, timeout_s: float = 3.0) -> str:
         sock.close()
 
 
+def can_enter_data_mode(uid: str) -> tuple[bool, str]:
+    db_path = Path(DEFAULT_DB_PATH)
+    try:
+        active = is_transfer_active(db_path, uid)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Cannot verify transfer state for {uid}: {exc}"
+    if active:
+        return False, (
+            f"ENTER_DATA_MODE blocked for {uid}: file transfer is in progress. "
+            "Wait until transfer completes, then try again."
+        )
+    return True, ""
+
+
 def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -984,6 +998,10 @@ class Handler(BaseHTTPRequestHandler):
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
+                return
+            ok, reason = can_enter_data_mode(uid=uid)
+            if not ok:
+                self._send_html(render_page(reason))
                 return
             msg = enter_data_mode(device_ip=device_ip)
             self._send_html(render_page(msg))
