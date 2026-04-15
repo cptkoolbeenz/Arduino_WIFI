@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import time
+from pathlib import Path
 
 from .cloud import run_cloud_upload_cycle
+from .db import init_db, log_scheduler_cycle
 from .discovery import run_discovery
 
 
@@ -57,6 +59,14 @@ def run_scheduled(args: argparse.Namespace) -> int:
     in_cloud_prev = None
     discovery_cycle_count = 0
     cloud_cycle_count = 0
+    db_enabled = bool(getattr(args, "db_log", True))
+    db_path = Path(str(getattr(args, "db_path", "data/bsm_network.db"))).expanduser()
+    if db_enabled:
+        try:
+            init_db(db_path)
+        except Exception as exc:
+            print(f"Warning: failed to initialize DB '{db_path}': {exc}")
+            db_enabled = False
     schedule_ref = f"UTC{args.time_offset_hours:+g}h"
     print(
         f"Scheduled mode enabled: discovery={args.start_hour:02d}:00-{args.end_hour:02d}:00 "
@@ -92,6 +102,14 @@ def run_scheduled(args: argparse.Namespace) -> int:
                 discovery_cycle_count += 1
                 print(f"[{now_local.isoformat(timespec='seconds')}] Starting discovery cycle #{discovery_cycle_count}")
                 rc = run_discovery(args)
+                if db_enabled:
+                    log_scheduler_cycle(
+                        db_path=db_path,
+                        cycle_type="discovery",
+                        cycle_index=discovery_cycle_count,
+                        rc=rc,
+                        message="Scheduled discovery cycle complete.",
+                    )
                 end_time = dt.datetime.now().isoformat(timespec="seconds")
                 print(f"[{end_time}] Discovery cycle #{discovery_cycle_count} complete (rc={rc})")
                 time.sleep(max(args.cycle_interval_sec, 1.0))
@@ -99,6 +117,14 @@ def run_scheduled(args: argparse.Namespace) -> int:
                 cloud_cycle_count += 1
                 print(f"[{now_local.isoformat(timespec='seconds')}] Starting cloud cycle #{cloud_cycle_count}")
                 rc = run_cloud_upload_cycle(args)
+                if db_enabled:
+                    log_scheduler_cycle(
+                        db_path=db_path,
+                        cycle_type="cloud",
+                        cycle_index=cloud_cycle_count,
+                        rc=rc,
+                        message="Scheduled cloud cycle complete.",
+                    )
                 end_time = dt.datetime.now().isoformat(timespec="seconds")
                 print(f"[{end_time}] Cloud cycle #{cloud_cycle_count} complete (rc={rc})")
                 time.sleep(max(args.cloud_cycle_interval_sec, 1.0))

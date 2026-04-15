@@ -204,6 +204,39 @@ String getChipIdHex() {
 }
 
 /***********************
+ * Builds a stable 6-char short UID from full chip ID.
+ * Uses FNV-1a hash + extra mixing + Base32 alphabet.
+ * @param fullId Full chip unique ID (hex string).
+ * @param outLen Number of chars to emit (default 6).
+ * @return Deterministic short UID.
+ ***********************/
+String shortUidFromHash(const String &fullId, size_t outLen = 6) {
+  uint32_t h = 2166136261UL;  // FNV offset basis
+  for (size_t i = 0; i < fullId.length(); ++i) {
+    h ^= (uint8_t)fullId[i];
+    h *= 16777619UL;  // FNV prime
+  }
+
+  // Extra avalanche for better bit diffusion.
+  h ^= (h >> 16);
+  h *= 0x7feb352dUL;
+  h ^= (h >> 15);
+  h *= 0x846ca68bUL;
+  h ^= (h >> 16);
+
+  const char ALPHABET[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  String out = "";
+  out.reserve(outLen);
+  uint32_t x = h;
+  for (size_t i = 0; i < outLen; ++i) {
+    uint8_t idx = x & 31U;
+    out += ALPHABET[idx];
+    x = (x >> 5) ^ (x << 27);
+  }
+  return out;
+}
+
+/***********************
  * Returns the ESP32-S3 station MAC address as uppercase hex.
  * @return MAC string without separators, e.g. AABBCCDDEEFF.
  ***********************/
@@ -1793,7 +1826,7 @@ void setup() {
   delay(500); // give time for serial to start up
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
-  deviceID_6 = (deviceId.length() >= 6) ? deviceId.substring(deviceId.length() - 6) : deviceId;
+  deviceID_6 = shortUidFromHash(deviceId, 6);
   networkHostname = buildNetworkHostname();
  
 

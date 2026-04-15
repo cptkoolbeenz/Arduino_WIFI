@@ -11,8 +11,8 @@ DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
 DEFAULT_LOCAL_OFFSET = -3 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
 DEFAULT_HOST_LABEL = "NORTH_END_WIFI"
-DEFAULT_START_HOUR = 10
-DEFAULT_END_HOUR = 18
+DEFAULT_START_HOUR = 7
+DEFAULT_END_HOUR = 19
 DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
 DEFAULT_PREFER_FILE_PREFIX = "TR"
@@ -20,6 +20,10 @@ DEFAULT_FILE_DAY = "yesterday"
 DEFAULT_DISCOVER_CSV = "data/discovered_devices.csv"
 DEFAULT_WEB_HOST = "0.0.0.0"
 DEFAULT_WEB_PORT = 5000
+DEFAULT_AP_ID = "DEFAULT"
+DEFAULT_AP_LIMIT = 1
+DEFAULT_MAX_CONCURRENT_TRANSFERS = 0
+DEFAULT_DB_PATH = "data/bsm_network.db"
 
 
 def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
@@ -90,6 +94,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         sync_time=False,
         cloud_enabled=True,
         scheduled=True,
+        db_log=True,
     )
     parser.add_argument("--bind", default=DEFAULT_BIND_IP, help=f"Local interface/IP to bind (default: {DEFAULT_BIND_IP})")
     parser.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"UDP port to listen on (default: {DEFAULT_LISTEN_PORT})")
@@ -105,6 +110,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--discover-attempts", type=int, default=8, help="How many poll broadcasts to send (default: 8)")
     parser.add_argument("--discover-interval", type=float, default=0.5, help="Seconds between poll broadcasts (default: 0.5)")
     parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
+    parser.add_argument(
+        "--network-map",
+        default="",
+        help="Optional JSON config for AP/burrow mapping (supports keys: device_to_ap, device_to_burrow, ap_limits, default_ap)",
+    )
+    parser.add_argument(
+        "--runtime-ap-map",
+        default="",
+        help="Optional JSON runtime AP overrides (same schema as --network-map, checked first)",
+    )
+    parser.add_argument(
+        "--default-ap-id",
+        default=DEFAULT_AP_ID,
+        help=f"Fallback AP bucket when no mapping exists (default: {DEFAULT_AP_ID})",
+    )
+    parser.add_argument(
+        "--default-ap-limit",
+        type=int,
+        default=DEFAULT_AP_LIMIT,
+        help=f"Per-AP transfer cap for fallback AP bucket (default: {DEFAULT_AP_LIMIT})",
+    )
+    parser.add_argument(
+        "--max-concurrent-transfers",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT_TRANSFERS,
+        help=(
+            "Global transfer cap across all AP buckets. "
+            "0 means auto (sum of AP limits, minimum 1)."
+        ),
+    )
+    parser.add_argument(
+        "--db-path",
+        default=DEFAULT_DB_PATH,
+        help=f"SQLite DB path for network events/device state (default: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument("--db-log", action="store_true", dest="db_log", help="Enable SQLite logging (default: enabled)")
+    parser.add_argument("--no-db-log", action="store_false", dest="db_log", help="Disable SQLite logging")
     parser.add_argument("--sync-time", action="store_true", help="Sync Arduino RTC from controller time before retrieval")
     parser.add_argument("--no-sync-time", action="store_false", dest="sync_time", help="Disable RTC sync command")
     parser.add_argument(

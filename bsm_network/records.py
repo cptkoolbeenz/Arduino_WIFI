@@ -30,6 +30,7 @@ def write_discovery_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
             f,
             fieldnames=[
                 "unique_id",
+                "short_uid",
                 "network_uid",
                 "network_hostname",
                 "wifi_mac",
@@ -38,6 +39,11 @@ def write_discovery_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
                 "udp_target_port",
                 "recv_ip",
                 "recv_port",
+                "ap_id",
+                "ap_source",
+                "burrow_id",
+                "short_uid_collision",
+                "short_uid_collision_note",
                 "last_seen",
             ],
         )
@@ -67,6 +73,7 @@ def save_device_data_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
 def append_file_receive_log(
     log_root: Path,
     device_uid: str,
+    device_short_uid: str | None,
     source_filename: str,
     saved_path: Path,
     transfer_id: str,
@@ -75,8 +82,10 @@ def append_file_receive_log(
     transfer_seconds: float,
 ) -> Path:
     log_root.mkdir(parents=True, exist_ok=True)
-    device_uid_6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
-    log_path = log_root / f"{device_uid_6}.csv"
+    token = (device_short_uid or "").strip().upper()
+    if not token:
+        token = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    log_path = log_root / f"{token}.csv"
     exists = log_path.exists()
 
     with log_path.open("a", newline="", encoding="utf-8") as f:
@@ -97,7 +106,7 @@ def append_file_receive_log(
         writer.writerow(
             [
                 dt.datetime.now().isoformat(timespec="seconds"),
-                device_uid_6,
+                token,
                 source_filename,
                 str(saved_path),
                 transfer_id,
@@ -110,9 +119,11 @@ def append_file_receive_log(
     return log_path
 
 
-def load_received_filenames(log_root: Path, device_uid: str) -> set[str]:
-    device_uid_6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
-    log_path = log_root / f"{device_uid_6}.csv"
+def load_received_filenames(log_root: Path, device_uid: str, device_short_uid: str | None = None) -> set[str]:
+    token = (device_short_uid or "").strip().upper()
+    if not token:
+        token = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    log_path = log_root / f"{token}.csv"
     if not log_path.exists():
         return set()
 
@@ -126,12 +137,19 @@ def load_received_filenames(log_root: Path, device_uid: str) -> set[str]:
     return seen
 
 
-def build_local_filename(remote_filename: str, device_uid: str, extra_tag: str = "") -> str:
+def build_local_filename(
+    remote_filename: str,
+    device_uid: str,
+    extra_tag: str = "",
+    device_short_uid: str | None = None,
+) -> str:
     base = Path(remote_filename).name
     stem = Path(base).stem
     suffix = Path(base).suffix or ".TXT"
 
-    uid6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
+    uid6 = (device_short_uid or "").strip().upper()
+    if not uid6:
+        uid6 = (device_uid[-6:] if len(device_uid) >= 6 else device_uid).upper()
     tag = ""
     if extra_tag:
         safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", extra_tag)

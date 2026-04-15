@@ -62,6 +62,13 @@ python3 bsm_network.py --cloud-once
 - `--discover-attempts DISCOVER_ATTEMPTS`: Number of poll broadcasts. Default: `8`.
 - `--discover-interval DISCOVER_INTERVAL`: Seconds between poll broadcasts. Default: `0.5`.
 - `--discover-csv DISCOVER_CSV`: Output CSV path for discovered device table.
+- `--network-map NETWORK_MAP`: Optional JSON with AP routing defaults (`device_to_ap`, `device_to_burrow`, `ap_limits`, `default_ap`).
+- `--runtime-ap-map RUNTIME_AP_MAP`: Optional JSON with live AP overrides (checked before `--network-map`).
+- `--default-ap-id DEFAULT_AP_ID`: Fallback AP bucket when no mapping is found. Default: `DEFAULT`.
+- `--default-ap-limit DEFAULT_AP_LIMIT`: Per-AP cap for fallback bucket. Default: `1`.
+- `--max-concurrent-transfers MAX_CONCURRENT_TRANSFERS`: Global transfer cap; `0` auto-uses sum of AP limits.
+- `--db-path DB_PATH`: SQLite path for network/device activity logs. Default: `data/bsm_network.db`.
+- `--db-log` / `--no-db-log`: Enable/disable SQLite logging (enabled by default).
 
 ### Time Sync
 
@@ -136,6 +143,32 @@ python3 bsm_network.py \
   --transfer-latest-file \
   --prefer-file-prefix TR \
   --file-day today
+```
+
+Single-AP home test (2 concurrent transfers max via AP bucket):
+
+```bash
+python3 bsm_network.py \
+  --discover \
+  --network-map docs/network_map.example.json \
+  --default-ap-id AP_HOME \
+  --default-ap-limit 2 \
+  --max-concurrent-transfers 2
+```
+
+Network map JSON keys (including field label mapping):
+
+```json
+{
+  "default_ap": "AP_HOME",
+  "ap_limits": { "AP_HOME": 2, "DEFAULT": 1 },
+  "device_to_ap": {
+    "31011F0B383136326B7F33354B573355": "AP_HOME"
+  },
+  "device_to_burrow": {
+    "31011F0B383136326B7F33354B573355": "BURROW_01"
+  }
+}
 ```
 
 Scheduled discover/transfer during daytime, cloud overnight:

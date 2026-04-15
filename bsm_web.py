@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from bsm_network.config import (
+    DEFAULT_DB_PATH,
     DEFAULT_DISCOVER_CSV,
     DEFAULT_DISCOVER_PORT,
     DEFAULT_WEB_HOST,
@@ -27,6 +28,7 @@ from bsm_network.config import (
     build_poll_now_argv,
     parse_args,
 )
+from bsm_network.db import read_devices_snapshot
 from bsm_network.discovery import run_discovery
 from bsm_network.protocol import (
     clear_device_errors as protocol_clear_device_errors,
@@ -235,29 +237,38 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
         return "(No devices discovered yet)"
 
     lines = []
-    lines.append("status   unique_id                              network_uid       device_ip      recv_ip        last_seen")
-    lines.append("------   ------------------------------------   ---------------   -----------   -----------    -------------------")
+    lines.append("status   burrow_id      short_uid  unique_id                              ap_id       network_uid       device_ip      recv_ip        last_seen")
+    lines.append("------   ------------   --------   ------------------------------------   ---------   ---------------   -----------   -----------    -------------------")
     for row in rows:
         status = row.get("status", "UNKNOWN")
+        burrow_id = row.get("burrow_id", "")
+        short_uid = row.get("short_uid", "")
+        if str(row.get("short_uid_collision", "0")) in {"1", "true", "True"}:
+            short_uid = f"{short_uid}*"
         uid = row.get("unique_id", "")
+        ap_id = row.get("ap_id", "")
         net_uid = row.get("network_uid", "")
         dev_ip = row.get("device_ip", "")
         recv_ip = row.get("recv_ip", "")
         last_seen_raw = row.get("last_seen", "")
-        lines.append(f"{status:<6}   {uid:<36}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw}")
+        lines.append(f"{status:<6}   {burrow_id:<12}   {short_uid:<8}   {uid:<36}   {ap_id:<9}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw}")
     return "\n".join(lines)
 
 
 def read_devices_rows(path: Path, online_seconds: int = 600) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
+    db_rows = read_devices_snapshot(Path(DEFAULT_DB_PATH))
+    if db_rows:
+        rows = db_rows
+    else:
+        if not path.exists():
+            return []
 
-    rows: list[dict[str, str]] = []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_clean = {k: (v or "").strip() for k, v in row.items()}
-            rows.append(row_clean)
+        rows = []
+        with path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                row_clean = {k: (v or "").strip() for k, v in row.items()}
+                rows.append(row_clean)
 
     now = dt.datetime.now()
     for row in rows:
@@ -531,7 +542,14 @@ def render_page(message: str = "") -> bytes:
         for d in online:
             uid = d.get("unique_id", "")
             ip = d.get("device_ip", "") or d.get("recv_ip", "")
-            label = f"{uid[-6:]} @ {ip} ({uid})"
+            burrow = (d.get("burrow_id", "") or "").strip()
+            burrow_prefix = f"{burrow} | " if burrow else ""
+            short_uid = (d.get("short_uid", "") or "").strip()
+            if not short_uid:
+                short_uid = uid[-6:]
+            if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
+                short_uid = f"{short_uid}*"
+            label = f"{burrow_prefix}{short_uid} @ {ip} ({uid})"
             value = f"{uid}|{ip}"
             opts.append(f'<option value="{html.escape(value)}">{html.escape(label)}</option>')
         force_select_html = "\n".join(opts)

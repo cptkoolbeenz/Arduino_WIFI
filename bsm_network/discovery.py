@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import json
 import datetime as dt
 import ipaddress
 import re
 import socket
 import subprocess
+import threading
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from .db import (
+    find_unique_ids_by_short_uid,
+    init_db,
+    log_discovery_event,
+    log_slot_event,
+    log_transfer_event,
+    upsert_device,
+)
 from .protocol import parse_payload, request_remote_file_list, send_time_sync, transfer_file_protocol
 from .records import (
     build_local_filename,
@@ -203,7 +215,355 @@ def collect_device_lines(
     return rows
 
 
+def _short_uid_from_unique_id(full_id: str, out_len: int = 6) -> str:
+    data = (full_id or "").strip()
+    if not data:
+        return ""
+
+    h = 2166136261  # FNV-1a offset
+    for b in data.encode("utf-8", errors="ignore"):
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF  # FNV-1a prime
+
+    # Extra avalanche to improve diffusion.
+    h ^= (h >> 16)
+    h = (h * 0x7FEB352D) & 0xFFFFFFFF
+    h ^= (h >> 15)
+    h = (h * 0x846CA68B) & 0xFFFFFFFF
+    h ^= (h >> 16)
+
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    out = []
+    x = h & 0xFFFFFFFF
+    for _ in range(max(1, out_len)):
+        out.append(alphabet[x & 31])
+        x = ((x >> 5) ^ ((x << 27) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    return "".join(out)
+
+
+def _normalize_ap_id(value: str | None) -> str:
+    token = (value or "").strip()
+    return token if token else "DEFAULT"
+
+
+def _normalize_map_key(value: str | None) -> str:
+    return (value or "").strip().upper()
+
+
+def _load_json_config(path_value: str) -> dict:
+    path = Path(path_value).expanduser()
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a JSON object: {path}")
+    return data
+
+
+def _extract_device_mapping(data: dict) -> dict[str, str]:
+    raw = data.get("device_to_ap")
+    if raw is None:
+        raw = data.get("mappings", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = _normalize_map_key(str(k))
+        ap = _normalize_ap_id(str(v))
+        if key:
+            out[key] = ap
+    return out
+
+
+def _extract_ap_limits(data: dict) -> dict[str, int]:
+    raw = data.get("ap_limits", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        ap = _normalize_ap_id(str(k))
+        try:
+            limit = int(v)
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            out[ap] = limit
+    return out
+
+
+def _extract_burrow_mapping(data: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+
+    raw_simple = data.get("device_to_burrow", {})
+    if isinstance(raw_simple, dict):
+        for k, v in raw_simple.items():
+            key = _normalize_map_key(str(k))
+            burrow_id = str(v).strip()
+            if key and burrow_id:
+                out[key] = burrow_id
+
+    raw_meta = data.get("device_meta", {})
+    if isinstance(raw_meta, dict):
+        for k, meta in raw_meta.items():
+            key = _normalize_map_key(str(k))
+            if not key or not isinstance(meta, dict):
+                continue
+            burrow_id = str(meta.get("burrow_id", "")).strip()
+            if burrow_id:
+                out[key] = burrow_id
+    return out
+
+
+def _build_ap_routing_config(args: argparse.Namespace) -> tuple[dict[str, str], dict[str, int], str, dict[str, str]]:
+    default_ap = _normalize_ap_id(getattr(args, "default_ap_id", "DEFAULT"))
+    default_limit = max(1, int(getattr(args, "default_ap_limit", 1)))
+
+    merged_mapping: dict[str, str] = {}
+    merged_limits: dict[str, int] = {}
+    merged_burrow: dict[str, str] = {}
+
+    for label, path_value in (("network-map", args.network_map), ("runtime-ap-map", args.runtime_ap_map)):
+        if not path_value:
+            continue
+        try:
+            data = _load_json_config(path_value)
+        except Exception as exc:
+            print(f"Warning: failed to load {label} '{path_value}': {exc}")
+            continue
+
+        file_default_ap = _normalize_ap_id(str(data.get("default_ap", "") or ""))
+        if file_default_ap and file_default_ap != "DEFAULT":
+            default_ap = file_default_ap
+        merged_limits.update(_extract_ap_limits(data))
+        merged_mapping.update(_extract_device_mapping(data))
+        merged_burrow.update(_extract_burrow_mapping(data))
+
+    if default_ap not in merged_limits:
+        merged_limits[default_ap] = default_limit
+    if "DEFAULT" not in merged_limits:
+        merged_limits["DEFAULT"] = default_limit
+
+    return merged_mapping, merged_limits, default_ap, merged_burrow
+
+
+def _resolve_ap_for_device(
+    row: dict[str, str | int],
+    device_to_ap: dict[str, str],
+    default_ap: str,
+) -> tuple[str, str]:
+    for key in (
+        _normalize_map_key(str(row.get("unique_id", ""))),
+        _normalize_map_key(str(row.get("network_uid", ""))),
+        _normalize_map_key(str(row.get("device_ip", ""))),
+        _normalize_map_key(str(row.get("recv_ip", ""))),
+    ):
+        if not key:
+            continue
+        ap = device_to_ap.get(key)
+        if ap:
+            return ap, "mapping"
+    return default_ap, "default"
+
+
+def _resolve_burrow_for_device(
+    row: dict[str, str | int],
+    device_to_burrow: dict[str, str],
+) -> str:
+    for key in (
+        _normalize_map_key(str(row.get("unique_id", ""))),
+        _normalize_map_key(str(row.get("network_uid", ""))),
+        _normalize_map_key(str(row.get("device_ip", ""))),
+        _normalize_map_key(str(row.get("recv_ip", ""))),
+    ):
+        if not key:
+            continue
+        burrow_id = device_to_burrow.get(key, "").strip()
+        if burrow_id:
+            return burrow_id
+    return ""
+
+
+class APSlotManager:
+    def __init__(self, ap_limits: dict[str, int], global_limit: int):
+        self.ap_limits = ap_limits
+        self.global_limit = max(1, global_limit)
+        self.running_by_ap: dict[str, int] = {}
+        self.running_total = 0
+        self._cond = threading.Condition(threading.Lock())
+
+    def acquire(self, ap_id: str) -> None:
+        limit = max(1, self.ap_limits.get(ap_id, self.ap_limits.get("DEFAULT", 1)))
+        with self._cond:
+            while self.running_total >= self.global_limit or self.running_by_ap.get(ap_id, 0) >= limit:
+                self._cond.wait()
+            self.running_total += 1
+            self.running_by_ap[ap_id] = self.running_by_ap.get(ap_id, 0) + 1
+            if self.running_by_ap[ap_id] > limit:
+                print(f"Warning: AP slot invariant exceeded for {ap_id}: {self.running_by_ap[ap_id]} > {limit}")
+
+    def release(self, ap_id: str) -> None:
+        with self._cond:
+            if self.running_total > 0:
+                self.running_total -= 1
+            cur = self.running_by_ap.get(ap_id, 0)
+            if cur > 0:
+                self.running_by_ap[ap_id] = cur - 1
+            self._cond.notify_all()
+
+    def snapshot(self) -> tuple[int, dict[str, int]]:
+        with self._cond:
+            return self.running_total, dict(self.running_by_ap)
+
+
+def _open_device_control_socket(bind_ip: str) -> socket.socket:
+    requested_bind = (bind_ip or "").strip() or "0.0.0.0"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((requested_bind, 0))
+    except OSError:
+        if requested_bind != "0.0.0.0":
+            sock.bind(("0.0.0.0", 0))
+        else:
+            raise
+    sock.settimeout(0.2)
+    return sock
+
+
+def _transfer_latest_file_for_device(
+    row: dict[str, str | int],
+    args: argparse.Namespace,
+    bind_ip: str,
+    target_yymmdd: str | None,
+    file_output_root: Path,
+    file_log_root: Path,
+) -> dict[str, str | float]:
+    started = time.monotonic()
+    uid = str(row["unique_id"])
+    short_uid = str(row.get("short_uid", "")).strip().upper()
+    display_id = short_uid if short_uid else (uid[-6:] if len(uid) >= 6 else uid).upper()
+    device_ip = str(row["device_ip"] or row["recv_ip"])
+    ap_id = str(row.get("ap_id", "DEFAULT"))
+    network_uid = str(row.get("network_uid", ""))
+    burrow_id = str(row.get("burrow_id", ""))
+
+    base_result: dict[str, str | float] = {
+        "unique_id": uid,
+        "network_uid": network_uid,
+        "burrow_id": burrow_id,
+        "ap_id": ap_id,
+        "device_ip": device_ip,
+        "source_filename": "",
+        "saved_path": "",
+        "status": "error",
+        "message": "",
+        "error_text": "",
+        "duration_s": 0.0,
+    }
+
+    control_sock = _open_device_control_socket(bind_ip)
+    try:
+        if args.sync_time:
+            sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
+            synced = send_time_sync(
+                control_sock=control_sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                epoch=sync_epoch,
+                timeout_s=3.0,
+            )
+            if synced:
+                print(f"{uid}: RTC sync OK")
+            else:
+                print(f"{uid}: RTC sync failed/timeout")
+
+        remote_files = request_remote_file_list(
+            control_sock=control_sock,
+            device_ip=device_ip,
+            control_port=args.discover_port,
+            timeout_s=args.file_list_timeout,
+        )
+        if not remote_files:
+            base_result["status"] = "skip"
+            base_result["message"] = f"No files reported by {display_id} ({device_ip})."
+            return base_result
+
+        seen = load_received_filenames(file_log_root, uid, device_short_uid=short_uid)
+        if args.transfer_latest_even_if_seen:
+            next_file = select_most_recent_file(
+                remote_files,
+                prefer_prefix=args.prefer_file_prefix,
+                target_yymmdd=target_yymmdd,
+                tr_only=args.tr_only,
+            )
+        else:
+            next_file = select_most_recent_unsaved_file(
+                remote_files,
+                seen,
+                prefer_prefix=args.prefer_file_prefix,
+                target_yymmdd=target_yymmdd,
+                tr_only=args.tr_only,
+            )
+
+        if not next_file:
+            base_result["status"] = "skip"
+            base_result["message"] = f"No new files to fetch for {display_id}."
+            return base_result
+
+        base_result["source_filename"] = next_file
+        print(f"{display_id}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
+        extra_tag = ""
+        if args.transfer_latest_even_if_seen:
+            extra_tag = dt.datetime.now().strftime("R%Y%m%d_%H%M%S")
+        local_name = build_local_filename(next_file, uid, extra_tag=extra_tag, device_short_uid=short_uid)
+        out_dir = file_output_root / display_id
+        local_name = ensure_unique_filename(local_name, out_dir)
+
+        saved_path = transfer_file_protocol(
+            control_sock=control_sock,
+            device_ip=device_ip,
+            control_port=args.discover_port,
+            local_bind_ip=bind_ip,
+            requested_filename=next_file,
+            output_dir=out_dir,
+            device_uid=uid,
+            device_short_uid=short_uid,
+            log_root=file_log_root,
+            local_filename=local_name,
+            timeout_s=max(args.download_timeout, 30.0),
+            tolerant_integrity=args.transfer_tolerant,
+            mark_partial_received=args.mark_partial_received,
+        )
+        base_result["saved_path"] = str(saved_path)
+        base_result["status"] = "saved"
+        base_result["message"] = f"Saved file for {display_id}: {saved_path}"
+        return base_result
+    except Exception as exc:
+        source = str(base_result.get("source_filename", "")).strip()
+        if source:
+            base_result["message"] = f"Transfer failed for {display_id} file {source}: {exc}"
+        else:
+            base_result["message"] = f"Transfer failed for {display_id}: {exc}"
+        base_result["error_text"] = str(exc)
+        base_result["status"] = "error"
+        return base_result
+    finally:
+        base_result["duration_s"] = time.monotonic() - started
+        control_sock.close()
+
+
 def run_discovery(args: argparse.Namespace) -> int:
+    run_id = f"DISC_{int(time.time() * 1000)}"
+    db_enabled = bool(getattr(args, "db_log", True))
+    db_path = Path(str(getattr(args, "db_path", "data/bsm_network.db"))).expanduser()
+    if db_enabled:
+        try:
+            init_db(db_path)
+        except Exception as exc:
+            print(f"Warning: failed to initialize DB '{db_path}': {exc}")
+            db_enabled = False
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -283,6 +643,8 @@ def run_discovery(args: argparse.Namespace) -> int:
     if not discovered:
         sock.close()
         print("No Arduino IDs discovered.")
+        if db_enabled:
+            log_discovery_event(db_path=db_path, run_id=run_id, status="none", message="No Arduino IDs discovered.")
         return 1
 
     rows = [discovered[uid] for uid in sorted(discovered)]
@@ -300,13 +662,95 @@ def run_discovery(args: argparse.Namespace) -> int:
         row["network_hostname"] = net.get("network_hostname", "")
         row["wifi_mac"] = net.get("wifi_mac", "")
 
+    device_to_ap, ap_limits, default_ap, device_to_burrow = _build_ap_routing_config(args)
+    default_warned: set[str] = set()
+    short_uid_to_uids: dict[str, list[str]] = {}
+
+    for row in rows:
+        uid = str(row.get("unique_id", ""))
+        ap_id, source = _resolve_ap_for_device(row, device_to_ap, default_ap)
+        burrow_id = _resolve_burrow_for_device(row, device_to_burrow)
+        short_uid = _short_uid_from_unique_id(uid, 6)
+
+        row["ap_id"] = ap_id
+        row["ap_source"] = source
+        row["burrow_id"] = burrow_id
+        row["short_uid"] = short_uid
+        row["short_uid_collision"] = 0
+        row["short_uid_collision_note"] = ""
+
+        if short_uid:
+            short_uid_to_uids.setdefault(short_uid, []).append(uid)
+            if db_enabled:
+                existing = [x for x in find_unique_ids_by_short_uid(db_path, short_uid) if x and x != uid]
+                if existing:
+                    row["short_uid_collision"] = 1
+                    row["short_uid_collision_note"] = "Existing: " + ",".join(sorted(set(existing)))
+                    msg = f"Short UID collision for {uid}: {short_uid} already used by {','.join(sorted(set(existing)))}"
+                    print(f"Warning: {msg}")
+                    log_discovery_event(
+                        db_path=db_path,
+                        run_id=run_id,
+                        status="short_uid_collision",
+                        row=row,
+                        message=msg,
+                    )
+
+        if source == "default":
+            if uid not in default_warned:
+                default_warned.add(uid)
+                print(
+                    f"Warning: {uid} has no AP mapping; assigned to default bucket "
+                    f"'{default_ap}' (limit={ap_limits.get(default_ap, 1)})."
+                )
+
+    # Check collisions among devices discovered in this run.
+    for short_uid, uid_list in short_uid_to_uids.items():
+        uniq = sorted(set(uid_list))
+        if len(uniq) <= 1:
+            continue
+        joined = ",".join(uniq)
+        for row in rows:
+            if str(row.get("short_uid", "")) != short_uid:
+                continue
+            row["short_uid_collision"] = 1
+            prev = str(row.get("short_uid_collision_note", ""))
+            run_note = f"Run: {joined}"
+            row["short_uid_collision_note"] = (prev + "; " + run_note).strip("; ")
+            msg = f"Short UID collision in current discovery run: {short_uid} -> {joined}"
+            print(f"Warning: {msg}")
+            if db_enabled:
+                log_discovery_event(
+                    db_path=db_path,
+                    run_id=run_id,
+                    status="short_uid_collision",
+                    row=row,
+                    message=msg,
+                )
+
+    for row in rows:
+        if db_enabled:
+            upsert_device(db_path, row)
+            log_discovery_event(
+                db_path=db_path,
+                run_id=run_id,
+                status="discovered",
+                row=row,
+                message="Device discovered and mapped.",
+            )
+
     print(f"Discovered {len(rows)} Arduino device(s):")
-    print("unique_id, network_uid, udp_target_ip, device_ip, recv_ip")
+    print("unique_id, short_uid, network_uid, udp_target_ip, device_ip, recv_ip")
     for row in rows:
         print(
-            f"{row['unique_id']}, {row.get('network_uid', '')}, "
+            f"{row['unique_id']}, {row.get('short_uid', '')}, {row.get('network_uid', '')}, "
             f"{row['udp_target_ip']}, {row['device_ip']}, {row['recv_ip']}"
         )
+    ap_counts = Counter(str(row.get("ap_id", default_ap)) for row in rows)
+    print("AP assignment summary:")
+    for ap_id in sorted(ap_counts):
+        limit = ap_limits.get(ap_id, ap_limits.get("DEFAULT", 1))
+        print(f"  {ap_id}: devices={ap_counts[ap_id]} limit={limit}")
 
     if args.discover_csv:
         csv_path = Path(args.discover_csv).expanduser()
@@ -362,84 +806,88 @@ def run_discovery(args: argparse.Namespace) -> int:
                 f"Transfer selection mode: latest available, "
                 f"prefix={args.prefer_file_prefix}, tr_only={args.tr_only}"
             )
-        for row in rows:
-            uid = str(row["unique_id"])
-            uid6 = (uid[-6:] if len(uid) >= 6 else uid).upper()
-            device_ip = str(row["device_ip"] or row["recv_ip"])
-            if args.sync_time:
-                sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
-                synced = send_time_sync(
-                    control_sock=sock,
-                    device_ip=device_ip,
-                    control_port=args.discover_port,
-                    epoch=sync_epoch,
-                    timeout_s=3.0,
+        if args.max_concurrent_transfers > 0:
+            global_limit = int(args.max_concurrent_transfers)
+        else:
+            global_limit = max(1, sum(max(1, v) for v in ap_limits.values()))
+        print(f"Transfer concurrency: global={global_limit}, ap_limits={ap_limits}")
+
+        slot_manager = APSlotManager(ap_limits=ap_limits, global_limit=global_limit)
+        # Use one worker per device so waiting on AP slot limits does not
+        # starve tasks assigned to other AP buckets.
+        worker_count = max(1, len(rows))
+        transfer_results: list[dict[str, str | float]] = []
+
+        def _worker(row: dict[str, str | int]) -> dict[str, str | float]:
+            ap_id = str(row.get("ap_id", default_ap))
+            uid = str(row.get("unique_id", ""))
+            slot_manager.acquire(ap_id)
+            running_total, running_by_ap = slot_manager.snapshot()
+            print(f"{uid}: acquired slot ap={ap_id} running_total={running_total} running_by_ap={running_by_ap}")
+            if db_enabled:
+                log_slot_event(
+                    db_path=db_path,
+                    run_id=run_id,
+                    unique_id=uid,
+                    ap_id=ap_id,
+                    action="acquire",
+                    running_total=running_total,
+                    running_on_ap=int(running_by_ap.get(ap_id, 0)),
                 )
-                if synced:
-                    print(f"{uid}: RTC sync OK")
-                else:
-                    print(f"{uid}: RTC sync failed/timeout")
             try:
-                remote_files = request_remote_file_list(
-                    control_sock=sock,
-                    device_ip=device_ip,
-                    control_port=args.discover_port,
-                    timeout_s=args.file_list_timeout,
-                )
-            except Exception as exc:
-                print(f"File list failed for {uid} ({device_ip}): {exc}")
-                continue
-
-            if not remote_files:
-                print(f"No files reported by {uid6} ({device_ip}).")
-                continue
-
-            seen = load_received_filenames(file_log_root, uid)
-            if args.transfer_latest_even_if_seen:
-                next_file = select_most_recent_file(
-                    remote_files,
-                    prefer_prefix=args.prefer_file_prefix,
+                return _transfer_latest_file_for_device(
+                    row=row,
+                    args=args,
+                    bind_ip=bound_bind,
                     target_yymmdd=target_yymmdd,
-                    tr_only=args.tr_only,
+                    file_output_root=file_output_root,
+                    file_log_root=file_log_root,
                 )
-            else:
-                next_file = select_most_recent_unsaved_file(
-                    remote_files,
-                    seen,
-                    prefer_prefix=args.prefer_file_prefix,
-                    target_yymmdd=target_yymmdd,
-                    tr_only=args.tr_only,
-                )
+            finally:
+                slot_manager.release(ap_id)
+                running_total, running_by_ap = slot_manager.snapshot()
+                print(f"{uid}: released slot ap={ap_id} running_total={running_total} running_by_ap={running_by_ap}")
+                if db_enabled:
+                    log_slot_event(
+                        db_path=db_path,
+                        run_id=run_id,
+                        unique_id=uid,
+                        ap_id=ap_id,
+                        action="release",
+                        running_total=running_total,
+                        running_on_ap=int(running_by_ap.get(ap_id, 0)),
+                    )
 
-            if not next_file:
-                print(f"No new files to fetch for {uid6}.")
-                continue
-            print(f"{uid6}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(_worker, row) for row in rows]
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    result = {
+                        "ap_id": default_ap,
+                        "status": "error",
+                        "message": f"Transfer worker failed: {exc}",
+                        "error_text": str(exc),
+                        "duration_s": 0.0,
+                    }
+                transfer_results.append(result)
+                print(str(result.get("message", "")))
+                if db_enabled:
+                    log_transfer_event(db_path=db_path, run_id=run_id, result=result)
 
-            try:
-                extra_tag = ""
-                if args.transfer_latest_even_if_seen:
-                    extra_tag = dt.datetime.now().strftime("R%Y%m%d_%H%M%S")
-                local_name = build_local_filename(next_file, uid, extra_tag=extra_tag)
-                out_dir = file_output_root / uid6
-                local_name = ensure_unique_filename(local_name, out_dir)
-                saved_path = transfer_file_protocol(
-                    control_sock=sock,
-                    device_ip=device_ip,
-                    control_port=args.discover_port,
-                    local_bind_ip=bound_bind,
-                    requested_filename=next_file,
-                    output_dir=out_dir,
-                    device_uid=uid,
-                    log_root=file_log_root,
-                    local_filename=local_name,
-                    timeout_s=max(args.download_timeout, 30.0),
-                    tolerant_integrity=args.transfer_tolerant,
-                    mark_partial_received=args.mark_partial_received,
-                )
-                print(f"Saved file for {uid6}: {saved_path}")
-            except Exception as exc:
-                print(f"Transfer failed for {uid6} file {next_file}: {exc}")
+        status_counts = Counter(str(r.get("status", "")) for r in transfer_results)
+        ap_saved_counts = Counter(str(r.get("ap_id", default_ap)) for r in transfer_results if str(r.get("status", "")) == "saved")
+        print(
+            "Transfer summary: "
+            f"saved={status_counts.get('saved', 0)} "
+            f"skip={status_counts.get('skip', 0)} "
+            f"error={status_counts.get('error', 0)}"
+        )
+        if ap_saved_counts:
+            print("Saved-by-AP summary:")
+            for ap_id in sorted(ap_saved_counts):
+                print(f"  {ap_id}: {ap_saved_counts[ap_id]}")
     else:
         download_root = Path(args.download_dir).expanduser()
         for row in rows:
@@ -464,7 +912,8 @@ def run_discovery(args: argparse.Namespace) -> int:
                 continue
 
             timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            suffix = uid[-6:] if len(uid) >= 6 else uid
+            short_uid = str(row.get("short_uid", "")).strip().upper()
+            suffix = short_uid if short_uid else (uid[-6:] if len(uid) >= 6 else uid)
             out_path = download_root / f"{suffix}_{timestamp}.csv"
             save_device_data_csv(out_path, device_rows)
             print(f"Saved {len(device_rows)} line(s) for {uid} -> {out_path}")

@@ -445,6 +445,7 @@ def transfer_file_protocol(
     requested_filename: str,
     output_dir: Path,
     device_uid: str | None = None,
+    device_short_uid: str | None = None,
     log_root: Path | None = None,
     local_filename: str | None = None,
     timeout_s: float = 30.0,
@@ -644,6 +645,7 @@ def transfer_file_protocol(
         append_file_receive_log(
             log_root=log_root,
             device_uid=device_uid,
+            device_short_uid=device_short_uid,
             source_filename=filename,
             saved_path=out_path,
             transfer_id=transfer_id,
