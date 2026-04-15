@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import csv
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -12,12 +13,14 @@ import threading
 import datetime as dt
 import time
 from contextlib import redirect_stderr, redirect_stdout
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from bsm_network.config import (
+    ACTIVE_NETWORK_PROFILE,
+    ACTIVE_NETWORK_PROFILE_SOURCE,
     DEFAULT_DB_PATH,
     DEFAULT_DISCOVER_CSV,
     DEFAULT_DISCOVER_PORT,
@@ -28,7 +31,7 @@ from bsm_network.config import (
     build_poll_now_argv,
     parse_args,
 )
-from bsm_network.db import is_transfer_active, read_devices_snapshot, set_burrow_id_by_short_uid
+from bsm_network.db import is_transfer_active, list_active_transfers, read_devices_snapshot, set_burrow_id_by_short_uid
 from bsm_network.discovery import run_discovery
 from bsm_network.protocol import (
     clear_device_errors as protocol_clear_device_errors,
@@ -211,6 +214,7 @@ class ProcessManager:
 
 
 MANAGER = ProcessManager()
+ACTION_LOG_PATH = Path("data/web_actions.log")
 
 
 def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
@@ -222,6 +226,26 @@ def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
         f.seek(start)
         data = f.read()
     return data.decode("utf-8", errors="replace")
+
+
+def append_action_log(action: str, message: str) -> None:
+    ACTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().isoformat(timespec="seconds")
+    with ACTION_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(f"[{stamp}] {action}: {message}\n")
+
+
+def read_activity_status() -> str:
+    action_txt = read_log_tail(ACTION_LOG_PATH, max_bytes=80_000)
+    normal_txt = read_log_tail(MANAGER._log_path, max_bytes=80_000)
+
+    sections = []
+    sections.append("=== WEB ACTIONS ===")
+    sections.append(action_txt.strip() or "(No web actions yet)")
+    sections.append("")
+    sections.append("=== NORMAL OPS OUTPUT ===")
+    sections.append(normal_txt.strip() or "(No normal-ops output yet)")
+    return "\n".join(sections)
 
 
 def _iso_to_dt(value: str) -> dt.datetime | None:
@@ -548,245 +572,326 @@ def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
         sock.close()
 
 
+def read_today_uploads_status(db_path: Path) -> str:
+    if not db_path.exists():
+        return "(No upload DB yet)"
+
+    today = dt.date.today().isoformat()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT
+                  COALESCE(t.burrow_id, ''),
+                  COALESCE(d.short_uid, ''),
+                  COALESCE(t.network_uid, ''),
+                  COALESCE(t.source_filename, ''),
+                  COALESCE(t.event_ts, '')
+                FROM transfer_events t
+                LEFT JOIN devices d
+                  ON d.unique_id = t.unique_id
+                WHERE t.status = 'saved'
+                  AND date(substr(t.event_ts, 1, 10)) = ?
+                ORDER BY t.event_ts DESC
+                """,
+                (today,),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return f"(Upload list unavailable: {exc})"
+
+    if not rows:
+        return "(No files uploaded today)"
+
+    lines = []
+    lines.append("burrow_id      short_uid  network_uid       filename                uploaded_at")
+    lines.append("------------   --------   ---------------   ----------------------  -------------------")
+    for burrow_id, short_uid, network_uid, filename, uploaded_at in rows:
+        lines.append(
+            f"{str(burrow_id):<12}   {str(short_uid):<8}   {str(network_uid):<15}   "
+            f"{str(filename):<22}  {str(uploaded_at):<19}"
+        )
+    return "\n".join(lines)
+
+
+def _request_remote_file_list_with_sizes(device_ip: str, timeout_s: float = 8.0) -> tuple[list[tuple[str, int]], str]:
+    transfer_id = f"LWEB{int(time.time() * 1000)}"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.4)
+    try:
+        msg = f"LIST_FILES,{transfer_id}".encode("utf-8")
+        sock.sendto(msg, (device_ip, DISCOVER_CONTROL_PORT))
+
+        items: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        got_end = False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                data, (src_ip, _src_port) = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if src_ip != device_ip:
+                continue
+            line = data.decode("utf-8", errors="replace").strip()
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2 or parts[1] != transfer_id:
+                continue
+            msg_type = parts[0]
+            if msg_type == "ERROR":
+                return [], f"Arduino error: {line}"
+            if msg_type == "FILE_ITEM" and len(parts) >= 4:
+                name = parts[2]
+                try:
+                    size = int(parts[3])
+                except ValueError:
+                    size = 0
+                if name and name not in seen:
+                    seen.add(name)
+                    items.append((name, size))
+                continue
+            if msg_type == "FILE_LIST_END":
+                got_end = True
+                break
+        if not got_end:
+            return [], f"LIST_FILES timeout for {device_ip}"
+        return items, ""
+    except Exception as exc:  # noqa: BLE001
+        return [], str(exc)
+    finally:
+        sock.close()
+
+
+def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str]], str]:
+    if not db_path.exists():
+        return [], "(No upload DB yet)"
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT COALESCE(source_filename, ''), COALESCE(event_ts, '')
+                FROM transfer_events
+                WHERE status = 'saved' AND unique_id = ?
+                ORDER BY event_ts DESC
+                """,
+                (unique_id,),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return [], f"(Upload history unavailable: {exc})"
+    return [(str(r[0] or ""), str(r[1] or "")) for r in rows], ""
+
+
+def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str, str]], str]:
+    if not db_path.exists():
+        return [], "(No SQLite DB yet)"
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT event_ts, source, detail
+                FROM (
+                  SELECT
+                    COALESCE(event_ts, '') AS event_ts,
+                    'DISCOVERY' AS source,
+                    ('status=' || COALESCE(status, '') || ' msg=' || COALESCE(message, '')) AS detail
+                  FROM discovery_events
+                  WHERE unique_id = ?
+
+                  UNION ALL
+
+                  SELECT
+                    COALESCE(event_ts, '') AS event_ts,
+                    'TRANSFER' AS source,
+                    ('status=' || COALESCE(status, '') || ' file=' || COALESCE(source_filename, '') || ' msg=' || COALESCE(message, '')) AS detail
+                  FROM transfer_events
+                  WHERE unique_id = ?
+
+                  UNION ALL
+
+                  SELECT
+                    COALESCE(event_ts, '') AS event_ts,
+                    'SLOT' AS source,
+                    ('action=' || COALESCE(action, '') || ' ap=' || COALESCE(ap_id, '') ||
+                     ' total=' || COALESCE(CAST(running_total AS TEXT), '0') ||
+                     ' on_ap=' || COALESCE(CAST(running_on_ap AS TEXT), '0')) AS detail
+                  FROM slot_events
+                  WHERE unique_id = ?
+                )
+                ORDER BY event_ts DESC
+                """,
+                (unique_id, unique_id, unique_id),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return [], f"(History unavailable: {exc})"
+
+    out = [(str(r[0] or ""), str(r[1] or ""), str(r[2] or "")) for r in rows]
+    return out, ""
+
+
 def render_page(message: str = "") -> bytes:
     running, pid = MANAGER.status()
-    forcing, force_pid = MANAGER.force_status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
-    force_state = f"RUNNING (Task {force_pid})" if forcing else "IDLE"
-    devices = read_devices_rows(Path("data/discovered_devices.csv"))
-    online = [d for d in devices if d.get("status") == "ONLINE"]
-    last_offset, last_preset = get_last_set_time_state()
     msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
-    if devices:
-        burrow_opts = []
-        for d in sorted(devices, key=lambda x: ((x.get("short_uid", "") or ""), (x.get("unique_id", "") or ""))):
-            uid = (d.get("unique_id", "") or "").strip()
-            short_uid = (d.get("short_uid", "") or "").strip()
-            if not short_uid:
-                short_uid = uid[-6:] if len(uid) >= 6 else uid
-            if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
-                short_uid = f"{short_uid}*"
-            burrow_id = (d.get("burrow_id", "") or "").strip()
-            status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
-            label = f"{short_uid} | {uid} | burrow={burrow_id or '-'} | {status}"
-            burrow_opts.append(
-                f'<option value="{html.escape(short_uid.replace("*", ""))}">{html.escape(label)}</option>'
-            )
-        burrow_select_html = "\n".join(burrow_opts)
-        burrow_form_html = f"""
-    <form method="post" action="/assign-burrow-id" style="display:block; margin-top:0.75rem;">
-      <label for="burrow_short_uid">Assign burrow_id by short_uid:</label>
-      <select id="burrow_short_uid" name="short_uid" style="margin:0 0.5rem;">
-        {burrow_select_html}
-      </select>
-      <label for="burrow_value">burrow_id:</label>
-      <input id="burrow_value" name="burrow_id" type="text" maxlength="32" style="width:10rem; margin:0 0.5rem;" />
-      <button type="submit">Save Burrow ID</button>
-    </form>
-"""
-    else:
-        burrow_form_html = '<p style="margin-top:0.75rem;"><em>No discovered devices available for burrow assignment.</em></p>'
-    if online:
-        opts = []
-        for d in online:
-            uid = d.get("unique_id", "")
-            ip = d.get("device_ip", "") or d.get("recv_ip", "")
-            burrow = (d.get("burrow_id", "") or "").strip()
-            burrow_prefix = f"{burrow} | " if burrow else ""
-            short_uid = (d.get("short_uid", "") or "").strip()
-            if not short_uid:
-                short_uid = uid[-6:]
-            if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
-                short_uid = f"{short_uid}*"
-            label = f"{burrow_prefix}{short_uid} @ {ip} ({uid})"
-            value = f"{uid}|{ip}"
-            opts.append(f'<option value="{html.escape(value)}">{html.escape(label)}</option>')
-        force_select_html = "\n".join(opts)
-        force_form_html = f"""
-    <form method="post" action="/force-upload" style="display:block; margin-top:0.75rem;">
-      <label for="device">Force latest TR from:</label>
-      <select id="device" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Force Upload Latest TR</button>
-    </form>
-    <form method="post" action="/query-time" style="display:block; margin-top:0.5rem;">
-      <label for="device_time">Query RTC time from:</label>
-      <select id="device_time" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Query RTC Time</button>
-    </form>
-    <form method="post" action="/set-time" style="display:block; margin-top:0.5rem;">
-      <label for="device_set_time">Set RTC time for:</label>
-      <select id="device_set_time" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <label for="tz_preset">Zone:</label>
-      <select id="tz_preset" name="tz_preset" style="margin:0 0.5rem;">
-        <option value="ast" data-offset="{TZ_PRESET_OFFSETS["ast"]}" {"selected" if last_preset == "ast" else ""}>AST</option>
-        <option value="adt" data-offset="{TZ_PRESET_OFFSETS["adt"]}" {"selected" if last_preset == "adt" else ""}>ADT</option>
-        <option value="est" data-offset="{TZ_PRESET_OFFSETS["est"]}" {"selected" if last_preset == "est" else ""}>EST</option>
-        <option value="edt" data-offset="{TZ_PRESET_OFFSETS["edt"]}" {"selected" if last_preset == "edt" else ""}>EDT</option>
-        <option value="manual" data-offset="{last_offset}" {"selected" if last_preset == "manual" else ""}>Manual</option>
-      </select>
-      <label for="offset_hours">Offset (hrs):</label>
-      <input id="offset_hours" name="offset_hours" type="number" step="0.5" value="{last_offset}" style="width:5rem; margin:0 0.5rem;" />
-      <button type="submit">Set Arduino Time</button>
-    </form>
-    <form method="post" action="/ping" style="display:block; margin-top:0.5rem;">
-      <label for="device_ping">Ping:</label>
-      <select id="device_ping" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Ping Device</button>
-    </form>
-    <form method="post" action="/get-status" style="display:block; margin-top:0.5rem;">
-      <label for="device_status">Get status from:</label>
-      <select id="device_status" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Get Status</button>
-    </form>
-    <form method="post" action="/get-config" style="display:block; margin-top:0.5rem;">
-      <label for="device_config">Get config from:</label>
-      <select id="device_config" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Get Config</button>
-    </form>
-    <form method="post" action="/get-diag" style="display:block; margin-top:0.5rem;">
-      <label for="device_diag">Get diagnostics from:</label>
-      <select id="device_diag" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Get Diagnostics</button>
-    </form>
-    <form method="post" action="/get-last-data" style="display:block; margin-top:0.5rem;">
-      <label for="device_data">Get last data from:</label>
-      <select id="device_data" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Get Last Data</button>
-    </form>
-    <form method="post" action="/set-config" style="display:block; margin-top:0.5rem;">
-      <label for="device_set_config">Set config for:</label>
-      <select id="device_set_config" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <label for="start_hour">START_HOUR:</label>
-      <input id="start_hour" name="start_hour" type="number" min="0" max="23" style="width:4rem; margin:0 0.5rem;" />
-      <label for="end_hour">END_HOUR:</label>
-      <input id="end_hour" name="end_hour" type="number" min="0" max="23" style="width:4rem; margin:0 0.5rem;" />
-      <button type="submit">Set Config</button>
-    </form>
-    <form method="post" action="/reboot" style="display:block; margin-top:0.5rem;">
-      <label for="device_reboot">Reboot:</label>
-      <select id="device_reboot" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Reboot Device</button>
-    </form>
-    <form method="post" action="/enter-data-mode" style="display:block; margin-top:0.5rem;">
-      <label for="device_enter">Enter data mode:</label>
-      <select id="device_enter" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Enter Data Mode</button>
-    </form>
-    <form method="post" action="/clear-errors" style="display:block; margin-top:0.5rem;">
-      <label for="device_clear">Clear errors:</label>
-      <select id="device_clear" name="device" style="margin:0 0.5rem;">
-        {force_select_html}
-      </select>
-      <button type="submit">Clear Errors</button>
-    </form>
-"""
-    else:
-        force_form_html = '<p style="margin-top:0.75rem;"><em>No ONLINE Arduinos currently listed.</em></p>'
     page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BSM Controller</title>
+  <title>Big Science Network</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; }}
-    .panel {{ max-width: 980px; border: 1px solid #ccc; padding: 1rem 1.25rem; border-radius: 8px; }}
-    .status {{ margin: 0.75rem 0 1rem 0; }}
-    form {{ display: inline-block; margin-right: 0.75rem; }}
-    button {{ font-size: 1rem; padding: 0.6rem 1rem; cursor: pointer; }}
-    #logbox {{
-      margin-top: 1rem;
-      border: 1px solid #bbb;
-      border-radius: 6px;
-      background: #fafafa;
-      height: 420px;
-      overflow: auto;
-      padding: 0.7rem;
-      white-space: pre-wrap;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.88rem;
-      line-height: 1.35;
+    :root {{
+      --bg: #f2f4f7;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --line: #c7d2de;
+      --primary: #0b5ea8;
+      --accent: #e7f1fb;
     }}
-    #devicebox {{
-      margin-top: 1rem;
-      border: 1px solid #bbb;
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+    }}
+    .shell {{
+      max-width: 1100px;
+      margin: 1.25rem auto;
+      padding: 0 1rem;
+    }}
+    .panel {{
+      border: 1px solid var(--line);
+      background: var(--panel);
       border-radius: 6px;
-      background: #f6fbff;
-      height: 220px;
+      padding: 1rem;
+      box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08);
+    }}
+    .title {{
+      margin: 0 0 0.75rem 0;
+      color: #0b2d4b;
+      letter-spacing: 0.02em;
+    }}
+    .status {{
+      margin: 0 0 0.75rem 0;
+      font-weight: 600;
+    }}
+    .controls {{
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.75rem;
+    }}
+    form {{ margin: 0; }}
+    button {{
+      border: 1px solid #2b6cb0;
+      background: var(--primary);
+      color: white;
+      border-radius: 6px;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }}
+    .placeholder-btn {{
+      background: var(--accent);
+      color: #0b2d4b;
+      border-color: #8db4da;
+    }}
+    .section-title {{
+      margin: 0.9rem 0 0.4rem 0;
+      font-size: 0.95rem;
+      color: #304a64;
+      font-weight: 700;
+    }}
+    .scrollbox {{
+      border: 1px solid var(--line);
+      background: #fbfdff;
+      border-radius: 6px;
+      height: 260px;
       overflow: auto;
-      padding: 0.7rem;
+      padding: 0.65rem;
       white-space: pre;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.86rem;
+      font-size: 0.84rem;
       line-height: 1.35;
+    }}
+    .nav-buttons {{
+      margin-top: 0.9rem;
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }}
+    #activitybox {{
+      margin-top: 0.8rem;
     }}
   </style>
 </head>
 <body>
-  <h2>BSM Network Control</h2>
+  <div class="shell">
   <div class="panel">
+    <h2 class="title">Big Science Network</h2>
     <div class="status">Status: <strong>{html.escape(state)}</strong></div>
-    <div class="status">Force Upload: <strong>{html.escape(force_state)}</strong></div>
+    <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
     {msg_html}
-    <form method="post" action="/start">
-      <button type="submit">Normal Ops</button>
-    </form>
-    <form method="post" action="/stop">
-      <button type="submit">Stop Normal Ops</button>
-    </form>
-    <form method="post" action="/poll-now">
-      <button type="submit">Poll Now</button>
-    </form>
-    {burrow_form_html}
-    {force_form_html}
-    <div id="devicebox">Loading Arduino status...</div>
-    <div id="logbox">Loading log...</div>
+    <div class="controls">
+      <form method="post" action="/start">
+        <button type="submit">Normal Ops</button>
+      </form>
+      <form method="post" action="/stop">
+        <button type="submit">Stop Normal Ops</button>
+      </form>
+      <form method="post" action="/poll-now">
+        <button type="submit">Poll Now</button>
+      </form>
+    </div>
+
+    <div class="section-title">Known Arduinos</div>
+    <div id="devicebox" class="scrollbox">Loading Arduino status...</div>
+
+    <div class="section-title">Uploads Today</div>
+    <div id="uploadsbox" class="scrollbox">Loading uploaded-file list...</div>
+
+    <div class="nav-buttons">
+      <form method="get" action="/file-transfers">
+        <button type="submit" class="placeholder-btn">File Transfers</button>
+      </form>
+      <form method="get" action="/maintenance">
+        <button type="submit" class="placeholder-btn">Maintenance</button>
+      </form>
+      <button type="button" class="placeholder-btn">Other</button>
+    </div>
+
+    <div class="section-title">Activity Log</div>
+    <div id="activitybox" class="scrollbox">Loading activity output...</div>
+  </div>
   </div>
   <script>
-    const logbox = document.getElementById("logbox");
     const devicebox = document.getElementById("devicebox");
-    const tzPreset = document.getElementById("tz_preset");
-    const offsetInput = document.getElementById("offset_hours");
-    async function refreshLog() {{
+    const uploadsbox = document.getElementById("uploadsbox");
+    const activitybox = document.getElementById("activitybox");
+    async function refreshUploads() {{
       try {{
-        const resp = await fetch("/logs", {{ cache: "no-store" }});
+        const resp = await fetch("/uploads-today", {{ cache: "no-store" }});
         if (!resp.ok) {{
           return;
         }}
         const txt = await resp.text();
-        const nearBottom = (logbox.scrollTop + logbox.clientHeight) >= (logbox.scrollHeight - 30);
-        logbox.textContent = txt || "(No log output yet)";
-        if (nearBottom) {{
-          logbox.scrollTop = logbox.scrollHeight;
-        }}
+        uploadsbox.textContent = txt || "(No uploaded files today)";
       }} catch (_err) {{
         // Keep last displayed text on transient fetch errors.
       }}
     }}
-    refreshLog();
-    setInterval(refreshLog, 2000);
+    refreshUploads();
+    setInterval(refreshUploads, 3000);
 
     async function refreshDevices() {{
       try {{
@@ -803,18 +908,512 @@ def render_page(message: str = "") -> bytes:
     refreshDevices();
     setInterval(refreshDevices, 3000);
 
-    if (tzPreset && offsetInput) {{
-      tzPreset.addEventListener("change", () => {{
-        const opt = tzPreset.options[tzPreset.selectedIndex];
-        if (!opt) return;
-        if (opt.value === "manual") return;
-        const off = opt.getAttribute("data-offset");
-        if (off !== null && off !== "") {{
-          offsetInput.value = off;
+    async function refreshActivity() {{
+      try {{
+        const resp = await fetch("/activity", {{ cache: "no-store" }});
+        if (!resp.ok) {{
+          return;
         }}
-      }});
+        const txt = await resp.text();
+        const nearBottom = (activitybox.scrollTop + activitybox.clientHeight) >= (activitybox.scrollHeight - 30);
+        activitybox.textContent = txt || "(No activity yet)";
+        if (nearBottom) {{
+          activitybox.scrollTop = activitybox.scrollHeight;
+        }}
+      }} catch (_err) {{
+        // Keep last displayed text on transient fetch errors.
+      }}
     }}
+    refreshActivity();
+    setInterval(refreshActivity, 2000);
   </script>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
+def render_file_transfers_page(message: str = "", selected_uid: str = "") -> bytes:
+    running, pid = MANAGER.status()
+    state = f"RUNNING (PID {pid})" if running else "STOPPED"
+    msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    selected_uid = (selected_uid or "").strip()
+
+    selected_device: dict[str, str] | None = None
+    for d in devices:
+        if (d.get("unique_id", "") or "").strip() == selected_uid:
+            selected_device = d
+            break
+
+    device_rows_html = []
+    for d in devices:
+        uid = (d.get("unique_id", "") or "").strip()
+        short_uid = (d.get("short_uid", "") or "").strip()
+        if not short_uid:
+            short_uid = uid[-6:] if len(uid) >= 6 else uid
+        if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
+            short_uid = f"{short_uid}*"
+        burrow = (d.get("burrow_id", "") or "").strip() or "-"
+        status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
+        ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
+        checked = "checked" if uid == selected_uid else ""
+        label = f"{status:<7} {burrow:<10} {short_uid:<8} {uid:<36} {ip}"
+        device_rows_html.append(
+            f'<label style="display:block; margin:0.15rem 0;"><input type="radio" name="uid" value="{html.escape(uid)}" {checked} /> '
+            f'<span style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.84rem;">{html.escape(label)}</span></label>'
+        )
+    if not device_rows_html:
+        device_rows_html = ['<div style="font-style:italic;">No devices discovered yet.</div>']
+
+    selected_short = ""
+    selected_ip = ""
+    files_on_device_lines = ["(Select a known Arduino to view SD files)"]
+    uploaded_lines = ["(Select a known Arduino to view upload history)"]
+    history_lines = ["(Select a known Arduino to view complete DB history)"]
+    active_rows: list[dict[str, str]] = []
+    active_error = ""
+    try:
+        active_rows = list_active_transfers(Path(DEFAULT_DB_PATH))
+    except Exception as exc:  # noqa: BLE001
+        active_error = str(exc)
+    active_busy = len(active_rows) > 0
+    busy_note_html = ""
+    if active_error:
+        busy_note_html = f'<p><strong>Warning:</strong> Active-transfer check failed: {html.escape(active_error)}</p>'
+    elif active_busy:
+        status_lines = []
+        status_lines.append("Active uploads currently running:")
+        status_lines.append("short_uid  unique_id                              device_ip      file               started_at")
+        status_lines.append("--------   ------------------------------------   -----------    ----------------   -------------------")
+        by_uid = {str(d.get("unique_id", "")): d for d in devices}
+        for row in active_rows:
+            uid = row.get("unique_id", "")
+            d = by_uid.get(uid, {})
+            short_uid = (d.get("short_uid", "") or "").strip()
+            if not short_uid:
+                short_uid = uid[-6:] if len(uid) >= 6 else uid
+            status_lines.append(
+                f"{short_uid:<8}   {uid:<36}   {row.get('device_ip', ''):<11}    "
+                f"{row.get('source_filename', ''):<16}   {row.get('started_at', '')}"
+            )
+        busy_note_html = (
+            "<div class=\"busy-note\"><pre>"
+            + html.escape("\n".join(status_lines))
+            + "</pre></div>"
+        )
+
+    if selected_device is not None:
+        selected_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
+        selected_short = (selected_device.get("short_uid", "") or "").strip()
+        if not selected_short:
+            selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
+
+        if active_busy:
+            files_on_device_lines = [
+                "(Live SD file query paused while uploads are active.)",
+                "(Use 'Wait/Refresh' or 'Stop Normal Ops Safely', then reload.)",
+            ]
+        else:
+            remote_items, remote_err = _request_remote_file_list_with_sizes(selected_ip, timeout_s=8.0)
+            if remote_err:
+                files_on_device_lines = [f"(Could not fetch files: {remote_err})"]
+            else:
+                files_on_device_lines = []
+                files_on_device_lines.append("filename                          size_bytes")
+                files_on_device_lines.append("--------------------------------  ----------")
+                for name, size in sorted(remote_items, key=lambda x: x[0], reverse=True):
+                    files_on_device_lines.append(f"{name:<32}  {size:>10}")
+                if len(remote_items) == 0:
+                    files_on_device_lines = ["(No files reported by Arduino)"]
+
+        uploaded_rows, uploaded_err = _read_uploaded_files_for_device(Path(DEFAULT_DB_PATH), selected_uid)
+        if uploaded_err:
+            uploaded_lines = [uploaded_err]
+        else:
+            uploaded_lines = []
+            uploaded_lines.append("filename                          uploaded_at")
+            uploaded_lines.append("--------------------------------  -------------------")
+            for name, ts in uploaded_rows:
+                uploaded_lines.append(f"{name:<32}  {ts}")
+            if len(uploaded_rows) == 0:
+                uploaded_lines = ["(No uploaded files logged for this Arduino)"]
+
+        history_rows, history_err = _read_full_history_for_device(Path(DEFAULT_DB_PATH), selected_uid)
+        if history_err:
+            history_lines = [history_err]
+        else:
+            history_lines = []
+            history_lines.append("event_ts              source      detail")
+            history_lines.append("-------------------  ----------  -----------------------------------------------")
+            for ts, source, detail in history_rows:
+                history_lines.append(f"{ts:<19}  {source:<10}  {detail}")
+            if len(history_rows) == 0:
+                history_lines = ["(No DB history for this Arduino)"]
+
+    files_title_suffix = selected_short if selected_short else "..."
+    device_rows_html_block = "".join(device_rows_html)
+    files_on_device_block = "\n".join(html.escape(x) for x in files_on_device_lines)
+    uploaded_block = "\n".join(html.escape(x) for x in uploaded_lines)
+    history_block = "\n".join(html.escape(x) for x in history_lines)
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Big Science Network - File Transfers</title>
+  <style>
+    :root {{
+      --bg: #f2f4f7;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --line: #c7d2de;
+      --primary: #0b5ea8;
+      --accent: #e7f1fb;
+    }}
+    body {{ margin: 0; background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%); color: var(--text); font-family: "Avenir Next", "Trebuchet MS", sans-serif; }}
+    .shell {{ max-width: 1180px; margin: 1.25rem auto; padding: 0 1rem; }}
+    .panel {{ border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 1rem; box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08); }}
+    .title {{ margin: 0; color: #0b2d4b; letter-spacing: 0.02em; }}
+    .subtitle {{ margin: 0.25rem 0 0.8rem 0; color: #304a64; font-weight: 700; }}
+    .status {{ margin: 0 0 0.75rem 0; font-weight: 600; }}
+    .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
+    form {{ margin: 0; }}
+    button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
+    .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
+    .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
+    .grid2 {{ margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
+    .busy-note {{
+      margin: 0.3rem 0 0.8rem 0;
+      border: 1px solid #e5b97a;
+      background: #fff4dd;
+      border-radius: 6px;
+      padding: 0.5rem;
+    }}
+    .busy-note pre {{
+      margin: 0;
+      white-space: pre;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+      line-height: 1.3;
+      color: #6e4b00;
+    }}
+    @media (max-width: 900px) {{ .grid2 {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="panel">
+      <h2 class="title">Big Science Network</h2>
+      <div class="subtitle">File Transfers</div>
+      <div class="status">Status: <strong>{html.escape(state)}</strong></div>
+      <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
+      {msg_html}
+      <div class="controls">
+        <form method="get" action="/"><button type="submit">Dashboard</button></form>
+        <form method="get" action="/file-transfers">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <button type="submit">Wait/Refresh</button>
+        </form>
+        <form method="post" action="/file-transfers-stop-safe">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <button type="submit">Stop Normal Ops Safely</button>
+        </form>
+      </div>
+      {busy_note_html}
+
+      <div class="section-title">Known Arduinos (select one)</div>
+      <form method="get" action="/file-transfers">
+        <div class="scrollbox" style="white-space: normal;">
+          {device_rows_html_block}
+        </div>
+        <div style="margin-top:0.5rem;">
+          <button type="submit">Load File Lists</button>
+        </div>
+      </form>
+
+      <div class="grid2">
+        <div>
+          <div class="section-title">Files on {html.escape(files_title_suffix)}</div>
+          <div class="scrollbox">{files_on_device_block}</div>
+        </div>
+        <div>
+          <div class="section-title">Files uploaded from {html.escape(files_title_suffix)}</div>
+          <div class="scrollbox">{uploaded_block}</div>
+        </div>
+      </div>
+
+      <div class="section-title">Complete SQLite History for {html.escape(files_title_suffix)}</div>
+      <div class="scrollbox">{history_block}</div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
+def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dict[str, str] | None:
+    for d in devices:
+        if (d.get("unique_id", "") or "").strip() == selected_uid:
+            return d
+    return None
+
+
+def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
+    rows = []
+    for d in devices:
+        uid = (d.get("unique_id", "") or "").strip()
+        short_uid = (d.get("short_uid", "") or "").strip()
+        if not short_uid:
+            short_uid = uid[-6:] if len(uid) >= 6 else uid
+        if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
+            short_uid = f"{short_uid}*"
+        burrow = (d.get("burrow_id", "") or "").strip() or "-"
+        status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
+        ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
+        checked = "checked" if uid == selected_uid else ""
+        label = f"{status:<7} {burrow:<10} {short_uid:<8} {uid:<36} {ip}"
+        rows.append(
+            f'<label style="display:block; margin:0.15rem 0;"><input type="radio" name="uid" value="{html.escape(uid)}" {checked} /> '
+            f'<span style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.84rem;">{html.escape(label)}</span></label>'
+        )
+    if not rows:
+        return '<div style="font-style:italic;">No devices discovered yet.</div>'
+    return "".join(rows)
+
+
+def _maintenance_info_lines(device_ip: str) -> list[str]:
+    status = query_device_status(device_ip=device_ip)
+    config = query_device_config(device_ip=device_ip)
+    diag = query_device_diagnostics(device_ip=device_ip)
+    rtc = query_device_time(device_ip=device_ip)
+    lines = []
+    lines.append("Maintenance Info     | Value")
+    lines.append("-------------------- | -------------------------------------------------------------")
+    lines.append(f"Get Status           | {status}")
+    lines.append(f"Get Config           | {config}")
+    lines.append(f"Get Diagnostics      | {diag}")
+    lines.append(f"Get RTC Time         | {rtc}")
+    return lines
+
+
+def _rtc_panel_lines(device_ip: str, timeout_s: float = 2.0) -> tuple[str, str, str]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_s)
+        sock.sendto(b"GET_TIME", (device_ip, DISCOVER_CONTROL_PORT))
+        data, (src_ip, _src_port) = sock.recvfrom(2048)
+        line = data.decode("utf-8", errors="replace").strip()
+        if src_ip != device_ip:
+            return "result", f"unexpected_source={src_ip}"
+        if line.startswith("TIME,"):
+            parts = line.split(",", 2)
+            epoch = parts[1] if len(parts) > 1 else ""
+            ts = parts[2] if len(parts) > 2 else ""
+            return _format_two_line_columns([("epoch", epoch), ("timestamp", ts)])
+        return "result", "------", line
+    except socket.timeout:
+        return "result", "------", f"timeout after {timeout_s:.1f}s"
+    except Exception as exc:  # noqa: BLE001
+        return "result", "------", f"error: {exc}"
+    finally:
+        sock.close()
+
+
+def _dict_panel_lines(
+    fetch_fn,
+    device_ip: str,
+    fallback_order: list[str],
+    timeout_s: float = 2.0,
+) -> tuple[str, str, str]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_s)
+        data = fetch_fn(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        if not data:
+            return "result", "------", "no data"
+        keys = [k for k in fallback_order if k in data] + [k for k in data.keys() if k not in fallback_order]
+        cols = [(k, str(data.get(k, ""))) for k in keys]
+        return _format_two_line_columns(cols) if cols else ("result", "------", "ok")
+    except TimeoutError:
+        return "result", "------", f"timeout after {timeout_s:.1f}s"
+    except Exception as exc:  # noqa: BLE001
+        return "result", "------", f"error: {exc}"
+    finally:
+        sock.close()
+
+
+def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
+    rtc = _rtc_panel_lines(device_ip=device_ip)
+    status = _dict_panel_lines(
+        fetch_fn=protocol_get_device_status,
+        device_ip=device_ip,
+        fallback_order=["UPTIME", "MODE", "SD_FREE_KB", "LAST_DATA_TS", "BATTERY"],
+        timeout_s=2.0,
+    )
+    config = _dict_panel_lines(
+        fetch_fn=protocol_get_device_config,
+        device_ip=device_ip,
+        fallback_order=["START_HOUR", "END_HOUR", "DEVICE_ID"],
+        timeout_s=2.0,
+    )
+    diagnostics = _dict_panel_lines(
+        fetch_fn=protocol_get_device_diagnostics,
+        device_ip=device_ip,
+        fallback_order=["RTC_OK", "RTC_ERRORS", "I2C_ERRORS", "SD_ERRORS"],
+        timeout_s=2.0,
+    )
+    return {
+        "RTC Time": rtc,
+        "Status": status,
+        "Config": config,
+        "Diagnostics": diagnostics,
+    }
+
+
+def _format_two_line_columns(cols: list[tuple[str, str]]) -> tuple[str, str, str]:
+    if not cols:
+        return "result", "------", ""
+    # Add one trailing space to every column width so columns are separated by one space.
+    widths = [max(len(h), len(v)) + 1 for h, v in cols]
+    header = "".join(h.ljust(widths[i]) for i, (h, _v) in enumerate(cols)).rstrip()
+    # Per user spec: dashes per column use (column width - 1), preserving an inter-column space.
+    separator = "".join((("-" * max(1, widths[i] - 1)).ljust(widths[i])) for i in range(len(cols))).rstrip()
+    values = "".join(v.ljust(widths[i]) for i, (_h, v) in enumerate(cols)).rstrip()
+    return header, separator, values
+
+
+def _mini_panel_block(header: str, separator: str, values: str) -> str:
+    # Build a dashboard-style 3-line block:
+    # header row
+    # dashed separator row
+    # value row
+    return f"{header}\n{separator}\n{values}"
+
+
+def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
+    running, pid = MANAGER.status()
+    state = f"RUNNING (PID {pid})" if running else "STOPPED"
+    msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    selected_uid = (selected_uid or "").strip()
+    selected_device = _find_device_by_uid(devices, selected_uid)
+
+    panels: dict[str, tuple[str, str, str]] = {
+        "RTC Time": ("result", "------", "select a known Arduino"),
+        "Status": ("result", "------", "select a known Arduino"),
+        "Config": ("result", "------", "select a known Arduino"),
+        "Diagnostics": ("result", "------", "select a known Arduino"),
+    }
+    selected_short = "..."
+    if selected_device is not None:
+        uid = (selected_device.get("unique_id", "") or "").strip()
+        selected_short = (selected_device.get("short_uid", "") or "").strip()
+        if not selected_short:
+            selected_short = uid[-6:] if len(uid) >= 6 else uid
+        device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
+        panels = _maintenance_panel_data(device_ip=device_ip)
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
+
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Big Science Network - Maintenance</title>
+  <style>
+    :root {{
+      --bg: #f2f4f7;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --line: #c7d2de;
+      --primary: #0b5ea8;
+    }}
+    body {{ margin: 0; background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%); color: var(--text); font-family: "Avenir Next", "Trebuchet MS", sans-serif; }}
+    .shell {{ max-width: 1180px; margin: 1.25rem auto; padding: 0 1rem; }}
+    .panel {{ border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 1rem; box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08); }}
+    .title {{ margin: 0; color: #0b2d4b; letter-spacing: 0.02em; }}
+    .subtitle {{ margin: 0.25rem 0 0.8rem 0; color: #304a64; font-weight: 700; }}
+    .status {{ margin: 0 0 0.75rem 0; font-weight: 600; }}
+    .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
+    form {{ margin: 0; }}
+    button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
+    .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
+    .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
+    .mini-grid {{ margin-top: 0.9rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
+    .mini-title {{ margin: 0 0 0.25rem 0; font-size: 0.9rem; color: #304a64; font-weight: 700; }}
+    .mini-box {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }}
+    @media (max-width: 900px) {{ .mini-grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="panel">
+      <h2 class="title">Big Science Network</h2>
+      <div class="subtitle">Maintenance</div>
+      <div class="status">Status: <strong>{html.escape(state)}</strong></div>
+      <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
+      {msg_html}
+
+      <div class="controls">
+        <form method="get" action="/"><button type="submit">Dashboard</button></form>
+      </div>
+
+      <div class="section-title">Known Arduinos (select one)</div>
+      <form method="get" action="/maintenance">
+        <div class="scrollbox" style="white-space: normal;">
+          {device_rows_html_block}
+        </div>
+        <div style="margin-top:0.5rem;">
+          <button type="submit">Load Maintenance Info</button>
+        </div>
+      </form>
+
+      <div class="controls" style="margin-top:0.8rem;">
+        <form method="post" action="/maintenance-action">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="action" value="set-time" />
+          <button type="submit">Set RTC Time</button>
+        </form>
+        <form method="post" action="/maintenance-action">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="action" value="ping" />
+          <button type="submit">Ping</button>
+        </form>
+        <form method="post" action="/maintenance-action">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="action" value="reboot" />
+          <button type="submit">Reboot</button>
+        </form>
+      </div>
+
+      <div class="section-title">Maintenance Info for {html.escape(selected_short)}</div>
+      <div class="mini-grid">
+        <div>
+          <div class="mini-title">RTC Time</div>
+          <div class="mini-box">{html.escape(_mini_panel_block(panels["RTC Time"][0], panels["RTC Time"][1], panels["RTC Time"][2]))}</div>
+        </div>
+        <div>
+          <div class="mini-title">Status</div>
+          <div class="mini-box">{html.escape(_mini_panel_block(panels["Status"][0], panels["Status"][1], panels["Status"][2]))}</div>
+        </div>
+        <div>
+          <div class="mini-title">Config</div>
+          <div class="mini-box">{html.escape(_mini_panel_block(panels["Config"][0], panels["Config"][1], panels["Config"][2]))}</div>
+        </div>
+        <div>
+          <div class="mini-title">Diagnostics</div>
+          <div class="mini-box">{html.escape(_mini_panel_block(panels["Diagnostics"][0], panels["Diagnostics"][1], panels["Diagnostics"][2]))}</div>
+        </div>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -839,13 +1438,31 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/logs":
-            self._send_text(read_log_tail(MANAGER._log_path))
-            return
-        if self.path == "/devices":
+        parsed = urlparse(self.path)
+        route = parsed.path
+        query = parse_qs(parsed.query, keep_blank_values=True)
+
+        if route == "/devices":
             self._send_text(read_devices_status(Path("data/discovered_devices.csv")))
             return
-        if self.path != "/":
+        if route == "/uploads-today":
+            self._send_text(read_today_uploads_status(Path(DEFAULT_DB_PATH)))
+            return
+        if route == "/activity":
+            self._send_text(read_activity_status())
+            return
+        if route == "/logs":
+            self._send_text(read_log_tail(MANAGER._log_path))
+            return
+        if route == "/file-transfers":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_html(render_file_transfers_page(selected_uid=selected_uid))
+            return
+        if route == "/maintenance":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_html(render_maintenance_page(selected_uid=selected_uid))
+            return
+        if route != "/":
             self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
             return
         self._send_html(render_page())
@@ -856,15 +1473,53 @@ class Handler(BaseHTTPRequestHandler):
         form = parse_qs(body, keep_blank_values=True)
         if self.path == "/start":
             msg = MANAGER.start()
+            append_action_log("start", msg)
             self._send_html(render_page(msg))
             return
         if self.path == "/stop":
             msg = MANAGER.stop()
+            append_action_log("stop", msg)
             self._send_html(render_page(msg))
             return
         if self.path == "/poll-now":
             msg = MANAGER.poll_now()
+            append_action_log("poll-now", msg)
             self._send_html(render_page(msg))
+            return
+        if self.path == "/file-transfers-stop-safe":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            msg = MANAGER.stop()
+            append_action_log("stop-for-file-transfers", msg)
+            self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+            return
+        if self.path == "/maintenance-action":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            action = (form.get("action") or [""])[0].strip()
+            devices = read_devices_rows(Path("data/discovered_devices.csv"))
+            selected_device = _find_device_by_uid(devices, selected_uid)
+            if selected_device is None:
+                self._send_html(render_maintenance_page(message="Select a known Arduino first.", selected_uid=selected_uid))
+                return
+            device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
+            if not device_ip:
+                self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
+                return
+            if action == "set-time":
+                msg = set_device_time(device_ip=device_ip, offset_hours=WEB_SET_TIME_OFFSET_HOURS)
+                append_action_log("maintenance-set-time", msg)
+                self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
+                return
+            if action == "ping":
+                msg = ping_device(device_ip=device_ip)
+                append_action_log("maintenance-ping", msg)
+                self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
+                return
+            if action == "reboot":
+                msg = reboot_device(device_ip=device_ip)
+                append_action_log("maintenance-reboot", msg)
+                self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
+                return
+            self._send_html(render_maintenance_page(message=f"Unknown maintenance action: {action}", selected_uid=selected_uid))
             return
         if self.path == "/assign-burrow-id":
             short_uid = (form.get("short_uid") or [""])[0].strip().upper()

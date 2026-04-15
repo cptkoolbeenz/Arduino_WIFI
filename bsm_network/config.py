@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+from pathlib import Path
 
 # Network defaults used by CLI flags below.
 # Edit these in one place when moving to a different local network.
@@ -24,6 +27,79 @@ DEFAULT_AP_ID = "DEFAULT"
 DEFAULT_AP_LIMIT = 2
 DEFAULT_MAX_CONCURRENT_TRANSFERS = 0
 DEFAULT_DB_PATH = "data/bsm_network.db"
+DEFAULT_NETWORK_MAP = ""
+DEFAULT_RUNTIME_AP_MAP = ""
+DEFAULT_PROFILE_PATH = "config/network_profile.json"
+ACTIVE_NETWORK_PROFILE = "builtin"
+ACTIVE_NETWORK_PROFILE_SOURCE = "builtin defaults"
+
+
+def _coerce_int(value: object, fallback: int) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return fallback
+
+
+def _coerce_float(value: object, fallback: float) -> float:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return fallback
+
+
+def _apply_runtime_profile() -> None:
+    global DEFAULT_BIND_IP, DEFAULT_DISCOVER_BROADCAST_IP, DEFAULT_DISCOVER_PORT
+    global DEFAULT_HOST_LABEL, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT, DEFAULT_LOCAL_OFFSET
+    global DEFAULT_DISCOVER_CSV, DEFAULT_DB_PATH, DEFAULT_NETWORK_MAP, DEFAULT_RUNTIME_AP_MAP
+    global ACTIVE_NETWORK_PROFILE, ACTIVE_NETWORK_PROFILE_SOURCE
+
+    profile_path_raw = os.environ.get("BSM_NETWORK_PROFILE", DEFAULT_PROFILE_PATH)
+    profile_path = Path(profile_path_raw).expanduser()
+    if not profile_path.exists():
+        return
+
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Warning: failed to read network profile '{profile_path}': {exc}")
+        return
+
+    if not isinstance(data, dict):
+        print(f"Warning: network profile '{profile_path}' must be a JSON object.")
+        return
+
+    raw_profiles = data.get("profiles", {})
+    if not isinstance(raw_profiles, dict):
+        print(f"Warning: network profile '{profile_path}' missing 'profiles' object.")
+        return
+
+    active_name = str(data.get("active_profile") or data.get("active") or "").strip()
+    if not active_name:
+        print(f"Warning: network profile '{profile_path}' missing active_profile/active.")
+        return
+
+    profile = raw_profiles.get(active_name, {})
+    if not isinstance(profile, dict):
+        print(f"Warning: network profile '{profile_path}' has invalid profile '{active_name}'.")
+        return
+
+    DEFAULT_BIND_IP = str(profile.get("bind", DEFAULT_BIND_IP)).strip() or DEFAULT_BIND_IP
+    DEFAULT_DISCOVER_BROADCAST_IP = str(profile.get("discover_ip", DEFAULT_DISCOVER_BROADCAST_IP)).strip() or DEFAULT_DISCOVER_BROADCAST_IP
+    DEFAULT_DISCOVER_PORT = _coerce_int(profile.get("discover_port", DEFAULT_DISCOVER_PORT), DEFAULT_DISCOVER_PORT)
+    DEFAULT_HOST_LABEL = str(profile.get("host_label", DEFAULT_HOST_LABEL)).strip() or DEFAULT_HOST_LABEL
+    DEFAULT_WEB_HOST = str(profile.get("web_host", DEFAULT_WEB_HOST)).strip() or DEFAULT_WEB_HOST
+    DEFAULT_WEB_PORT = _coerce_int(profile.get("web_port", DEFAULT_WEB_PORT), DEFAULT_WEB_PORT)
+    DEFAULT_LOCAL_OFFSET = _coerce_float(profile.get("time_offset_hours", DEFAULT_LOCAL_OFFSET), DEFAULT_LOCAL_OFFSET)
+    DEFAULT_DISCOVER_CSV = str(profile.get("discover_csv", DEFAULT_DISCOVER_CSV)).strip() or DEFAULT_DISCOVER_CSV
+    DEFAULT_DB_PATH = str(profile.get("db_path", DEFAULT_DB_PATH)).strip() or DEFAULT_DB_PATH
+    DEFAULT_NETWORK_MAP = str(profile.get("network_map", DEFAULT_NETWORK_MAP)).strip()
+    DEFAULT_RUNTIME_AP_MAP = str(profile.get("runtime_ap_map", DEFAULT_RUNTIME_AP_MAP)).strip()
+    ACTIVE_NETWORK_PROFILE = active_name
+    ACTIVE_NETWORK_PROFILE_SOURCE = str(profile_path)
+
+
+_apply_runtime_profile()
 
 
 def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
@@ -112,12 +188,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
     parser.add_argument(
         "--network-map",
-        default="",
+        default=DEFAULT_NETWORK_MAP,
         help="Optional JSON config for AP/burrow mapping (supports keys: device_to_ap, device_to_burrow, ap_limits, default_ap)",
     )
     parser.add_argument(
         "--runtime-ap-map",
-        default="",
+        default=DEFAULT_RUNTIME_AP_MAP,
         help="Optional JSON runtime AP overrides (same schema as --network-map, checked first)",
     )
     parser.add_argument(

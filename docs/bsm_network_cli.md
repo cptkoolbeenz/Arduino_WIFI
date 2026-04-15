@@ -14,6 +14,20 @@ Show all runtime help:
 python3 bsm_network.py --help
 ```
 
+## Shared Network Profile
+
+Both `bsm_network.py` and `bsm_web.py` now load shared network defaults from:
+
+- `config/network_profile.json`
+
+Switch environments by changing `active_profile` (`field` or `home`) in that file, then restart both apps.
+
+You can also override the profile file path with:
+
+```bash
+BSM_NETWORK_PROFILE=/path/to/network_profile.json python3 bsm_network.py
+```
+
 ## Common Modes
 
 Listener mode (no discovery):
@@ -58,14 +72,14 @@ python3 bsm_network.py --cloud-once
 - `--no-discover`: Disable discovery workflow.
 - `--discover-ip DISCOVER_IP`: Broadcast IP used for discovery poll. Default: `192.168.10.255`.
 - `--discover-port DISCOVER_PORT`: Arduino UDP control port. Default: `8888`.
-- `--discover-timeout DISCOVER_TIMEOUT`: Seconds to wait for discovery replies. Default: `20.0`.
-- `--discover-attempts DISCOVER_ATTEMPTS`: Number of poll broadcasts. Default: `8`.
-- `--discover-interval DISCOVER_INTERVAL`: Seconds between poll broadcasts. Default: `0.5`.
+- `--discover-timeout DISCOVER_TIMEOUT`: Seconds to wait for discovery replies. Default: `30.0`.
+- `--discover-attempts DISCOVER_ATTEMPTS`: Number of poll broadcasts. Default: `15`.
+- `--discover-interval DISCOVER_INTERVAL`: Seconds between poll broadcasts. Default: `0.6`.
 - `--discover-csv DISCOVER_CSV`: Output CSV path for discovered device table.
 - `--network-map NETWORK_MAP`: Optional JSON with AP routing defaults (`device_to_ap`, `device_to_burrow`, `ap_limits`, `default_ap`).
 - `--runtime-ap-map RUNTIME_AP_MAP`: Optional JSON with live AP overrides (checked before `--network-map`).
 - `--default-ap-id DEFAULT_AP_ID`: Fallback AP bucket when no mapping is found. Default: `DEFAULT`.
-- `--default-ap-limit DEFAULT_AP_LIMIT`: Per-AP cap for fallback bucket. Default: `1`.
+- `--default-ap-limit DEFAULT_AP_LIMIT`: Per-AP cap for fallback bucket. Default: `2`.
 - `--max-concurrent-transfers MAX_CONCURRENT_TRANSFERS`: Global transfer cap; `0` auto-uses sum of AP limits.
 - `--db-path DB_PATH`: SQLite path for network/device activity logs. Default: `data/bsm_network.db`.
 - `--db-log` / `--no-db-log`: Enable/disable SQLite logging (enabled by default).
@@ -103,8 +117,8 @@ python3 bsm_network.py --cloud-once
 ### Scheduled Window Mode
 
 - `--scheduled`: Run repeating schedule loop.
-- `--start-hour START_HOUR`: Discovery window start hour (0-23). Default: `10`.
-- `--end-hour END_HOUR`: Discovery window end hour (0-23). Default: `18`.
+- `--start-hour START_HOUR`: Discovery window start hour (0-23). Default: `7`.
+- `--end-hour END_HOUR`: Discovery window end hour (0-23). Default: `19`.
 - `--cycle-interval-sec CYCLE_INTERVAL_SEC`: Delay between in-window discovery cycles. Default: `180`.
 - `--out-window-sleep-sec OUT_WINDOW_SLEEP_SEC`: Sleep between checks outside window. Default: `45`.
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import __version__
 from .cloud import run_cloud_upload_cycle
-from .config import parse_args
+from .config import ACTIVE_NETWORK_PROFILE, ACTIVE_NETWORK_PROFILE_SOURCE, parse_args
 from .discovery import detect_lan_ip, run_discovery
 from .protocol import parse_payload
 from .records import append_csv
@@ -17,6 +17,7 @@ from .scheduler import run_scheduled
 def main() -> int:
     args = parse_args()
     print(f"BSM Network {__version__}")
+    print(f"Network profile: {ACTIVE_NETWORK_PROFILE} ({ACTIVE_NETWORK_PROFILE_SOURCE})")
 
     csv_path = Path(args.csv_log).expanduser() if args.csv_log else None
 
