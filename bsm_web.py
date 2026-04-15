@@ -28,7 +28,7 @@ from bsm_network.config import (
     build_poll_now_argv,
     parse_args,
 )
-from bsm_network.db import is_transfer_active, read_devices_snapshot
+from bsm_network.db import is_transfer_active, read_devices_snapshot, set_burrow_id_by_short_uid
 from bsm_network.discovery import run_discovery
 from bsm_network.protocol import (
     clear_device_errors as protocol_clear_device_errors,
@@ -523,6 +523,12 @@ def can_enter_data_mode(uid: str) -> tuple[bool, str]:
     return True, ""
 
 
+def assign_burrow_id(short_uid: str, burrow_id: str) -> str:
+    db_path = Path(DEFAULT_DB_PATH)
+    ok, msg = set_burrow_id_by_short_uid(db_path=db_path, short_uid=short_uid, burrow_id=burrow_id)
+    return msg if ok else f"Assign burrow_id failed: {msg}"
+
+
 def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -551,6 +557,35 @@ def render_page(message: str = "") -> bytes:
     online = [d for d in devices if d.get("status") == "ONLINE"]
     last_offset, last_preset = get_last_set_time_state()
     msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
+    if devices:
+        burrow_opts = []
+        for d in sorted(devices, key=lambda x: ((x.get("short_uid", "") or ""), (x.get("unique_id", "") or ""))):
+            uid = (d.get("unique_id", "") or "").strip()
+            short_uid = (d.get("short_uid", "") or "").strip()
+            if not short_uid:
+                short_uid = uid[-6:] if len(uid) >= 6 else uid
+            if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
+                short_uid = f"{short_uid}*"
+            burrow_id = (d.get("burrow_id", "") or "").strip()
+            status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
+            label = f"{short_uid} | {uid} | burrow={burrow_id or '-'} | {status}"
+            burrow_opts.append(
+                f'<option value="{html.escape(short_uid.replace("*", ""))}">{html.escape(label)}</option>'
+            )
+        burrow_select_html = "\n".join(burrow_opts)
+        burrow_form_html = f"""
+    <form method="post" action="/assign-burrow-id" style="display:block; margin-top:0.75rem;">
+      <label for="burrow_short_uid">Assign burrow_id by short_uid:</label>
+      <select id="burrow_short_uid" name="short_uid" style="margin:0 0.5rem;">
+        {burrow_select_html}
+      </select>
+      <label for="burrow_value">burrow_id:</label>
+      <input id="burrow_value" name="burrow_id" type="text" maxlength="32" style="width:10rem; margin:0 0.5rem;" />
+      <button type="submit">Save Burrow ID</button>
+    </form>
+"""
+    else:
+        burrow_form_html = '<p style="margin-top:0.75rem;"><em>No discovered devices available for burrow assignment.</em></p>'
     if online:
         opts = []
         for d in online:
@@ -724,6 +759,7 @@ def render_page(message: str = "") -> bytes:
     <form method="post" action="/poll-now">
       <button type="submit">Poll Now</button>
     </form>
+    {burrow_form_html}
     {force_form_html}
     <div id="devicebox">Loading Arduino status...</div>
     <div id="logbox">Loading log...</div>
@@ -828,6 +864,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/poll-now":
             msg = MANAGER.poll_now()
+            self._send_html(render_page(msg))
+            return
+        if self.path == "/assign-burrow-id":
+            short_uid = (form.get("short_uid") or [""])[0].strip().upper()
+            burrow_id = (form.get("burrow_id") or [""])[0].strip()
+            if not short_uid:
+                self._send_html(render_page("short_uid is required for burrow assignment."))
+                return
+            msg = assign_burrow_id(short_uid=short_uid, burrow_id=burrow_id)
             self._send_html(render_page(msg))
             return
         if self.path == "/force-upload":
