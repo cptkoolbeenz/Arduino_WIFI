@@ -5,6 +5,7 @@ import time
 import zlib
 import re
 from pathlib import Path
+from typing import Callable
 
 from .records import append_file_receive_log
 
@@ -451,6 +452,7 @@ def transfer_file_protocol(
     timeout_s: float = 30.0,
     tolerant_integrity: bool = False,
     mark_partial_received: bool = False,
+    progress_callback: Callable[[int, int, int, str], None] | None = None,
 ) -> Path:
     transfer_id = _new_transfer_id("T")
     transfer_start = time.monotonic()
@@ -486,6 +488,21 @@ def transfer_file_protocol(
     filename = requested_filename
     max_resume_attempts = 8
     resume_attempts = 0
+    last_progress_pct = -1
+
+    def _emit_progress(pct: int, written: int, total: int, name: str) -> None:
+        nonlocal last_progress_pct
+        pct_clamped = 0 if pct < 0 else (100 if pct > 100 else pct)
+        if pct_clamped == last_progress_pct:
+            return
+        last_progress_pct = pct_clamped
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(pct_clamped, written, total, name)
+        except Exception:
+            # UI callback errors must never break file transfer.
+            pass
 
     with out_path.open("wb") as out:
         completed = False
@@ -505,6 +522,7 @@ def transfer_file_protocol(
                 )
                 if file_size is None:
                     file_size = session_file_size
+                    _emit_progress(0, bytes_written, file_size, filename)
                 elif file_size != session_file_size:
                     raise ValueError(f"FILE_INFO size changed during resume: {file_size} -> {session_file_size}")
 
@@ -547,6 +565,7 @@ def transfer_file_protocol(
                             pct = int((bytes_written * 100) / file_size)
                             if pct >= next_progress_report:
                                 print(f"[{device_ip}] Receiving {filename}: {pct}% ({bytes_written}/{file_size})")
+                                _emit_progress(pct, bytes_written, file_size, filename)
                                 next_progress_report += 10
                         continue
 
@@ -572,6 +591,8 @@ def transfer_file_protocol(
                                 break
                             raise ValueError("EOF integrity check failed (crc mismatch)")
                         print(f"[{device_ip}] EOF verified: bytes={total_bytes} crc32={local_crc}")
+                        if file_size and file_size > 0:
+                            _emit_progress(100, bytes_written, file_size, filename)
                         completed = True
                         break
 

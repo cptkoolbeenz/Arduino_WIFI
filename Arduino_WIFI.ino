@@ -79,6 +79,7 @@ uint32_t sdErrorCount = 0;
 
 const char POLL_MESSAGE[] = "POLL_UID";
 const char LIST_FILES_MESSAGE[] = "LIST_FILES";
+const char DELETE_FILE_MESSAGE[] = "DELETE_FILE";
 const char START_FILE_MESSAGE[] = "START_FILE";
 const char RESUME_MESSAGE[] = "RESUME";
 const char SET_TIME_MESSAGE[] = "SET_TIME";
@@ -1235,6 +1236,60 @@ void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t r
 }
 
 /***********************
+ * Returns true when filename is safe to use on SD root path.
+ ***********************/
+bool isSafeSdFilename(const String &filename) {
+  if (filename.length() == 0 || filename.length() > 40) return false;
+  if (filename.indexOf('/') >= 0 || filename.indexOf('\\') >= 0) return false;
+  if (filename.indexOf("..") >= 0) return false;
+  return true;
+}
+
+/***********************
+ * Deletes a specific file from SD card on controller request.
+ * Command format: DELETE_FILE,<transferId>,<filename>
+ ***********************/
+void deleteFileFromSd(const String &transferId, const String &filenameIn, const IPAddress &replyIp, uint16_t replyPort) {
+  if (!sdReady) {
+    sendUdpMessage("ERROR," + transferId + ",SD_NOT_READY,SD init failed", replyIp, replyPort);
+    return;
+  }
+
+  String filename = filenameIn;
+  filename.trim();
+  if (filename.startsWith("/")) filename = filename.substring(1);
+
+  if (!isSafeSdFilename(filename)) {
+    sendUdpMessage("ERROR," + transferId + ",BAD_FILENAME," + filenameIn, replyIp, replyPort);
+    return;
+  }
+
+  // Safety guard: do not delete the active acquisition file.
+  if (filename.equalsIgnoreCase(myFilename)) {
+    sendUdpMessage("ERROR," + transferId + ",ACTIVE_FILE," + filename, replyIp, replyPort);
+    return;
+  }
+
+  String path = "/" + filename;
+  bool exists = SD.exists(path.c_str()) || SD.exists(filename.c_str());
+  if (!exists) {
+    sendUdpMessage("ERROR," + transferId + ",FILE_NOT_FOUND," + filename, replyIp, replyPort);
+    return;
+  }
+
+  bool removed = SD.remove(path.c_str());
+  if (!removed) removed = SD.remove(filename.c_str());
+  if (!removed) {
+    sendUdpMessage("ERROR," + transferId + ",DELETE_FAILED," + filename, replyIp, replyPort);
+    return;
+  }
+
+  Serial.print(F("SD delete OK: "));
+  Serial.println(filename);
+  sendUdpMessage("ACK_DELETE," + transferId + "," + filename, replyIp, replyPort);
+}
+
+/***********************
  * Streams one remote file over TCP using CHUNK headers.
  * @param transferId Transfer correlation ID.
  * @param filename Remote filename requested by controller.
@@ -1479,6 +1534,13 @@ void serviceWifiCommands() {
   if (fieldCount >= 1 && strcmp(fields[0], LIST_FILES_MESSAGE) == 0) {
     String transferId = (fieldCount >= 2) ? String(fields[1]) : String("T0");
     sendFileList(transferId, remoteIp, remotePort);
+    return;
+  }
+
+  if (fieldCount >= 3 && strcmp(fields[0], DELETE_FILE_MESSAGE) == 0) {
+    String transferId = String(fields[1]);
+    String filename = String(fields[2]);
+    deleteFileFromSd(transferId, filename, remoteIp, remotePort);
     return;
   }
 

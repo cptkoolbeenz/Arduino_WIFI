@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import csv
+import json
 import sqlite3
 import socket
 import subprocess
@@ -21,6 +22,7 @@ from pathlib import Path
 from bsm_network.config import (
     ACTIVE_NETWORK_PROFILE,
     ACTIVE_NETWORK_PROFILE_SOURCE,
+    DEFAULT_BIND_IP,
     DEFAULT_DB_PATH,
     DEFAULT_DISCOVER_CSV,
     DEFAULT_DISCOVER_PORT,
@@ -31,7 +33,14 @@ from bsm_network.config import (
     build_poll_now_argv,
     parse_args,
 )
-from bsm_network.db import is_transfer_active, list_active_transfers, read_devices_snapshot, set_burrow_id_by_short_uid
+from bsm_network.db import (
+    is_transfer_active,
+    list_active_transfers,
+    log_transfer_event,
+    read_devices_snapshot,
+    set_burrow_id_by_short_uid,
+    set_burrow_id_by_unique_id,
+)
 from bsm_network.discovery import run_discovery
 from bsm_network.protocol import (
     clear_device_errors as protocol_clear_device_errors,
@@ -43,7 +52,9 @@ from bsm_network.protocol import (
     ping_device as protocol_ping_device,
     reboot_device as protocol_reboot_device,
     set_device_config as protocol_set_device_config,
+    transfer_file_protocol,
 )
+from bsm_network.records import build_local_filename, ensure_unique_filename
 
 DISCOVER_CONTROL_PORT = DEFAULT_DISCOVER_PORT
 WEB_SET_TIME_OFFSET_HOURS = -4.0
@@ -215,6 +226,48 @@ class ProcessManager:
 
 MANAGER = ProcessManager()
 ACTION_LOG_PATH = Path("data/web_actions.log")
+WEB_FILE_OUTPUT_ROOT = Path("data/files")
+WEB_FILE_LOG_ROOT = Path("data/file_logs")
+UPLOAD_PROGRESS_LOCK = threading.Lock()
+UPLOAD_PROGRESS: dict[str, dict[str, str | int | bool | float]] = {}
+
+
+def set_upload_progress(op_id: str, pct: int, message: str, done: bool = False, error: bool = False) -> None:
+    token = (op_id or "").strip()
+    if not token:
+        return
+    now = time.time()
+    with UPLOAD_PROGRESS_LOCK:
+        UPLOAD_PROGRESS[token] = {
+            "pct": max(0, min(100, int(pct))),
+            "message": str(message),
+            "done": bool(done),
+            "error": bool(error),
+            "updated_at": now,
+        }
+        # Best-effort cleanup for stale entries.
+        stale_before = now - 1800.0
+        stale_keys = [k for k, v in UPLOAD_PROGRESS.items() if float(v.get("updated_at", 0.0) or 0.0) < stale_before]
+        for k in stale_keys:
+            UPLOAD_PROGRESS.pop(k, None)
+
+
+def get_upload_progress(op_id: str) -> dict[str, str | int | bool]:
+    token = (op_id or "").strip()
+    if not token:
+        return {"ok": False, "pct": 0, "message": "missing op id", "done": False, "error": True}
+    with UPLOAD_PROGRESS_LOCK:
+        entry = UPLOAD_PROGRESS.get(token)
+    if not entry:
+        # Allow client polling to continue while upload handler initializes.
+        return {"ok": False, "pct": 0, "message": "upload operation pending", "done": False, "error": False}
+    return {
+        "ok": True,
+        "pct": int(entry.get("pct", 0) or 0),
+        "message": str(entry.get("message", "")),
+        "done": bool(entry.get("done", False)),
+        "error": bool(entry.get("error", False)),
+    }
 
 
 def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
@@ -553,6 +606,23 @@ def assign_burrow_id(short_uid: str, burrow_id: str) -> str:
     return msg if ok else f"Assign burrow_id failed: {msg}"
 
 
+def assign_burrow_id_for_uid(unique_id: str, burrow_id: str) -> str:
+    db_path = Path(DEFAULT_DB_PATH)
+    ok, msg = set_burrow_id_by_unique_id(db_path=db_path, unique_id=unique_id, burrow_id=burrow_id)
+    return msg if ok else f"Assign burrow_id failed: {msg}"
+
+
+def _current_burrow_for_uid(unique_id: str) -> str:
+    uid = (unique_id or "").strip()
+    if not uid:
+        return ""
+    rows = read_devices_snapshot(Path(DEFAULT_DB_PATH))
+    for row in rows:
+        if (row.get("unique_id", "") or "").strip() == uid:
+            return (row.get("burrow_id", "") or "").strip()
+    return ""
+
+
 def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -665,7 +735,47 @@ def _request_remote_file_list_with_sizes(device_ip: str, timeout_s: float = 8.0)
         sock.close()
 
 
-def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str]], str]:
+def delete_remote_file(device_ip: str, remote_filename: str, timeout_s: float = 8.0) -> tuple[bool, str]:
+    ip = (device_ip or "").strip()
+    name = (remote_filename or "").strip()
+    if not ip or not name:
+        return False, "Missing device IP or filename."
+    if "," in name:
+        return False, "Filename contains unsupported comma."
+
+    transfer_id = f"DWEB{int(time.time() * 1000)}"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.4)
+    try:
+        msg = f"DELETE_FILE,{transfer_id},{name}".encode("utf-8")
+        sock.sendto(msg, (ip, DISCOVER_CONTROL_PORT))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                data, (src_ip, _src_port) = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if src_ip != ip:
+                continue
+            line = data.decode("utf-8", errors="replace").strip()
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2 or parts[1] != transfer_id:
+                continue
+            if parts[0] == "ACK_DELETE":
+                return True, f"Deleted SD file '{name}' on {ip}."
+            if parts[0] == "ERROR":
+                return False, f"Arduino error: {line}"
+        return False, (
+            f"DELETE_FILE timeout for {ip} "
+            "(device may not be running firmware with DELETE_FILE support yet)"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    finally:
+        sock.close()
+
+
+def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str, str, float]], str]:
     if not db_path.exists():
         return [], "(No upload DB yet)"
     try:
@@ -673,7 +783,7 @@ def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list
         try:
             cur = conn.execute(
                 """
-                SELECT COALESCE(source_filename, ''), COALESCE(event_ts, '')
+                SELECT COALESCE(source_filename, ''), COALESCE(event_ts, ''), COALESCE(saved_path, '')
                 FROM transfer_events
                 WHERE status = 'saved' AND unique_id = ?
                 ORDER BY event_ts DESC
@@ -685,7 +795,181 @@ def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list
             conn.close()
     except sqlite3.OperationalError as exc:
         return [], f"(Upload history unavailable: {exc})"
-    return [(str(r[0] or ""), str(r[1] or "")) for r in rows], ""
+    existing_rows: list[tuple[str, str, str, float]] = []
+    for r in rows:
+        name = str(r[0] or "")
+        ts = str(r[1] or "")
+        saved_path = str(r[2] or "")
+        if not saved_path:
+            continue
+        try:
+            p = Path(saved_path).expanduser()
+            if p.exists() and p.is_file():
+                size_mb = float(p.stat().st_size) / (1024.0 * 1024.0)
+                existing_rows.append((name, ts, saved_path, size_mb))
+        except Exception:
+            continue
+    return existing_rows, ""
+
+
+def _build_uploaded_rows_html(rows: list[tuple[str, str, str, float]]) -> str:
+    if not rows:
+        return '<div style="font-style:italic;">(No uploaded files logged for this Arduino)</div>'
+    out = []
+    out.append('<div class="upload-head">filename                          size_mb   uploaded_at</div>')
+    out.append('<div class="upload-sep">--------------------------------  -------   -------------------</div>')
+    for name, ts, saved_path, size_mb in rows:
+        line = f"{name:<32}  {size_mb:>7.3f}   {ts}"
+        out.append(
+            f'<div class="upload-row" data-name="{html.escape(name, quote=True)}" '
+            f'data-ts="{html.escape(ts, quote=True)}" '
+            f'data-path="{html.escape(saved_path, quote=True)}">{html.escape(line)}</div>'
+        )
+    return "".join(out)
+
+
+def delete_local_uploaded_file(saved_path: str) -> tuple[bool, str]:
+    raw = (saved_path or "").strip()
+    if not raw:
+        return False, "No saved_path provided."
+    try:
+        target = Path(raw).expanduser().resolve()
+        data_root = Path("data").resolve()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Invalid path: {exc}"
+    if data_root not in target.parents and target != data_root:
+        return False, f"Refusing to delete outside data folder: {target}"
+    if not target.exists():
+        return False, f"File not found: {target}"
+    if not target.is_file():
+        return False, f"Not a file: {target}"
+    try:
+        target.unlink()
+        return True, f"Deleted local file: {target}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Delete failed: {exc}"
+
+
+def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
+    if not rows:
+        return '<div style="font-style:italic;">(No files reported by Arduino)</div>'
+    out = []
+    out.append('<div class="sd-head">filename                          size_mb</div>')
+    out.append('<div class="sd-sep">--------------------------------  -------</div>')
+    for name, size in sorted(rows, key=lambda x: x[0], reverse=True):
+        size_mb = float(size) / (1024.0 * 1024.0)
+        line = f"{name:<32}  {size_mb:>7.3f}"
+        out.append(
+            f'<div class="sd-row" data-name="{html.escape(name, quote=True)}">{html.escape(line)}</div>'
+        )
+    return "".join(out)
+
+
+def upload_selected_remote_file(
+    unique_id: str,
+    short_uid: str,
+    network_uid: str,
+    burrow_id: str,
+    ap_id: str,
+    device_ip: str,
+    remote_filename: str,
+    progress_callback=None,
+) -> tuple[bool, str, dict[str, str | float]]:
+    uid = (unique_id or "").strip()
+    sid = (short_uid or "").strip().upper()
+    net_uid = (network_uid or "").strip()
+    burrow = (burrow_id or "").strip()
+    ap = (ap_id or "").strip()
+    ip = (device_ip or "").strip()
+    rfn = (remote_filename or "").strip()
+    if not uid or not ip or not rfn:
+        return (
+            False,
+            "Missing uid/device_ip/remote filename.",
+            {
+                "unique_id": uid,
+                "network_uid": net_uid,
+                "burrow_id": burrow,
+                "ap_id": ap,
+                "device_ip": ip,
+                "source_filename": rfn,
+                "saved_path": "",
+                "status": "error",
+                "message": "Missing uid/device_ip/remote filename.",
+                "error_text": "missing-required-input",
+                "duration_s": 0.0,
+            },
+        )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    start_ts = time.monotonic()
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        requested_bind = (DEFAULT_BIND_IP or "").strip() or "0.0.0.0"
+        try:
+            sock.bind((requested_bind, 0))
+        except OSError:
+            if requested_bind != "0.0.0.0":
+                sock.bind(("0.0.0.0", 0))
+            else:
+                raise
+        sock.settimeout(0.2)
+
+        display_id = sid if sid else (uid[-6:] if len(uid) >= 6 else uid).upper()
+        out_dir = WEB_FILE_OUTPUT_ROOT / display_id
+        local_name = build_local_filename(rfn, uid, device_short_uid=sid if sid else None)
+        local_name = ensure_unique_filename(local_name, out_dir)
+
+        saved_path = transfer_file_protocol(
+            control_sock=sock,
+            device_ip=ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            local_bind_ip=requested_bind if requested_bind else "0.0.0.0",
+            requested_filename=rfn,
+            output_dir=out_dir,
+            device_uid=uid,
+            device_short_uid=sid if sid else None,
+            log_root=WEB_FILE_LOG_ROOT,
+            local_filename=local_name,
+            timeout_s=120.0,
+            tolerant_integrity=True,
+            mark_partial_received=False,
+            progress_callback=progress_callback,
+        )
+        duration_s = time.monotonic() - start_ts
+        result = {
+            "unique_id": uid,
+            "network_uid": net_uid,
+            "burrow_id": burrow,
+            "ap_id": ap,
+            "device_ip": ip,
+            "source_filename": rfn,
+            "saved_path": str(saved_path),
+            "status": "saved",
+            "message": f"Uploaded selected file '{rfn}' -> {saved_path}",
+            "error_text": "",
+            "duration_s": duration_s,
+        }
+        return True, str(result["message"]), result
+    except Exception as exc:  # noqa: BLE001
+        duration_s = time.monotonic() - start_ts
+        msg = f"Upload failed for '{rfn}': {exc}"
+        result = {
+            "unique_id": uid,
+            "network_uid": net_uid,
+            "burrow_id": burrow,
+            "ap_id": ap,
+            "device_ip": ip,
+            "source_filename": rfn,
+            "saved_path": "",
+            "status": "error",
+            "message": msg,
+            "error_text": str(exc),
+            "duration_s": duration_s,
+        }
+        return False, msg, result
+    finally:
+        sock.close()
 
 
 def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str, str]], str]:
@@ -765,7 +1049,7 @@ def render_page(message: str = "") -> bytes:
       font-family: "Avenir Next", "Trebuchet MS", sans-serif;
     }}
     .shell {{
-      max-width: 1100px;
+      max-width: 1180px;
       margin: 1.25rem auto;
       padding: 0 1rem;
     }}
@@ -824,6 +1108,9 @@ def render_page(message: str = "") -> bytes:
       font-size: 0.84rem;
       line-height: 1.35;
     }}
+    .known-arduino-box {{
+      height: 320px;
+    }}
     .nav-buttons {{
       margin-top: 0.9rem;
       display: flex;
@@ -855,7 +1142,7 @@ def render_page(message: str = "") -> bytes:
     </div>
 
     <div class="section-title">Known Arduinos</div>
-    <div id="devicebox" class="scrollbox">Loading Arduino status...</div>
+    <div id="devicebox" class="scrollbox known-arduino-box">Loading Arduino status...</div>
 
     <div class="section-title">Uploads Today</div>
     <div id="uploadsbox" class="scrollbox">Loading uploaded-file list...</div>
@@ -946,30 +1233,15 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
             selected_device = d
             break
 
-    device_rows_html = []
-    for d in devices:
-        uid = (d.get("unique_id", "") or "").strip()
-        short_uid = (d.get("short_uid", "") or "").strip()
-        if not short_uid:
-            short_uid = uid[-6:] if len(uid) >= 6 else uid
-        if str(d.get("short_uid_collision", "0")) in {"1", "true", "True"}:
-            short_uid = f"{short_uid}*"
-        burrow = (d.get("burrow_id", "") or "").strip() or "-"
-        status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
-        ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
-        checked = "checked" if uid == selected_uid else ""
-        label = f"{status:<7} {burrow:<10} {short_uid:<8} {uid:<36} {ip}"
-        device_rows_html.append(
-            f'<label style="display:block; margin:0.15rem 0;"><input type="radio" name="uid" value="{html.escape(uid)}" {checked} /> '
-            f'<span style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.84rem;">{html.escape(label)}</span></label>'
-        )
-    if not device_rows_html:
-        device_rows_html = ['<div style="font-style:italic;">No devices discovered yet.</div>']
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
 
     selected_short = ""
     selected_ip = ""
     files_on_device_lines = ["(Select a known Arduino to view SD files)"]
-    uploaded_lines = ["(Select a known Arduino to view upload history)"]
+    remote_rows_ui: list[tuple[str, int]] = []
+    remote_note = "(Select a known Arduino to view SD files)"
+    uploaded_rows_ui: list[tuple[str, str, str, float]] = []
+    uploaded_note = "(Select a known Arduino to view upload history)"
     history_lines = ["(Select a known Arduino to view complete DB history)"]
     active_rows: list[dict[str, str]] = []
     active_error = ""
@@ -1010,34 +1282,23 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
             selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
 
         if active_busy:
-            files_on_device_lines = [
-                "(Live SD file query paused while uploads are active.)",
-                "(Use 'Wait/Refresh' or 'Stop Normal Ops Safely', then reload.)",
-            ]
+            remote_note = "(Live SD file query paused while uploads are active.)"
         else:
             remote_items, remote_err = _request_remote_file_list_with_sizes(selected_ip, timeout_s=8.0)
             if remote_err:
-                files_on_device_lines = [f"(Could not fetch files: {remote_err})"]
+                remote_note = f"(Could not fetch files: {remote_err})"
             else:
-                files_on_device_lines = []
-                files_on_device_lines.append("filename                          size_bytes")
-                files_on_device_lines.append("--------------------------------  ----------")
-                for name, size in sorted(remote_items, key=lambda x: x[0], reverse=True):
-                    files_on_device_lines.append(f"{name:<32}  {size:>10}")
-                if len(remote_items) == 0:
-                    files_on_device_lines = ["(No files reported by Arduino)"]
+                remote_rows_ui = remote_items
+                if len(remote_rows_ui) == 0:
+                    remote_note = "(No files reported by Arduino)"
 
         uploaded_rows, uploaded_err = _read_uploaded_files_for_device(Path(DEFAULT_DB_PATH), selected_uid)
         if uploaded_err:
-            uploaded_lines = [uploaded_err]
+            uploaded_note = uploaded_err
         else:
-            uploaded_lines = []
-            uploaded_lines.append("filename                          uploaded_at")
-            uploaded_lines.append("--------------------------------  -------------------")
-            for name, ts in uploaded_rows:
-                uploaded_lines.append(f"{name:<32}  {ts}")
-            if len(uploaded_rows) == 0:
-                uploaded_lines = ["(No uploaded files logged for this Arduino)"]
+            uploaded_rows_ui = uploaded_rows
+            if len(uploaded_rows_ui) == 0:
+                uploaded_note = "(No uploaded files logged for this Arduino)"
 
         history_rows, history_err = _read_full_history_for_device(Path(DEFAULT_DB_PATH), selected_uid)
         if history_err:
@@ -1052,9 +1313,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
                 history_lines = ["(No DB history for this Arduino)"]
 
     files_title_suffix = selected_short if selected_short else "..."
-    device_rows_html_block = "".join(device_rows_html)
-    files_on_device_block = "\n".join(html.escape(x) for x in files_on_device_lines)
-    uploaded_block = "\n".join(html.escape(x) for x in uploaded_lines)
+    remote_rows_html = _build_remote_rows_html(remote_rows_ui)
+    uploaded_rows_html = _build_uploaded_rows_html(uploaded_rows_ui)
     history_block = "\n".join(html.escape(x) for x in history_lines)
     page = f"""<!doctype html>
 <html lang="en">
@@ -1080,9 +1340,46 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
     form {{ margin: 0; }}
     button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
+    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
     .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
     .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
+    .known-arduino-box {{ height: 320px; }}
+    .device-head, .device-sep {{ white-space: pre; }}
+    .device-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
+    .device-row:hover {{ background: #eef5ff; }}
+    .device-row.selected {{ background: #d7e9ff; font-weight: 700; }}
+    .sd-head, .sd-sep {{ white-space: pre; }}
+    .sd-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
+    .sd-row:hover {{ background: #eef5ff; }}
+    .sd-row.selected {{ background: #c8f7d1; font-weight: 700; }}
+    .upload-head, .upload-sep {{ white-space: pre; }}
+    .upload-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
+    .upload-row:hover {{ background: #eef5ff; }}
+    .upload-row.selected {{ background: #ffe1ba; font-weight: 700; }}
     .grid2 {{ margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
+    .list-actions {{ display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }}
+    .delete-btn {{ background: #c53030; border-color: #9b2c2c; }}
+    .progress-overlay {{
+      position: fixed;
+      inset: 0;
+      background: rgba(13, 29, 47, 0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }}
+    .progress-card {{
+      background: #ffffff;
+      border: 1px solid #9cb2c9;
+      border-radius: 8px;
+      min-width: 260px;
+      padding: 0.8rem 1rem;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.18);
+      text-align: center;
+      font-weight: 700;
+      color: #1f2937;
+    }}
     .busy-note {{
       margin: 0.3rem 0 0.8rem 0;
       border: 1px solid #e5b97a;
@@ -1112,11 +1409,11 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       <div class="controls">
         <form method="get" action="/"><button type="submit">Dashboard</button></form>
         <form method="get" action="/file-transfers">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <button type="submit">Wait/Refresh</button>
         </form>
         <form method="post" action="/file-transfers-stop-safe">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <button type="submit">Stop Normal Ops Safely</button>
         </form>
       </div>
@@ -1124,9 +1421,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 
       <div class="section-title">Known Arduinos (select one)</div>
       <form method="get" action="/file-transfers">
-        <div class="scrollbox" style="white-space: normal;">
-          {device_rows_html_block}
-        </div>
+        <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+        <div class="scrollbox known-arduino-box">{device_rows_html_block}</div>
         <div style="margin-top:0.5rem;">
           <button type="submit">Load File Lists</button>
         </div>
@@ -1135,11 +1431,36 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       <div class="grid2">
         <div>
           <div class="section-title">Files on {html.escape(files_title_suffix)}</div>
-          <div class="scrollbox">{files_on_device_block}</div>
+          <div class="list-actions">
+            <form method="post" action="/file-transfers-upload-selected" id="sd-upload-form">
+              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+              <input type="hidden" name="remote_filename" value="" id="sd-selected-name" />
+              <input type="hidden" name="upload_op_id" value="" id="sd-upload-op-id" />
+              <button type="submit" id="sd-upload-button">Upload</button>
+            </form>
+            <form method="post" action="/file-transfers-delete-sd" id="sd-delete-form">
+              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+              <input type="hidden" name="remote_filename" value="" id="sd-delete-selected-name" />
+              <button type="submit" class="delete-btn" id="sd-delete-button">Delete on SD</button>
+            </form>
+          </div>
+          <div class="scrollbox" id="sd-list-box">{
+              remote_rows_html if remote_rows_ui else html.escape(remote_note)
+          }</div>
         </div>
         <div>
           <div class="section-title">Files uploaded from {html.escape(files_title_suffix)}</div>
-          <div class="scrollbox">{uploaded_block}</div>
+          <div class="list-actions">
+            <form method="post" action="/file-transfers-delete-uploaded" id="uploaded-delete-form">
+              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+              <input type="hidden" name="saved_path" value="" id="uploaded-selected-path" />
+              <input type="hidden" name="source_filename" value="" id="uploaded-selected-name" />
+              <button type="submit" class="delete-btn" id="uploaded-delete-button">Delete</button>
+            </form>
+          </div>
+          <div class="scrollbox" id="uploaded-list-box">{
+              uploaded_rows_html if uploaded_rows_ui else html.escape(uploaded_note)
+          }</div>
         </div>
       </div>
 
@@ -1147,6 +1468,202 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       <div class="scrollbox">{history_block}</div>
     </div>
   </div>
+<div id="upload-progress-overlay" class="progress-overlay">
+  <div class="progress-card" id="upload-progress-text">Uploading selected file... Please wait.</div>
+</div>
+<div id="delete-progress-overlay" class="progress-overlay">
+  <div class="progress-card" id="delete-progress-text">Deleting selected file... Please wait.</div>
+</div>
+<script>
+  (function() {{
+    const rows = Array.from(document.querySelectorAll(".device-row"));
+    const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
+    const sdRows = Array.from(document.querySelectorAll(".sd-row"));
+    const uploadForm = document.getElementById("sd-upload-form");
+    const sdSelectedName = document.getElementById("sd-selected-name");
+    const sdUploadOpId = document.getElementById("sd-upload-op-id");
+    const sdDeleteForm = document.getElementById("sd-delete-form");
+    const sdDeleteSelectedName = document.getElementById("sd-delete-selected-name");
+    const uploadOverlay = document.getElementById("upload-progress-overlay");
+    const uploadProgressText = document.getElementById("upload-progress-text");
+    const deleteOverlay = document.getElementById("delete-progress-overlay");
+    const deleteProgressText = document.getElementById("delete-progress-text");
+    const uploadRows = Array.from(document.querySelectorAll(".upload-row"));
+    const deleteForm = document.getElementById("uploaded-delete-form");
+    const sdUploadButton = document.getElementById("sd-upload-button");
+    const sdDeleteButton = document.getElementById("sd-delete-button");
+    const uploadedDeleteButton = document.getElementById("uploaded-delete-button");
+    const selectedPath = document.getElementById("uploaded-selected-path");
+    const selectedName = document.getElementById("uploaded-selected-name");
+    function updateActionButtons() {{
+      const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
+      const hasSd = !!((sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "");
+      const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
+      if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
+      if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
+      if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
+    }}
+    function setSelectedUid(uid) {{
+      uidFields.forEach((f) => {{ f.value = uid; }});
+      rows.forEach((r) => {{
+        if (r.dataset.uid === uid) r.classList.add("selected");
+        else r.classList.remove("selected");
+      }});
+      updateActionButtons();
+    }}
+    rows.forEach((r) => {{
+      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || ""));
+    }});
+
+    function setSelectedSdRow(row) {{
+      sdRows.forEach((r) => r.classList.remove("selected"));
+      if (!row) {{
+        if (sdSelectedName) sdSelectedName.value = "";
+        if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
+        updateActionButtons();
+        return;
+      }}
+      row.classList.add("selected");
+      if (sdSelectedName) sdSelectedName.value = row.dataset.name || "";
+      if (sdDeleteSelectedName) sdDeleteSelectedName.value = row.dataset.name || "";
+      updateActionButtons();
+    }}
+    sdRows.forEach((r) => {{
+      r.addEventListener("click", () => setSelectedSdRow(r));
+    }});
+    if (uploadForm) {{
+      uploadForm.addEventListener("submit", (ev) => {{
+        ev.preventDefault();
+        const name = (sdSelectedName && sdSelectedName.value) ? sdSelectedName.value : "selected file";
+        const ok = window.confirm("Upload selected SD file '" + name + "' now?");
+        if (!ok) return;
+        const opId = "op_" + Date.now().toString() + "_" + Math.floor(Math.random() * 100000).toString();
+        if (sdUploadOpId) sdUploadOpId.value = opId;
+        if (uploadOverlay) uploadOverlay.style.display = "flex";
+        if (uploadProgressText) uploadProgressText.textContent = "Uploading selected file... 0% ... please wait.";
+
+        let progressTimer = null;
+        const pollProgress = () => {{
+          fetch("/upload-progress?op=" + encodeURIComponent(opId), {{ cache: "no-store" }})
+            .then((resp) => resp.json())
+            .then((state) => {{
+              if (!state) return;
+              const pct = Number.isFinite(state.pct) ? state.pct : 0;
+              if (uploadProgressText) {{
+                if (state.ok) {{
+                  uploadProgressText.textContent = "Uploading selected file - " + pct + "% - please wait.";
+                }} else {{
+                  uploadProgressText.textContent = "Uploading selected file... preparing transfer... please wait.";
+                }}
+              }}
+              if (state.done && progressTimer) {{
+                clearInterval(progressTimer);
+                progressTimer = null;
+              }}
+            }})
+            .catch((_err) => {{
+              // Ignore transient poll errors.
+            }});
+        }};
+        progressTimer = setInterval(pollProgress, 500);
+        pollProgress();
+
+        const params = new URLSearchParams(new FormData(uploadForm));
+        fetch(uploadForm.action, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }},
+          body: params.toString(),
+          cache: "no-store",
+        }})
+          .then((resp) => resp.text())
+          .then((htmlText) => {{
+            if (progressTimer) {{
+              clearInterval(progressTimer);
+              progressTimer = null;
+            }}
+            document.open();
+            document.write(htmlText);
+            document.close();
+          }})
+          .catch((_err) => {{
+            if (progressTimer) {{
+              clearInterval(progressTimer);
+              progressTimer = null;
+            }}
+            if (uploadOverlay) uploadOverlay.style.display = "none";
+            window.alert("Upload request failed before completion. Check activity log.");
+        }});
+      }});
+    }}
+    if (sdDeleteForm) {{
+      sdDeleteForm.addEventListener("submit", (ev) => {{
+        ev.preventDefault();
+        const name = (sdDeleteSelectedName && sdDeleteSelectedName.value) ? sdDeleteSelectedName.value : "selected file";
+        const ok1 = window.confirm("Delete selected SD file '" + name + "' now?");
+        if (!ok1) {{
+          return;
+        }}
+        const uploadedNames = new Set(
+          uploadRows
+            .map((r) => (r.dataset.name || "").trim().toUpperCase())
+            .filter((v) => v.length > 0)
+        );
+        if (!uploadedNames.has(name.trim().toUpperCase())) {{
+          const ok2 = window.confirm("chosen file has not been uploaded. Proceed anyway?");
+          if (!ok2) {{
+            return;
+          }}
+        }}
+        if (deleteOverlay) deleteOverlay.style.display = "flex";
+        if (deleteProgressText) {{
+          deleteProgressText.textContent = "Deleting " + name + ". Please wait.";
+        }}
+        const params = new URLSearchParams(new FormData(sdDeleteForm));
+        fetch(sdDeleteForm.action, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }},
+          body: params.toString(),
+          cache: "no-store",
+        }})
+          .then((resp) => resp.text())
+          .then((htmlText) => {{
+            document.open();
+            document.write(htmlText);
+            document.close();
+          }})
+          .catch((_err) => {{
+            if (deleteOverlay) deleteOverlay.style.display = "none";
+            window.alert("Delete request failed before completion. Check activity log.");
+          }});
+      }});
+    }}
+
+    function setSelectedUploadRow(row) {{
+      uploadRows.forEach((r) => r.classList.remove("selected"));
+      if (!row) {{
+        if (selectedPath) selectedPath.value = "";
+        if (selectedName) selectedName.value = "";
+        updateActionButtons();
+        return;
+      }}
+      row.classList.add("selected");
+      if (selectedPath) selectedPath.value = row.dataset.path || "";
+      if (selectedName) selectedName.value = row.dataset.name || "";
+      updateActionButtons();
+    }}
+    uploadRows.forEach((r) => {{
+      r.addEventListener("click", () => setSelectedUploadRow(r));
+    }});
+    if (deleteForm) {{
+      deleteForm.addEventListener("submit", (ev) => {{
+        const name = (selectedName && selectedName.value) ? selectedName.value : "this file";
+        const ok = window.confirm("Delete local uploaded file '" + name + "'?");
+        if (!ok) ev.preventDefault();
+      }});
+    }}
+    updateActionButtons();
+  }})();
+</script>
 </body>
 </html>
 """
@@ -1161,7 +1678,7 @@ def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dic
 
 
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
-    rows = []
+    rows: list[tuple[str, str]] = []
     for d in devices:
         uid = (d.get("unique_id", "") or "").strip()
         short_uid = (d.get("short_uid", "") or "").strip()
@@ -1171,16 +1688,30 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             short_uid = f"{short_uid}*"
         burrow = (d.get("burrow_id", "") or "").strip() or "-"
         status = (d.get("status", "UNKNOWN") or "UNKNOWN").strip()
+        if len(status) > 6:
+            status = status[:6]
+        ap_id = (d.get("ap_id", "") or "").strip()
+        net_uid = (d.get("network_uid", "") or "").strip()
         ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
-        checked = "checked" if uid == selected_uid else ""
-        label = f"{status:<7} {burrow:<10} {short_uid:<8} {uid:<36} {ip}"
-        rows.append(
-            f'<label style="display:block; margin:0.15rem 0;"><input type="radio" name="uid" value="{html.escape(uid)}" {checked} /> '
-            f'<span style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:0.84rem;">{html.escape(label)}</span></label>'
+        recv_ip = (d.get("recv_ip", "") or "").strip()
+        last_seen_raw = (d.get("last_seen", "") or "").strip()
+        line = (
+            f"{status:<6}   {burrow:<12}   {short_uid:<8}   {uid:<36}   "
+            f"{ap_id:<9}   {net_uid:<15}   {ip:<11}   {recv_ip:<11}    {last_seen_raw}"
         )
+        rows.append((uid, line))
     if not rows:
         return '<div style="font-style:italic;">No devices discovered yet.</div>'
-    return "".join(rows)
+
+    out = []
+    out.append('<div class="device-head">status   burrow_id      short_uid  unique_id                              ap_id       network_uid       device_ip      recv_ip        last_seen</div>')
+    out.append('<div class="device-sep">------   ------------   --------   ------------------------------------   ---------   ---------------   -----------   -----------    -------------------</div>')
+    for uid, line in rows:
+        selected_cls = " selected" if uid == selected_uid else ""
+        out.append(
+            f'<div class="device-row{selected_cls}" data-uid="{html.escape(uid)}">{html.escape(line)}</div>'
+        )
+    return "".join(out)
 
 
 def _maintenance_info_lines(device_ip: str) -> list[str]:
@@ -1206,7 +1737,7 @@ def _rtc_panel_lines(device_ip: str, timeout_s: float = 2.0) -> tuple[str, str, 
         data, (src_ip, _src_port) = sock.recvfrom(2048)
         line = data.decode("utf-8", errors="replace").strip()
         if src_ip != device_ip:
-            return "result", f"unexpected_source={src_ip}"
+            return "result", "------", f"unexpected_source={src_ip}"
         if line.startswith("TIME,"):
             parts = line.split(",", 2)
             epoch = parts[1] if len(parts) > 1 else ""
@@ -1297,13 +1828,14 @@ def _mini_panel_block(header: str, separator: str, values: str) -> str:
     return f"{header}\n{separator}\n{values}"
 
 
-def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
+def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_input: str | None = None) -> bytes:
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
     selected_device = _find_device_by_uid(devices, selected_uid)
+    selected_burrow = (burrow_input if burrow_input is not None else "").strip()
 
     panels: dict[str, tuple[str, str, str]] = {
         "RTC Time": ("result", "------", "select a known Arduino"),
@@ -1317,6 +1849,8 @@ def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
         selected_short = (selected_device.get("short_uid", "") or "").strip()
         if not selected_short:
             selected_short = uid[-6:] if len(uid) >= 6 else uid
+        if burrow_input is None:
+            selected_burrow = (selected_device.get("burrow_id", "") or "").strip()
         device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
         panels = _maintenance_panel_data(device_ip=device_ip)
     device_rows_html_block = _build_device_select_rows(devices, selected_uid)
@@ -1346,6 +1880,11 @@ def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
     button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
     .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
     .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
+    .known-arduino-box {{ height: 320px; }}
+    .device-head, .device-sep {{ white-space: pre; }}
+    .device-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
+    .device-row:hover {{ background: #eef5ff; }}
+    .device-row.selected {{ background: #d7e9ff; font-weight: 700; }}
     .mini-grid {{ margin-top: 0.9rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
     .mini-title {{ margin: 0 0 0.25rem 0; font-size: 0.9rem; color: #304a64; font-weight: 700; }}
     .mini-box {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }}
@@ -1367,29 +1906,37 @@ def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
 
       <div class="section-title">Known Arduinos (select one)</div>
       <form method="get" action="/maintenance">
-        <div class="scrollbox" style="white-space: normal;">
-          {device_rows_html_block}
+        <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+        <div class="scrollbox known-arduino-box">{device_rows_html_block}</div>
+        <div class="controls" style="margin-top:0.5rem;">
+          <button type="submit" class="needs-device">Load Maintenance Info</button>
         </div>
-        <div style="margin-top:0.5rem;">
-          <button type="submit">Load Maintenance Info</button>
+      </form>
+      <form method="post" action="/maintenance-burrow">
+        <div class="controls" style="margin-top:0.5rem;">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+          <label for="burrow_id_input">Burrow_ID:</label>
+          <input id="burrow_id_input" name="burrow_id" type="text" maxlength="32" value="{html.escape(selected_burrow)}" class="needs-device" style="padding:0.45rem; border:1px solid #9cb2c9; border-radius:4px; width:10rem;" />
+          <button type="submit" name="mode" value="edit" class="needs-device">Edit Burrow_ID</button>
+          <button type="submit" name="mode" value="save" class="needs-device">Save Burrow_ID</button>
         </div>
       </form>
 
       <div class="controls" style="margin-top:0.8rem;">
         <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <input type="hidden" name="action" value="set-time" />
-          <button type="submit">Set RTC Time</button>
+          <button type="submit" class="needs-device">Set RTC Time</button>
         </form>
         <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <input type="hidden" name="action" value="ping" />
-          <button type="submit">Ping</button>
+          <button type="submit" class="needs-device">Ping</button>
         </form>
         <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" />
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <input type="hidden" name="action" value="reboot" />
-          <button type="submit">Reboot</button>
+          <button type="submit" class="needs-device">Reboot</button>
         </form>
       </div>
 
@@ -1414,6 +1961,31 @@ def render_maintenance_page(message: str = "", selected_uid: str = "") -> bytes:
       </div>
     </div>
   </div>
+<script>
+  (function() {{
+    const rows = Array.from(document.querySelectorAll(".device-row"));
+    const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
+    const needsDeviceControls = Array.from(document.querySelectorAll(".needs-device"));
+    function updateNeedsDeviceState() {{
+      const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
+      needsDeviceControls.forEach((el) => {{
+        el.disabled = !hasUid;
+      }});
+    }}
+    function setSelectedUid(uid) {{
+      uidFields.forEach((f) => {{ f.value = uid; }});
+      rows.forEach((r) => {{
+        if (r.dataset.uid === uid) r.classList.add("selected");
+        else r.classList.remove("selected");
+      }});
+      updateNeedsDeviceState();
+    }}
+    rows.forEach((r) => {{
+      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || ""));
+    }});
+    updateNeedsDeviceState();
+  }})();
+</script>
 </body>
 </html>
 """
@@ -1437,6 +2009,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_json(self, payload: dict, code: int = HTTPStatus.OK) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         route = parsed.path
@@ -1450,6 +2031,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/activity":
             self._send_text(read_activity_status())
+            return
+        if route == "/upload-progress":
+            op = (query.get("op") or [""])[0].strip()
+            self._send_json(get_upload_progress(op))
             return
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
@@ -1492,6 +2077,108 @@ class Handler(BaseHTTPRequestHandler):
             append_action_log("stop-for-file-transfers", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
             return
+        if self.path == "/file-transfers-delete-uploaded":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            saved_path = (form.get("saved_path") or [""])[0].strip()
+            source_filename = (form.get("source_filename") or [""])[0].strip()
+            ok, detail = delete_local_uploaded_file(saved_path)
+            if ok:
+                msg = f"Deleted uploaded file '{source_filename}'. {detail}"
+            else:
+                msg = f"Delete failed for '{source_filename}': {detail}"
+            append_action_log("file-transfers-delete-uploaded", msg)
+            self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+            return
+        if self.path == "/file-transfers-delete-sd":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            remote_filename = (form.get("remote_filename") or [""])[0].strip()
+            devices = read_devices_rows(Path("data/discovered_devices.csv"))
+            selected_device = _find_device_by_uid(devices, selected_uid)
+            if selected_device is None:
+                self._send_html(render_file_transfers_page(message="Select a known Arduino first.", selected_uid=selected_uid))
+                return
+            device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
+            if not device_ip:
+                self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
+                return
+            if not remote_filename:
+                self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
+                return
+            try:
+                if is_transfer_active(Path(DEFAULT_DB_PATH), selected_uid):
+                    msg = "Delete on SD blocked: transfer is active for this Arduino."
+                    append_action_log("file-transfers-delete-sd", msg)
+                    self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                    return
+            except Exception:
+                pass
+            ok, detail = delete_remote_file(device_ip=device_ip, remote_filename=remote_filename, timeout_s=8.0)
+            if ok:
+                msg = detail
+            else:
+                msg = f"Delete on SD failed for '{remote_filename}': {detail}"
+            append_action_log("file-transfers-delete-sd", msg)
+            self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+            return
+        if self.path == "/file-transfers-upload-selected":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            remote_filename = (form.get("remote_filename") or [""])[0].strip()
+            upload_op_id = (form.get("upload_op_id") or [""])[0].strip()
+            devices = read_devices_rows(Path("data/discovered_devices.csv"))
+            selected_device = _find_device_by_uid(devices, selected_uid)
+            if selected_device is None:
+                self._send_html(render_file_transfers_page(message="Select a known Arduino first.", selected_uid=selected_uid))
+                return
+            device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
+            short_uid = (selected_device.get("short_uid", "") or "").strip()
+            network_uid = (selected_device.get("network_uid", "") or "").strip()
+            burrow_id = (selected_device.get("burrow_id", "") or "").strip()
+            ap_id = (selected_device.get("ap_id", "") or "").strip()
+            if not device_ip:
+                self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
+                return
+            if not remote_filename:
+                self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
+                return
+            running, _pid = MANAGER.status()
+            if running:
+                msg = "Stop Normal Ops before uploading a selected SD file (port/bind conflict)."
+                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                return
+            set_upload_progress(upload_op_id, 0, "upload starting", done=False, error=False)
+
+            def _on_progress(pct: int, written: int, total: int, name: str) -> None:
+                set_upload_progress(
+                    upload_op_id,
+                    pct,
+                    f"uploading {name} ({written}/{total})",
+                    done=False,
+                    error=False,
+                )
+
+            ok, detail, result = upload_selected_remote_file(
+                unique_id=selected_uid,
+                short_uid=short_uid,
+                network_uid=network_uid,
+                burrow_id=burrow_id,
+                ap_id=ap_id,
+                device_ip=device_ip,
+                remote_filename=remote_filename,
+                progress_callback=_on_progress,
+            )
+            if ok:
+                set_upload_progress(upload_op_id, 100, "upload complete", done=True, error=False)
+            else:
+                set_upload_progress(upload_op_id, 0, detail, done=True, error=True)
+            run_id = f"WEB_MANUAL_{int(time.time() * 1000)}"
+            try:
+                log_transfer_event(Path(DEFAULT_DB_PATH), run_id, result)
+            except Exception as exc:  # noqa: BLE001
+                append_action_log("file-transfers-upload-selected-db-log-error", f"Failed to write transfer event: {exc}")
+            msg = detail
+            append_action_log("file-transfers-upload-selected", msg)
+            self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+            return
         if self.path == "/maintenance-action":
             selected_uid = (form.get("uid") or [""])[0].strip()
             action = (form.get("action") or [""])[0].strip()
@@ -1520,6 +2207,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return
             self._send_html(render_maintenance_page(message=f"Unknown maintenance action: {action}", selected_uid=selected_uid))
+            return
+        if self.path == "/maintenance-burrow":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            burrow_id = (form.get("burrow_id") or [""])[0].strip()
+            mode = (form.get("mode") or ["save"])[0].strip().lower()
+            if not selected_uid:
+                self._send_html(render_maintenance_page(message="Select a known Arduino first.", selected_uid=selected_uid))
+                return
+            if mode == "edit":
+                current = _current_burrow_for_uid(selected_uid)
+                msg = f"Loaded current Burrow_ID for {selected_uid}."
+                append_action_log("maintenance-edit-burrow", msg)
+                self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid, burrow_input=current))
+                return
+            msg = assign_burrow_id_for_uid(unique_id=selected_uid, burrow_id=burrow_id)
+            append_action_log("maintenance-save-burrow", msg)
+            self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid, burrow_input=burrow_id))
             return
         if self.path == "/assign-burrow-id":
             short_uid = (form.get("short_uid") or [""])[0].strip().upper()

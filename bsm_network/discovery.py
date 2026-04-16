@@ -20,6 +20,7 @@ from .db import (
     log_discovery_event,
     log_slot_event,
     log_transfer_event,
+    read_devices_snapshot,
     set_transfer_active,
     self_test_db_writes,
     upsert_device,
@@ -686,6 +687,19 @@ def run_discovery(args: argparse.Namespace) -> int:
         return 1
 
     rows = [discovered[uid] for uid in sorted(discovered)]
+
+    # Preserve existing burrow assignments from DB unless an explicit mapping provides a value.
+    existing_burrow_by_uid: dict[str, str] = {}
+    if db_enabled:
+        try:
+            for d in read_devices_snapshot(db_path):
+                uid = str(d.get("unique_id", "")).strip()
+                if not uid:
+                    continue
+                existing_burrow_by_uid[uid] = str(d.get("burrow_id", "")).strip()
+        except Exception as exc:
+            print(f"Warning: DB read failed while loading existing burrow_id values: {exc}")
+
     for row in rows:
         device_ip = str(row["device_ip"] or row["recv_ip"])
         net = request_network_uid(
@@ -708,6 +722,8 @@ def run_discovery(args: argparse.Namespace) -> int:
         uid = str(row.get("unique_id", ""))
         ap_id, source = _resolve_ap_for_device(row, device_to_ap, default_ap)
         burrow_id = _resolve_burrow_for_device(row, device_to_burrow)
+        if not burrow_id:
+            burrow_id = existing_burrow_by_uid.get(uid, "")
         short_uid = _short_uid_from_unique_id(uid, 6)
 
         row["ap_id"] = ap_id
