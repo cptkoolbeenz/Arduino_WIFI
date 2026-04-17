@@ -77,6 +77,8 @@ UI_POLL_ACTIVITY_MS = 5000
 UI_POLL_PYTHON_LOG_MS = 5000
 UI_POLL_UPLOAD_PROGRESS_MS = 500
 ENDPOINT_CACHE_TTL_S = 1.5
+CMD_RETRY_ATTEMPTS = 3
+CMD_RETRY_BACKOFF_S = 0.25
 WEB_POLL_NOW_DISCOVER_TIMEOUT_S = "8"
 WEB_POLL_NOW_DISCOVER_ATTEMPTS = "4"
 WEB_POLL_NOW_DISCOVER_INTERVAL_S = "0.25"
@@ -84,6 +86,38 @@ WEB_POLL_NOW_DOWNLOAD_LINES = "0"
 WEB_POLL_NOW_DOWNLOAD_TIMEOUT_S = "0"
 ENDPOINT_CACHE_LOCK = threading.Lock()
 ENDPOINT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def new_correlation_id(prefix: str = "CMD") -> str:
+    return f"{prefix}{int(time.time() * 1000)}{(time.time_ns() & 0xFFF):03X}"
+
+
+def categorize_command_error(detail: str) -> str:
+    txt = (detail or "").strip().lower()
+    if not txt:
+        return "unknown"
+    if "active_file" in txt or "busy" in txt:
+        return "busy"
+    if "timeout" in txt:
+        return "timeout"
+    if "unsupported" in txt or "not supported" in txt:
+        return "unsupported"
+    if "missing" in txt or "no ip" in txt or "invalid" in txt:
+        return "invalid_input"
+    if "unexpected source" in txt:
+        return "unexpected_source"
+    if "error" in txt:
+        return "device_error"
+    return "unknown"
+
+
+def is_success_message(msg: str) -> bool:
+    return " OK " in f" {msg} "
+
+
+def should_retry_message(msg: str) -> bool:
+    category = categorize_command_error(msg)
+    return category in {"timeout", "unexpected_source"}
 
 
 def get_last_set_time_state() -> tuple[float, str]:
@@ -791,6 +825,24 @@ def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
         sock.close()
 
 
+def run_maintenance_action_with_retry(action: str, fn, timeout_s: float) -> str:
+    cid = new_correlation_id("MNT")
+    last_msg = ""
+    for attempt in range(1, CMD_RETRY_ATTEMPTS + 1):
+        last_msg = str(fn())
+        if is_success_message(last_msg):
+            return f"{last_msg} [cid={cid} category=ok attempts={attempt}]"
+        if attempt < CMD_RETRY_ATTEMPTS and should_retry_message(last_msg):
+            time.sleep(CMD_RETRY_BACKOFF_S * attempt)
+            continue
+        break
+    category = categorize_command_error(last_msg)
+    return (
+        f"{action} failed after retries: {last_msg} "
+        f"[cid={cid} category={category} attempts={CMD_RETRY_ATTEMPTS} timeout_s={timeout_s:.1f}]"
+    )
+
+
 def read_today_uploads_status(db_path: Path) -> str:
     if not db_path.exists():
         return "(No upload DB yet)"
@@ -849,91 +901,117 @@ def read_today_uploads_status(db_path: Path) -> str:
 
 
 def _request_remote_file_list_with_sizes(device_ip: str, timeout_s: float = 8.0) -> tuple[list[tuple[str, int]], str]:
-    transfer_id = f"LWEB{int(time.time() * 1000)}"
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.4)
-    try:
-        msg = f"LIST_FILES,{transfer_id}".encode("utf-8")
-        sock.sendto(msg, (device_ip, DISCOVER_CONTROL_PORT))
+    cid = new_correlation_id("LST")
+    last_err = ""
+    ip = (device_ip or "").strip()
+    if not ip:
+        return [], f"LIST_FILES failed: missing device IP [cid={cid} category=invalid_input]"
 
-        items: list[tuple[str, int]] = []
-        seen: set[str] = set()
-        got_end = False
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                data, (src_ip, _src_port) = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            if src_ip != device_ip:
-                continue
-            line = data.decode("utf-8", errors="replace").strip()
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2 or parts[1] != transfer_id:
-                continue
-            msg_type = parts[0]
-            if msg_type == "ERROR":
-                return [], f"Arduino error: {line}"
-            if msg_type == "FILE_ITEM" and len(parts) >= 4:
-                name = parts[2]
+    for attempt in range(1, CMD_RETRY_ATTEMPTS + 1):
+        transfer_id = f"LWEB{int(time.time() * 1000)}{attempt}"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.4)
+        try:
+            msg = f"LIST_FILES,{transfer_id}".encode("utf-8")
+            sock.sendto(msg, (ip, DISCOVER_CONTROL_PORT))
+
+            items: list[tuple[str, int]] = []
+            seen: set[str] = set()
+            got_end = False
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
                 try:
-                    size = int(parts[3])
-                except ValueError:
-                    size = 0
-                if name and name not in seen:
-                    seen.add(name)
-                    items.append((name, size))
-                continue
-            if msg_type == "FILE_LIST_END":
-                got_end = True
-                break
-        if not got_end:
-            return [], f"LIST_FILES timeout for {device_ip}"
-        return items, ""
-    except Exception as exc:  # noqa: BLE001
-        return [], str(exc)
-    finally:
-        sock.close()
+                    data, (src_ip, _src_port) = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                if src_ip != ip:
+                    continue
+                line = data.decode("utf-8", errors="replace").strip()
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2 or parts[1] != transfer_id:
+                    continue
+                msg_type = parts[0]
+                if msg_type == "ERROR":
+                    last_err = f"LIST_FILES Arduino error: {line}"
+                    break
+                if msg_type == "FILE_ITEM" and len(parts) >= 4:
+                    name = parts[2]
+                    try:
+                        size = int(parts[3])
+                    except ValueError:
+                        size = 0
+                    if name and name not in seen:
+                        seen.add(name)
+                        items.append((name, size))
+                    continue
+                if msg_type == "FILE_LIST_END":
+                    got_end = True
+                    break
+            if got_end:
+                return items, ""
+            if not last_err:
+                last_err = f"LIST_FILES timeout for {ip}"
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"LIST_FILES exception: {exc}"
+        finally:
+            sock.close()
+
+        if attempt < CMD_RETRY_ATTEMPTS and should_retry_message(last_err):
+            time.sleep(CMD_RETRY_BACKOFF_S * attempt)
+
+    category = categorize_command_error(last_err)
+    return [], f"{last_err} [cid={cid} category={category} attempts={CMD_RETRY_ATTEMPTS}]"
 
 
 def delete_remote_file(device_ip: str, remote_filename: str, timeout_s: float = 8.0) -> tuple[bool, str]:
     ip = (device_ip or "").strip()
     name = (remote_filename or "").strip()
+    cid = new_correlation_id("DEL")
     if not ip or not name:
-        return False, "Missing device IP or filename."
+        return False, f"Missing device IP or filename. [cid={cid} category=invalid_input]"
     if "," in name:
-        return False, "Filename contains unsupported comma."
+        return False, f"Filename contains unsupported comma. [cid={cid} category=invalid_input]"
 
-    transfer_id = f"DWEB{int(time.time() * 1000)}"
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.4)
-    try:
-        msg = f"DELETE_FILE,{transfer_id},{name}".encode("utf-8")
-        sock.sendto(msg, (ip, DISCOVER_CONTROL_PORT))
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                data, (src_ip, _src_port) = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            if src_ip != ip:
-                continue
-            line = data.decode("utf-8", errors="replace").strip()
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2 or parts[1] != transfer_id:
-                continue
-            if parts[0] == "ACK_DELETE":
-                return True, f"Deleted SD file '{name}' on {ip}."
-            if parts[0] == "ERROR":
-                return False, f"Arduino error: {line}"
-        return False, (
-            f"DELETE_FILE timeout for {ip} "
-            "(device may not be running firmware with DELETE_FILE support yet)"
-        )
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    finally:
-        sock.close()
+    last_err = ""
+    for attempt in range(1, CMD_RETRY_ATTEMPTS + 1):
+        transfer_id = f"DWEB{int(time.time() * 1000)}{attempt}"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.4)
+        try:
+            msg = f"DELETE_FILE,{transfer_id},{name}".encode("utf-8")
+            sock.sendto(msg, (ip, DISCOVER_CONTROL_PORT))
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    data, (src_ip, _src_port) = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                if src_ip != ip:
+                    continue
+                line = data.decode("utf-8", errors="replace").strip()
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2 or parts[1] != transfer_id:
+                    continue
+                if parts[0] == "ACK_DELETE":
+                    return True, f"Deleted SD file '{name}' on {ip}. [cid={cid} category=ok attempts={attempt}]"
+                if parts[0] == "ERROR":
+                    last_err = f"DELETE_FILE Arduino error: {line}"
+                    break
+            if not last_err:
+                last_err = (
+                    f"DELETE_FILE timeout for {ip} "
+                    "(device may not be running firmware with DELETE_FILE support yet)"
+                )
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"DELETE_FILE exception: {exc}"
+        finally:
+            sock.close()
+
+        if attempt < CMD_RETRY_ATTEMPTS and should_retry_message(last_err):
+            time.sleep(CMD_RETRY_BACKOFF_S * attempt)
+
+    category = categorize_command_error(last_err)
+    return False, f"{last_err} [cid={cid} category={category} attempts={CMD_RETRY_ATTEMPTS}]"
 
 
 def _read_uploaded_files_for_device(short_uid: str) -> tuple[list[tuple[str, str, str, float]], str]:
@@ -2352,6 +2430,11 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
       <div class="controls" style="margin-top:0.8rem;">
         <form method="post" action="/maintenance-action">
           <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+          <input type="hidden" name="action" value="get-time" />
+          <button type="submit" class="needs-device">Get RTC Time</button>
+        </form>
+        <form method="post" action="/maintenance-action">
+          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
           <input type="hidden" name="action" value="set-time" />
           <button type="submit" class="needs-device">Set RTC Time</button>
         </form>
@@ -2699,6 +2782,12 @@ class Handler(BaseHTTPRequestHandler):
                 set_upload_progress(upload_op_id, 100, "upload complete", done=True, error=False)
             else:
                 set_upload_progress(upload_op_id, 0, detail, done=True, error=True)
+            upload_cid = new_correlation_id("UPL")
+            upload_category = "ok" if ok else categorize_command_error(detail)
+            detail = f"{detail} [cid={upload_cid} category={upload_category}]"
+            result["message"] = detail
+            if not ok:
+                result["error_text"] = f"{result.get('error_text', '')} [cid={upload_cid} category={upload_category}]".strip()
             run_id = f"WEB_MANUAL_{int(time.time() * 1000)}"
             try:
                 log_transfer_event(Path(DEFAULT_DB_PATH), run_id, result)
@@ -2720,18 +2809,39 @@ class Handler(BaseHTTPRequestHandler):
             if not device_ip:
                 self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
                 return
+            if action == "get-time":
+                msg = run_maintenance_action_with_retry(
+                    action="GET_TIME",
+                    fn=lambda: query_device_time(device_ip=device_ip),
+                    timeout_s=2.0,
+                )
+                append_action_log("maintenance-get-time", msg)
+                self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
+                return
             if action == "set-time":
-                msg = set_device_time(device_ip=device_ip, offset_hours=WEB_SET_TIME_OFFSET_HOURS)
+                msg = run_maintenance_action_with_retry(
+                    action="SET_TIME",
+                    fn=lambda: set_device_time(device_ip=device_ip, offset_hours=WEB_SET_TIME_OFFSET_HOURS),
+                    timeout_s=2.0,
+                )
                 append_action_log("maintenance-set-time", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return
             if action == "ping":
-                msg = ping_device(device_ip=device_ip)
+                msg = run_maintenance_action_with_retry(
+                    action="PING",
+                    fn=lambda: ping_device(device_ip=device_ip),
+                    timeout_s=2.0,
+                )
                 append_action_log("maintenance-ping", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return
             if action == "reboot":
-                msg = reboot_device(device_ip=device_ip)
+                msg = run_maintenance_action_with_retry(
+                    action="REBOOT",
+                    fn=lambda: reboot_device(device_ip=device_ip),
+                    timeout_s=3.0,
+                )
                 append_action_log("maintenance-reboot", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return
