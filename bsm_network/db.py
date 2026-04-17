@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 from pathlib import Path
 
@@ -132,6 +133,19 @@ def init_db(db_path: Path) -> None:
               source_filename TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_active_transfers_started_at ON active_transfers(started_at);
+
+            CREATE TABLE IF NOT EXISTS web_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_ts TEXT NOT NULL,
+              action TEXT NOT NULL,
+              severity TEXT NOT NULL,
+              message TEXT,
+              correlation_id TEXT,
+              meta_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_events_ts ON web_events(event_ts);
+            CREATE INDEX IF NOT EXISTS idx_web_events_action_ts ON web_events(action, event_ts);
+            CREATE INDEX IF NOT EXISTS idx_web_events_severity_ts ON web_events(severity, event_ts);
 
             CREATE TABLE IF NOT EXISTS schema_meta (
               key TEXT PRIMARY KEY,
@@ -560,3 +574,35 @@ def get_db_schema_info(db_path: Path) -> dict[str, str]:
     except Exception as exc:  # noqa: BLE001
         info["error"] = str(exc)
     return info
+
+
+def log_web_event(
+    db_path: Path,
+    action: str,
+    message: str,
+    severity: str = "info",
+    correlation_id: str = "",
+    meta: dict | None = None,
+) -> None:
+    payload = ""
+    if meta:
+        try:
+            payload = json.dumps(meta, ensure_ascii=True, separators=(",", ":"))
+        except Exception:
+            payload = ""
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO web_events (
+              event_ts, action, severity, message, correlation_id, meta_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _now_iso(),
+                str(action or "").strip(),
+                str(severity or "info").strip().lower() or "info",
+                str(message or ""),
+                str(correlation_id or "").strip(),
+                payload,
+            ),
+        )

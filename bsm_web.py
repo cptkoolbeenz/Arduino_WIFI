@@ -39,8 +39,10 @@ from bsm_network.db import (
     init_db,
     is_transfer_active,
     list_active_transfers,
+    log_web_event,
     log_transfer_event,
     read_devices_snapshot,
+    self_test_db_writes,
     set_burrow_id_by_short_uid,
     set_burrow_id_by_unique_id,
 )
@@ -78,6 +80,7 @@ UI_POLL_DEVICES_MS = 5000
 UI_POLL_ACTIVITY_MS = 5000
 UI_POLL_PYTHON_LOG_MS = 5000
 UI_POLL_UPLOAD_PROGRESS_MS = 500
+UI_POLL_HEALTH_MS = 5000
 ENDPOINT_CACHE_TTL_S = 1.5
 CMD_RETRY_ATTEMPTS = 3
 CMD_RETRY_BACKOFF_S = 0.25
@@ -443,6 +446,15 @@ def append_action_log(action: str, message: str) -> None:
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     with ACTION_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {action}: {message}\n")
+    try:
+        log_web_event(
+            db_path=Path(DEFAULT_DB_PATH).expanduser(),
+            action=action,
+            message=message,
+            severity="error" if "failed" in message.lower() or "error" in message.lower() else "info",
+        )
+    except Exception:
+        pass
     invalidate_endpoint_cache(["activity", "python-log"])
 
 
@@ -462,6 +474,124 @@ def read_activity_status() -> str:
 def read_python_log_status() -> str:
     txt = read_log_tail(ACTION_LOG_PATH, max_bytes=120_000)
     return txt.strip() or "(No python web actions logged yet)"
+
+
+def _latest_discovery_timestamp(db_path: Path) -> str:
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT COALESCE(MAX(event_ts), '')
+                FROM discovery_events
+                WHERE status = 'discovered'
+                """
+            )
+            row = cur.fetchone()
+            return str((row[0] if row else "") or "")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return ""
+
+
+def get_health_payload() -> dict[str, object]:
+    db_path = Path(DEFAULT_DB_PATH).expanduser()
+    running, pid = MANAGER.status()
+    payload: dict[str, object] = {
+        "ok": True,
+        "web_alive": True,
+        "normal_ops_running": bool(running),
+        "normal_ops_pid": int(pid) if pid is not None else None,
+        "db_path": str(db_path),
+        "db_exists": bool(db_path.exists()),
+        "db_writable": False,
+        "active_transfer_count": 0,
+        "last_discovery_ts": "",
+        "last_discovery_age_s": None,
+        "device_ip_recv_ip_mismatch_count": 0,
+        "status": "ok",
+    }
+
+    try:
+        ok, _err = self_test_db_writes(db_path)
+        payload["db_writable"] = bool(ok)
+    except Exception:
+        payload["db_writable"] = False
+
+    try:
+        payload["active_transfer_count"] = len(list_active_transfers(db_path))
+    except Exception:
+        payload["active_transfer_count"] = 0
+
+    last_ts = _latest_discovery_timestamp(db_path)
+    payload["last_discovery_ts"] = last_ts
+    if last_ts:
+        dt_val = _iso_to_dt(last_ts)
+        if dt_val is not None:
+            payload["last_discovery_age_s"] = max(0.0, (dt.datetime.now() - dt_val).total_seconds())
+
+    mismatch_count = 0
+    try:
+        for row in read_devices_rows(Path("data/discovered_devices.csv")):
+            dev_ip = (row.get("device_ip", "") or "").strip()
+            recv_ip = (row.get("recv_ip", "") or "").strip()
+            if dev_ip and recv_ip and dev_ip != recv_ip:
+                mismatch_count += 1
+    except Exception:
+        mismatch_count = 0
+    payload["device_ip_recv_ip_mismatch_count"] = mismatch_count
+
+    if not payload["db_writable"]:
+        payload["ok"] = False
+        payload["status"] = "degraded"
+    elif mismatch_count > 0:
+        payload["status"] = "warning"
+    else:
+        payload["status"] = "ok"
+    return payload
+
+
+def format_health_status_text(payload: dict[str, object]) -> str:
+    status = str(payload.get("status", "unknown")).upper()
+    running = "YES" if bool(payload.get("normal_ops_running", False)) else "NO"
+    pid = payload.get("normal_ops_pid")
+    pid_text = str(pid) if pid is not None else "-"
+    db_exists = "YES" if bool(payload.get("db_exists", False)) else "NO"
+    db_writable = "YES" if bool(payload.get("db_writable", False)) else "NO"
+    active = int(payload.get("active_transfer_count", 0) or 0)
+    mismatch = int(payload.get("device_ip_recv_ip_mismatch_count", 0) or 0)
+    last_ts = str(payload.get("last_discovery_ts", "") or "")
+    age = payload.get("last_discovery_age_s")
+    age_min_text = f"{(float(age) / 60.0):.1f}" if isinstance(age, (int, float)) else ""
+    col_defs = [
+        ("status", 8),
+        ("normal_ops", 10),
+        ("pid", 7),
+        ("db_exists", 9),
+        ("db_writable", 11),
+        ("active_xfers", 12),
+        ("ip_mismatch", 11),
+        ("last_discovery", 19),
+        ("age_min", 7),
+    ]
+    data_vals = [
+        status,
+        running,
+        pid_text,
+        db_exists,
+        db_writable,
+        str(active),
+        str(mismatch),
+        (last_ts or "-"),
+        (age_min_text or "-"),
+    ]
+    header_line = " ".join(f"{name:<{width}}" for name, width in col_defs)
+    sep_line = " ".join("-" * width for _name, width in col_defs)
+    data_line = " ".join(f"{val:<{col_defs[idx][1]}}" for idx, val in enumerate(data_vals))
+    return f"{header_line}\n{sep_line}\n{data_line}"
 
 
 def _iso_to_dt(value: str) -> dt.datetime | None:
@@ -1421,6 +1551,16 @@ def render_page(message: str = "") -> bytes:
       color: #304a64;
       font-weight: 700;
     }}
+    .warn-banner {{
+      margin: 0.65rem 0 0.5rem 0;
+      padding: 0.55rem 0.7rem;
+      border: 1px solid #d97706;
+      border-radius: 6px;
+      background: #fff7ed;
+      color: #7c2d12;
+      font-size: 0.88rem;
+      display: none;
+    }}
     .scrollbox {{
       border: 1px solid var(--line);
       background: #fbfdff;
@@ -1435,6 +1575,9 @@ def render_page(message: str = "") -> bytes:
     }}
     .known-arduino-box {{
       height: 320px;
+    }}
+    #healthbox {{
+      height: 5.2em;
     }}
     .nav-buttons {{
       margin-top: 0.9rem;
@@ -1467,6 +1610,7 @@ def render_page(message: str = "") -> bytes:
     </div>
 
     <div class="section-title">Known Arduinos</div>
+    <div id="mismatch-banner" class="warn-banner"></div>
     <div id="devicebox" class="scrollbox known-arduino-box">Loading Arduino status...</div>
 
     <div class="section-title">Uploads Today</div>
@@ -1482,17 +1626,35 @@ def render_page(message: str = "") -> bytes:
       <button type="button" class="placeholder-btn">Other</button>
     </div>
 
+    <div class="section-title">Health</div>
+    <div id="healthbox" class="scrollbox">Loading health status...</div>
+
     <div class="section-title">Activity Log</div>
     <div id="activitybox" class="scrollbox">Loading activity output...</div>
   </div>
   </div>
   <script>
     const devicebox = document.getElementById("devicebox");
+    const healthbox = document.getElementById("healthbox");
     const uploadsbox = document.getElementById("uploadsbox");
     const activitybox = document.getElementById("activitybox");
+    const mismatchBanner = document.getElementById("mismatch-banner");
     let uploadsTimer = null;
     let devicesTimer = null;
     let activityTimer = null;
+    let healthTimer = null;
+    async function refreshHealth() {{
+      try {{
+        const resp = await fetch("/health-status", {{ cache: "no-store" }});
+        if (!resp.ok) {{
+          return;
+        }}
+        const txt = await resp.text();
+        healthbox.textContent = txt || "(No health status yet)";
+      }} catch (_err) {{
+        // Keep last displayed text on transient fetch errors.
+      }}
+    }}
     async function refreshUploads() {{
       try {{
         const resp = await fetch("/uploads-today", {{ cache: "no-store" }});
@@ -1514,6 +1676,14 @@ def render_page(message: str = "") -> bytes:
         }}
         const txt = await resp.text();
         devicebox.textContent = txt || "(No device status yet)";
+        const firstLine = (txt || "").split("\\n")[0] || "";
+        if (firstLine.startsWith("WARNING: device_ip != recv_ip")) {{
+          mismatchBanner.textContent = firstLine;
+          mismatchBanner.style.display = "block";
+        }} else {{
+          mismatchBanner.textContent = "";
+          mismatchBanner.style.display = "none";
+        }}
       }} catch (_err) {{
         // Keep last displayed text on transient fetch errors.
       }}
@@ -1539,17 +1709,19 @@ def render_page(message: str = "") -> bytes:
       if (uploadsTimer) {{ clearInterval(uploadsTimer); uploadsTimer = null; }}
       if (devicesTimer) {{ clearInterval(devicesTimer); devicesTimer = null; }}
       if (activityTimer) {{ clearInterval(activityTimer); activityTimer = null; }}
+      if (healthTimer) {{ clearInterval(healthTimer); healthTimer = null; }}
     }}
     function startPolling() {{
-      if (uploadsTimer || devicesTimer || activityTimer) {{
+      if (uploadsTimer || devicesTimer || activityTimer || healthTimer) {{
         return;
       }}
       uploadsTimer = setInterval(refreshUploads, {UI_POLL_UPLOADS_MS});
       devicesTimer = setInterval(refreshDevices, {UI_POLL_DEVICES_MS});
       activityTimer = setInterval(refreshActivity, {UI_POLL_ACTIVITY_MS});
+      healthTimer = setInterval(refreshHealth, {UI_POLL_HEALTH_MS});
     }}
     async function refreshAllNow() {{
-      await Promise.allSettled([refreshUploads(), refreshDevices(), refreshActivity()]);
+      await Promise.allSettled([refreshHealth(), refreshUploads(), refreshDevices(), refreshActivity()]);
     }}
     document.addEventListener("visibilitychange", () => {{
       if (document.hidden) {{
@@ -2589,10 +2761,39 @@ class Handler(BaseHTTPRequestHandler):
         self._safe_write(raw)
 
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._do_GET_impl()
+        except Exception as exc:  # noqa: BLE001
+            cid = new_correlation_id("WEBGET")
+            msg = f"GET {self.path} failed: {exc} [cid={cid}]"
+            append_action_log("web-get-error", msg)
+            parsed = urlparse(self.path)
+            route = parsed.path
+            if route.startswith("/api/") or route in {"/upload-progress", "/health"}:
+                self._send_json({"ok": False, "error": str(exc), "cid": cid}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_POST_impl()
+        except Exception as exc:  # noqa: BLE001
+            cid = new_correlation_id("WEBPOST")
+            msg = f"POST {self.path} failed: {exc} [cid={cid}]"
+            append_action_log("web-post-error", msg)
+            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _do_GET_impl(self) -> None:
         parsed = urlparse(self.path)
         route = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=True)
 
+        if route == "/health":
+            self._send_json(get_health_payload())
+            return
+        if route == "/health-status":
+            self._send_text(get_cached_text("health-status", ENDPOINT_CACHE_TTL_S, lambda: format_health_status_text(get_health_payload())))
+            return
         if route == "/devices":
             self._send_text(
                 get_cached_text(
@@ -2665,7 +2866,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_html(render_page())
 
-    def do_POST(self) -> None:  # noqa: N802
+    def _do_POST_impl(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
         form = parse_qs(body, keep_blank_values=True)
