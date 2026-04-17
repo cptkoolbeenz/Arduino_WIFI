@@ -71,16 +71,19 @@ LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_WIFI"
 WEB_APP_VERSION = "2.0"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
-UI_POLL_UPLOADS_MS = 3000
-UI_POLL_DEVICES_MS = 3000
-UI_POLL_ACTIVITY_MS = 2000
-UI_POLL_PYTHON_LOG_MS = 2000
+UI_POLL_UPLOADS_MS = 5000
+UI_POLL_DEVICES_MS = 5000
+UI_POLL_ACTIVITY_MS = 5000
+UI_POLL_PYTHON_LOG_MS = 5000
 UI_POLL_UPLOAD_PROGRESS_MS = 500
+ENDPOINT_CACHE_TTL_S = 1.5
 WEB_POLL_NOW_DISCOVER_TIMEOUT_S = "8"
 WEB_POLL_NOW_DISCOVER_ATTEMPTS = "4"
 WEB_POLL_NOW_DISCOVER_INTERVAL_S = "0.25"
 WEB_POLL_NOW_DOWNLOAD_LINES = "0"
 WEB_POLL_NOW_DOWNLOAD_TIMEOUT_S = "0"
+ENDPOINT_CACHE_LOCK = threading.Lock()
+ENDPOINT_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def get_last_set_time_state() -> tuple[float, str]:
@@ -375,11 +378,36 @@ def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def invalidate_endpoint_cache(keys: list[str] | None = None) -> None:
+    with ENDPOINT_CACHE_LOCK:
+        if keys is None:
+            ENDPOINT_CACHE.clear()
+            return
+        for key in keys:
+            ENDPOINT_CACHE.pop(str(key), None)
+
+
+def get_cached_text(key: str, ttl_s: float, producer) -> str:
+    now = time.monotonic()
+    cache_key = str(key)
+    with ENDPOINT_CACHE_LOCK:
+        cached = ENDPOINT_CACHE.get(cache_key)
+        if cached is not None:
+            ts, body = cached
+            if (now - ts) <= max(0.0, float(ttl_s)):
+                return body
+    body = str(producer())
+    with ENDPOINT_CACHE_LOCK:
+        ENDPOINT_CACHE[cache_key] = (time.monotonic(), body)
+    return body
+
+
 def append_action_log(action: str, message: str) -> None:
     ACTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     with ACTION_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{stamp}] {action}: {message}\n")
+    invalidate_endpoint_cache(["activity", "python-log"])
 
 
 def read_activity_status() -> str:
@@ -1296,6 +1324,9 @@ def render_page(message: str = "") -> bytes:
     const devicebox = document.getElementById("devicebox");
     const uploadsbox = document.getElementById("uploadsbox");
     const activitybox = document.getElementById("activitybox");
+    let uploadsTimer = null;
+    let devicesTimer = null;
+    let activityTimer = null;
     async function refreshUploads() {{
       try {{
         const resp = await fetch("/uploads-today", {{ cache: "no-store" }});
@@ -1308,8 +1339,6 @@ def render_page(message: str = "") -> bytes:
         // Keep last displayed text on transient fetch errors.
       }}
     }}
-    refreshUploads();
-    setInterval(refreshUploads, {UI_POLL_UPLOADS_MS});
 
     async function refreshDevices() {{
       try {{
@@ -1323,8 +1352,6 @@ def render_page(message: str = "") -> bytes:
         // Keep last displayed text on transient fetch errors.
       }}
     }}
-    refreshDevices();
-    setInterval(refreshDevices, {UI_POLL_DEVICES_MS});
 
     async function refreshActivity() {{
       try {{
@@ -1342,8 +1369,34 @@ def render_page(message: str = "") -> bytes:
         // Keep last displayed text on transient fetch errors.
       }}
     }}
-    refreshActivity();
-    setInterval(refreshActivity, {UI_POLL_ACTIVITY_MS});
+    function stopPolling() {{
+      if (uploadsTimer) {{ clearInterval(uploadsTimer); uploadsTimer = null; }}
+      if (devicesTimer) {{ clearInterval(devicesTimer); devicesTimer = null; }}
+      if (activityTimer) {{ clearInterval(activityTimer); activityTimer = null; }}
+    }}
+    function startPolling() {{
+      if (uploadsTimer || devicesTimer || activityTimer) {{
+        return;
+      }}
+      uploadsTimer = setInterval(refreshUploads, {UI_POLL_UPLOADS_MS});
+      devicesTimer = setInterval(refreshDevices, {UI_POLL_DEVICES_MS});
+      activityTimer = setInterval(refreshActivity, {UI_POLL_ACTIVITY_MS});
+    }}
+    async function refreshAllNow() {{
+      await Promise.allSettled([refreshUploads(), refreshDevices(), refreshActivity()]);
+    }}
+    document.addEventListener("visibilitychange", () => {{
+      if (document.hidden) {{
+        stopPolling();
+        return;
+      }}
+      refreshAllNow();
+      startPolling();
+    }});
+    refreshAllNow();
+    if (!document.hidden) {{
+      startPolling();
+    }}
   </script>
 </body>
 </html>
@@ -1626,6 +1679,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const selectedPath = document.getElementById("uploaded-selected-path");
     const selectedName = document.getElementById("uploaded-selected-name");
     const pythonLogBox = document.getElementById("pythonlogbox");
+    let pythonLogTimer = null;
     function updateActionButtons() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
       const hasSd = !!((sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "");
@@ -1829,8 +1883,30 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         // Keep last displayed text.
       }}
     }}
+    function stopPythonLogPolling() {{
+      if (pythonLogTimer) {{
+        clearInterval(pythonLogTimer);
+        pythonLogTimer = null;
+      }}
+    }}
+    function startPythonLogPolling() {{
+      if (pythonLogTimer) {{
+        return;
+      }}
+      pythonLogTimer = setInterval(refreshPythonLog, {UI_POLL_PYTHON_LOG_MS});
+    }}
+    document.addEventListener("visibilitychange", () => {{
+      if (document.hidden) {{
+        stopPythonLogPolling();
+        return;
+      }}
+      refreshPythonLog();
+      startPythonLogPolling();
+    }});
     refreshPythonLog();
-    setInterval(refreshPythonLog, {UI_POLL_PYTHON_LOG_MS});
+    if (!document.hidden) {{
+      startPythonLogPolling();
+    }}
     updateActionButtons();
   }})();
 </script>
@@ -2212,16 +2288,40 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
 
         if route == "/devices":
-            self._send_text(read_devices_status(Path("data/discovered_devices.csv")))
+            self._send_text(
+                get_cached_text(
+                    "devices",
+                    ENDPOINT_CACHE_TTL_S,
+                    lambda: read_devices_status(Path("data/discovered_devices.csv")),
+                )
+            )
             return
         if route == "/uploads-today":
-            self._send_text(read_today_uploads_status(Path(DEFAULT_DB_PATH)))
+            self._send_text(
+                get_cached_text(
+                    "uploads-today",
+                    ENDPOINT_CACHE_TTL_S,
+                    lambda: read_today_uploads_status(Path(DEFAULT_DB_PATH)),
+                )
+            )
             return
         if route == "/activity":
-            self._send_text(read_activity_status())
+            self._send_text(
+                get_cached_text(
+                    "activity",
+                    ENDPOINT_CACHE_TTL_S,
+                    read_activity_status,
+                )
+            )
             return
         if route == "/python-log":
-            self._send_text(read_python_log_status())
+            self._send_text(
+                get_cached_text(
+                    "python-log",
+                    ENDPOINT_CACHE_TTL_S,
+                    read_python_log_status,
+                )
+            )
             return
         if route == "/upload-progress":
             op = (query.get("op") or [""])[0].strip()
@@ -2247,6 +2347,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
         form = parse_qs(body, keep_blank_values=True)
+        invalidate_endpoint_cache()
         if self.path == "/start":
             msg = MANAGER.start()
             append_action_log("start", msg)
