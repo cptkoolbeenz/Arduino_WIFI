@@ -1182,6 +1182,92 @@ def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[t
     return out, ""
 
 
+def _resolve_device_context_for_uid(selected_uid: str) -> tuple[dict[str, str] | None, str, str]:
+    uid = (selected_uid or "").strip()
+    if not uid:
+        return None, "", ""
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    device = _find_device_by_uid(devices, uid)
+    if device is None:
+        return None, "", ""
+    short_uid = (device.get("short_uid", "") or "").strip()
+    if not short_uid:
+        short_uid = uid[-6:] if len(uid) >= 6 else uid
+    device_ip = (device.get("device_ip", "") or device.get("recv_ip", "")).strip()
+    return device, short_uid, device_ip
+
+
+def _history_text_for_device_uid(unique_id: str) -> str:
+    uid = (unique_id or "").strip()
+    if not uid:
+        return "(Select a known Arduino to view complete DB history)"
+    history_rows, history_err = _read_full_history_for_device(Path(DEFAULT_DB_PATH), uid)
+    if history_err:
+        return history_err
+    if not history_rows:
+        return "(No DB history for this Arduino)"
+    lines = []
+    lines.append("event_ts              source      detail")
+    lines.append("-------------------  ----------  -----------------------------------------------")
+    for ts, source, detail in history_rows:
+        lines.append(f"{ts:<19}  {source:<10}  {detail}")
+    return "\n".join(lines)
+
+
+def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, object]:
+    uid = (selected_uid or "").strip()
+    if not uid:
+        return {"ok": False, "message": "missing uid"}
+    _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
+    if not device_ip:
+        return {"ok": False, "message": "Selected Arduino has no IP address."}
+    remote_items, remote_err = _request_remote_file_list_with_sizes(device_ip, timeout_s=8.0)
+    if remote_err:
+        return {"ok": True, "short_uid": short_uid, "html": "", "note": f"(Could not fetch files: {remote_err})"}
+    if not remote_items:
+        return {"ok": True, "short_uid": short_uid, "html": "", "note": "(No files reported by Arduino)"}
+    return {"ok": True, "short_uid": short_uid, "html": _build_remote_rows_html(remote_items), "note": ""}
+
+
+def get_file_transfers_uploaded_files_payload(selected_uid: str) -> dict[str, object]:
+    uid = (selected_uid or "").strip()
+    if not uid:
+        return {"ok": False, "message": "missing uid"}
+    _device, short_uid, _device_ip = _resolve_device_context_for_uid(uid)
+    if not short_uid:
+        return {"ok": False, "message": "No short UID available for selected Arduino."}
+    uploaded_rows, uploaded_err = _read_uploaded_files_for_device(short_uid)
+    if uploaded_err:
+        return {"ok": True, "short_uid": short_uid, "html": "", "note": uploaded_err}
+    if not uploaded_rows:
+        return {"ok": True, "short_uid": short_uid, "html": "", "note": "(No uploaded files logged for this Arduino)"}
+    return {"ok": True, "short_uid": short_uid, "html": _build_uploaded_rows_html(uploaded_rows), "note": ""}
+
+
+def get_file_transfers_history_payload(selected_uid: str) -> dict[str, object]:
+    uid = (selected_uid or "").strip()
+    if not uid:
+        return {"ok": False, "message": "missing uid"}
+    _device, short_uid, _device_ip = _resolve_device_context_for_uid(uid)
+    text = _history_text_for_device_uid(uid)
+    return {"ok": True, "short_uid": short_uid, "text": text}
+
+
+def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
+    uid = (selected_uid or "").strip()
+    if not uid:
+        return {"ok": False, "message": "missing uid"}
+    _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
+    if not device_ip:
+        return {"ok": False, "message": "Selected Arduino has no IP address."}
+    raw_panels = _maintenance_panel_data(device_ip=device_ip)
+    payload_panels: dict[str, str] = {}
+    for key in ["RTC Time", "Status", "Config", "Diagnostics"]:
+        header, sep, values = raw_panels.get(key, ("result", "------", ""))
+        payload_panels[key] = _mini_panel_block(header, sep, values)
+    return {"ok": True, "short_uid": short_uid, "panels": payload_panels}
+
+
 def render_page(message: str = "") -> bytes:
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
@@ -1420,13 +1506,9 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     device_rows_html_block = _build_device_select_rows(devices, selected_uid)
 
     selected_short = ""
-    selected_ip = ""
-    files_on_device_lines = ["(Select a known Arduino to view SD files)"]
-    remote_rows_ui: list[tuple[str, int]] = []
     remote_note = "(Select a known Arduino to view SD files)"
-    uploaded_rows_ui: list[tuple[str, str, str, float]] = []
     uploaded_note = "(Select a known Arduino to view upload history)"
-    history_lines = ["(Select a known Arduino to view complete DB history)"]
+    history_text = "(Select a known Arduino to view complete DB history)"
     active_rows: list[dict[str, str]] = []
     active_error = ""
     try:
@@ -1460,43 +1542,14 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         )
 
     if selected_device is not None:
-        selected_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
         selected_short = (selected_device.get("short_uid", "") or "").strip()
         if not selected_short:
             selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
-
-        remote_items, remote_err = _request_remote_file_list_with_sizes(selected_ip, timeout_s=8.0)
-        if remote_err:
-            remote_note = f"(Could not fetch files: {remote_err})"
-        else:
-            remote_rows_ui = remote_items
-            if len(remote_rows_ui) == 0:
-                remote_note = "(No files reported by Arduino)"
-
-        uploaded_rows, uploaded_err = _read_uploaded_files_for_device(selected_short)
-        if uploaded_err:
-            uploaded_note = uploaded_err
-        else:
-            uploaded_rows_ui = uploaded_rows
-            if len(uploaded_rows_ui) == 0:
-                uploaded_note = "(No uploaded files logged for this Arduino)"
-
-        history_rows, history_err = _read_full_history_for_device(Path(DEFAULT_DB_PATH), selected_uid)
-        if history_err:
-            history_lines = [history_err]
-        else:
-            history_lines = []
-            history_lines.append("event_ts              source      detail")
-            history_lines.append("-------------------  ----------  -----------------------------------------------")
-            for ts, source, detail in history_rows:
-                history_lines.append(f"{ts:<19}  {source:<10}  {detail}")
-            if len(history_rows) == 0:
-                history_lines = ["(No DB history for this Arduino)"]
+        remote_note = "Loading files from Arduino..."
+        uploaded_note = "Loading uploaded-file list..."
+        history_text = "Loading SQLite history..."
 
     files_title_suffix = selected_short if selected_short else "..."
-    remote_rows_html = _build_remote_rows_html(remote_rows_ui)
-    uploaded_rows_html = _build_uploaded_rows_html(uploaded_rows_ui)
-    history_block = "\n".join(html.escape(x) for x in history_lines)
     page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1604,7 +1657,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
         <div class="scrollbox known-arduino-box">{device_rows_html_block}</div>
         <div style="margin-top:0.5rem;">
-          <button type="submit">Load File Lists</button>
+          <button type="submit" class="needs-device">Load File Lists</button>
         </div>
       </form>
 
@@ -1624,9 +1677,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               <button type="submit" class="delete-btn" id="sd-delete-button">Delete on SD</button>
             </form>
           </div>
-          <div class="scrollbox" id="sd-list-box">{
-              remote_rows_html if remote_rows_ui else html.escape(remote_note)
-          }</div>
+          <div class="scrollbox" id="sd-list-box">{html.escape(remote_note)}</div>
         </div>
         <div>
           <div class="section-title">Files uploaded from {html.escape(files_title_suffix)}</div>
@@ -1638,14 +1689,12 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               <button type="submit" class="delete-btn" id="uploaded-delete-button">Delete</button>
             </form>
           </div>
-          <div class="scrollbox" id="uploaded-list-box">{
-              uploaded_rows_html if uploaded_rows_ui else html.escape(uploaded_note)
-          }</div>
+          <div class="scrollbox" id="uploaded-list-box">{html.escape(uploaded_note)}</div>
         </div>
       </div>
 
       <div class="section-title">Complete SQLite History for {html.escape(files_title_suffix)}</div>
-      <div class="scrollbox">{history_block}</div>
+      <div class="scrollbox" id="history-box">{html.escape(history_text)}</div>
 
       <div class="section-title">Python Log</div>
       <div id="pythonlogbox" class="scrollbox">Loading python log...</div>
@@ -1661,7 +1710,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
   (function() {{
     const rows = Array.from(document.querySelectorAll(".device-row"));
     const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
-    const sdRows = Array.from(document.querySelectorAll(".sd-row"));
+    const needsDeviceControls = Array.from(document.querySelectorAll(".needs-device"));
+    const sdListBox = document.getElementById("sd-list-box");
+    const uploadedListBox = document.getElementById("uploaded-list-box");
+    const historyBox = document.getElementById("history-box");
     const uploadForm = document.getElementById("sd-upload-form");
     const sdSelectedName = document.getElementById("sd-selected-name");
     const sdUploadOpId = document.getElementById("sd-upload-op-id");
@@ -1671,7 +1723,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const uploadProgressText = document.getElementById("upload-progress-text");
     const deleteOverlay = document.getElementById("delete-progress-overlay");
     const deleteProgressText = document.getElementById("delete-progress-text");
-    const uploadRows = Array.from(document.querySelectorAll(".upload-row"));
     const deleteForm = document.getElementById("uploaded-delete-form");
     const sdUploadButton = document.getElementById("sd-upload-button");
     const sdDeleteButton = document.getElementById("sd-delete-button");
@@ -1680,28 +1731,51 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const selectedName = document.getElementById("uploaded-selected-name");
     const pythonLogBox = document.getElementById("pythonlogbox");
     let pythonLogTimer = null;
+    function getSelectedUid() {{
+      for (const f of uidFields) {{
+        const v = (f.value || "").trim();
+        if (v.length > 0) return v;
+      }}
+      return "";
+    }}
+    function getSdRows() {{
+      return Array.from(document.querySelectorAll("#sd-list-box .sd-row"));
+    }}
+    function getUploadRows() {{
+      return Array.from(document.querySelectorAll("#uploaded-list-box .upload-row"));
+    }}
     function updateActionButtons() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
+      needsDeviceControls.forEach((el) => {{
+        el.disabled = !hasUid;
+      }});
       const hasSd = !!((sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "");
       const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
       if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
       if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
       if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
     }}
-    function setSelectedUid(uid) {{
+    function setSelectedUid(uid, triggerLoad = true) {{
       uidFields.forEach((f) => {{ f.value = uid; }});
       rows.forEach((r) => {{
         if (r.dataset.uid === uid) r.classList.add("selected");
         else r.classList.remove("selected");
       }});
+      if (sdSelectedName) sdSelectedName.value = "";
+      if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
+      if (selectedPath) selectedPath.value = "";
+      if (selectedName) selectedName.value = "";
       updateActionButtons();
+      if (triggerLoad) {{
+        loadAllFilePanels(uid);
+      }}
     }}
     rows.forEach((r) => {{
-      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || ""));
+      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || "", true));
     }});
 
     function setSelectedSdRow(row) {{
-      sdRows.forEach((r) => r.classList.remove("selected"));
+      getSdRows().forEach((r) => r.classList.remove("selected"));
       if (!row) {{
         if (sdSelectedName) sdSelectedName.value = "";
         if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
@@ -1713,9 +1787,112 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       if (sdDeleteSelectedName) sdDeleteSelectedName.value = row.dataset.name || "";
       updateActionButtons();
     }}
-    sdRows.forEach((r) => {{
-      r.addEventListener("click", () => setSelectedSdRow(r));
-    }});
+    function bindSdRows() {{
+      getSdRows().forEach((r) => {{
+        r.addEventListener("click", () => setSelectedSdRow(r));
+      }});
+    }}
+    function setSelectedUploadRow(row) {{
+      getUploadRows().forEach((r) => r.classList.remove("selected"));
+      if (!row) {{
+        if (selectedPath) selectedPath.value = "";
+        if (selectedName) selectedName.value = "";
+        updateActionButtons();
+        return;
+      }}
+      row.classList.add("selected");
+      if (selectedPath) selectedPath.value = row.dataset.path || "";
+      if (selectedName) selectedName.value = row.dataset.name || "";
+      updateActionButtons();
+    }}
+    function bindUploadedRows() {{
+      getUploadRows().forEach((r) => {{
+        r.addEventListener("click", () => setSelectedUploadRow(r));
+      }});
+    }}
+    async function loadRemoteFiles(uid) {{
+      if (!sdListBox) return;
+      if (!uid) {{
+        sdListBox.textContent = "(Select a known Arduino to view SD files)";
+        setSelectedSdRow(null);
+        return;
+      }}
+      sdListBox.textContent = "Loading files from Arduino...";
+      try {{
+        const resp = await fetch("/api/file-transfers/remote-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) {{
+          sdListBox.textContent = payload && payload.message ? payload.message : "(Could not fetch files.)";
+          setSelectedSdRow(null);
+          return;
+        }}
+        if (payload.html && payload.html.length > 0) {{
+          sdListBox.innerHTML = payload.html;
+        }} else {{
+          sdListBox.textContent = payload.note || "(No files reported by Arduino)";
+        }}
+      }} catch (_err) {{
+        sdListBox.textContent = "(Could not fetch files.)";
+      }}
+      setSelectedSdRow(null);
+      bindSdRows();
+      updateActionButtons();
+    }}
+    async function loadUploadedFiles(uid) {{
+      if (!uploadedListBox) return;
+      if (!uid) {{
+        uploadedListBox.textContent = "(Select a known Arduino to view upload history)";
+        setSelectedUploadRow(null);
+        return;
+      }}
+      uploadedListBox.textContent = "Loading uploaded-file list...";
+      try {{
+        const resp = await fetch("/api/file-transfers/uploaded-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) {{
+          uploadedListBox.textContent = payload && payload.message ? payload.message : "(Could not load uploaded files.)";
+          setSelectedUploadRow(null);
+          return;
+        }}
+        if (payload.html && payload.html.length > 0) {{
+          uploadedListBox.innerHTML = payload.html;
+        }} else {{
+          uploadedListBox.textContent = payload.note || "(No uploaded files logged for this Arduino)";
+        }}
+      }} catch (_err) {{
+        uploadedListBox.textContent = "(Could not load uploaded files.)";
+      }}
+      setSelectedUploadRow(null);
+      bindUploadedRows();
+      updateActionButtons();
+    }}
+    async function loadHistory(uid) {{
+      if (!historyBox) return;
+      if (!uid) {{
+        historyBox.textContent = "(Select a known Arduino to view complete DB history)";
+        return;
+      }}
+      historyBox.textContent = "Loading SQLite history...";
+      try {{
+        const resp = await fetch("/api/file-transfers/history?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) {{
+          historyBox.textContent = payload && payload.message ? payload.message : "(Could not load history.)";
+          return;
+        }}
+        historyBox.textContent = payload.text || "(No DB history for this Arduino)";
+      }} catch (_err) {{
+        historyBox.textContent = "(Could not load history.)";
+      }}
+    }}
+    async function loadAllFilePanels(uid) {{
+      const selectedUid = (uid || "").trim();
+      await Promise.allSettled([
+        loadRemoteFiles(selectedUid),
+        loadUploadedFiles(selectedUid),
+        loadHistory(selectedUid),
+      ]);
+    }}
     if (uploadForm) {{
       uploadForm.addEventListener("submit", (ev) => {{
         ev.preventDefault();
@@ -1789,7 +1966,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           return;
         }}
         const uploadedNames = new Set(
-          uploadRows
+          getUploadRows()
             .map((r) => (r.dataset.name || "").trim().toUpperCase())
             .filter((v) => v.length > 0)
         );
@@ -1822,23 +1999,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           }});
       }});
     }}
-
-    function setSelectedUploadRow(row) {{
-      uploadRows.forEach((r) => r.classList.remove("selected"));
-      if (!row) {{
-        if (selectedPath) selectedPath.value = "";
-        if (selectedName) selectedName.value = "";
-        updateActionButtons();
-        return;
-      }}
-      row.classList.add("selected");
-      if (selectedPath) selectedPath.value = row.dataset.path || "";
-      if (selectedName) selectedName.value = row.dataset.name || "";
-      updateActionButtons();
-    }}
-    uploadRows.forEach((r) => {{
-      r.addEventListener("click", () => setSelectedUploadRow(r));
-    }});
     if (deleteForm) {{
       deleteForm.addEventListener("submit", (ev) => {{
         ev.preventDefault();
@@ -1907,6 +2067,12 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     if (!document.hidden) {{
       startPythonLogPolling();
     }}
+    const initialUid = getSelectedUid();
+    if (initialUid) {{
+      loadAllFilePanels(initialUid);
+    }}
+    bindSdRows();
+    bindUploadedRows();
     updateActionButtons();
   }})();
 </script>
@@ -2094,11 +2260,11 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     selected_device = _find_device_by_uid(devices, selected_uid)
     selected_burrow = (burrow_input if burrow_input is not None else "").strip()
 
-    panels: dict[str, tuple[str, str, str]] = {
-        "RTC Time": ("result", "------", "select a known Arduino"),
-        "Status": ("result", "------", "select a known Arduino"),
-        "Config": ("result", "------", "select a known Arduino"),
-        "Diagnostics": ("result", "------", "select a known Arduino"),
+    panel_placeholders: dict[str, str] = {
+        "RTC Time": "select a known Arduino",
+        "Status": "select a known Arduino",
+        "Config": "select a known Arduino",
+        "Diagnostics": "select a known Arduino",
     }
     selected_short = "..."
     if selected_device is not None:
@@ -2108,8 +2274,12 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
             selected_short = uid[-6:] if len(uid) >= 6 else uid
         if burrow_input is None:
             selected_burrow = (selected_device.get("burrow_id", "") or "").strip()
-        device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
-        panels = _maintenance_panel_data(device_ip=device_ip)
+        panel_placeholders = {
+            "RTC Time": "loading...",
+            "Status": "loading...",
+            "Config": "loading...",
+            "Diagnostics": "loading...",
+        }
     device_rows_html_block = _build_device_select_rows(devices, selected_uid)
 
     page = f"""<!doctype html>
@@ -2201,19 +2371,19 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
       <div class="mini-grid">
         <div>
           <div class="mini-title">RTC Time</div>
-          <div class="mini-box">{html.escape(_mini_panel_block(panels["RTC Time"][0], panels["RTC Time"][1], panels["RTC Time"][2]))}</div>
+          <div class="mini-box" id="panel-rtc">{html.escape(panel_placeholders["RTC Time"])}</div>
         </div>
         <div>
           <div class="mini-title">Status</div>
-          <div class="mini-box">{html.escape(_mini_panel_block(panels["Status"][0], panels["Status"][1], panels["Status"][2]))}</div>
+          <div class="mini-box" id="panel-status">{html.escape(panel_placeholders["Status"])}</div>
         </div>
         <div>
           <div class="mini-title">Config</div>
-          <div class="mini-box">{html.escape(_mini_panel_block(panels["Config"][0], panels["Config"][1], panels["Config"][2]))}</div>
+          <div class="mini-box" id="panel-config">{html.escape(panel_placeholders["Config"])}</div>
         </div>
         <div>
           <div class="mini-title">Diagnostics</div>
-          <div class="mini-box">{html.escape(_mini_panel_block(panels["Diagnostics"][0], panels["Diagnostics"][1], panels["Diagnostics"][2]))}</div>
+          <div class="mini-box" id="panel-diagnostics">{html.escape(panel_placeholders["Diagnostics"])}</div>
         </div>
       </div>
     </div>
@@ -2223,23 +2393,74 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     const rows = Array.from(document.querySelectorAll(".device-row"));
     const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
     const needsDeviceControls = Array.from(document.querySelectorAll(".needs-device"));
+    const panelRtc = document.getElementById("panel-rtc");
+    const panelStatus = document.getElementById("panel-status");
+    const panelConfig = document.getElementById("panel-config");
+    const panelDiagnostics = document.getElementById("panel-diagnostics");
+    function getSelectedUid() {{
+      for (const f of uidFields) {{
+        const v = (f.value || "").trim();
+        if (v.length > 0) return v;
+      }}
+      return "";
+    }}
+    function setPanelText(target, text) {{
+      if (!target) return;
+      target.textContent = text || "";
+    }}
+    function setAllPanels(text) {{
+      setPanelText(panelRtc, text);
+      setPanelText(panelStatus, text);
+      setPanelText(panelConfig, text);
+      setPanelText(panelDiagnostics, text);
+    }}
+    async function loadMaintenancePanels(uid) {{
+      const selectedUid = (uid || "").trim();
+      if (!selectedUid) {{
+        setAllPanels("select a known Arduino");
+        return;
+      }}
+      setAllPanels("loading...");
+      try {{
+        const resp = await fetch("/api/maintenance/panels?uid=" + encodeURIComponent(selectedUid), {{ cache: "no-store" }});
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) {{
+          setAllPanels(payload && payload.message ? payload.message : "Could not load maintenance data.");
+          return;
+        }}
+        const p = payload.panels || {{}};
+        setPanelText(panelRtc, p["RTC Time"] || "no data");
+        setPanelText(panelStatus, p["Status"] || "no data");
+        setPanelText(panelConfig, p["Config"] || "no data");
+        setPanelText(panelDiagnostics, p["Diagnostics"] || "no data");
+      }} catch (_err) {{
+        setAllPanels("Could not load maintenance data.");
+      }}
+    }}
     function updateNeedsDeviceState() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
       needsDeviceControls.forEach((el) => {{
         el.disabled = !hasUid;
       }});
     }}
-    function setSelectedUid(uid) {{
+    function setSelectedUid(uid, triggerLoad = true) {{
       uidFields.forEach((f) => {{ f.value = uid; }});
       rows.forEach((r) => {{
         if (r.dataset.uid === uid) r.classList.add("selected");
         else r.classList.remove("selected");
       }});
       updateNeedsDeviceState();
+      if (triggerLoad) {{
+        loadMaintenancePanels(uid);
+      }}
     }}
     rows.forEach((r) => {{
-      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || ""));
+      r.addEventListener("click", () => setSelectedUid(r.dataset.uid || "", true));
     }});
+    const initialUid = getSelectedUid();
+    if (initialUid) {{
+      loadMaintenancePanels(initialUid);
+    }}
     updateNeedsDeviceState();
   }})();
 </script>
@@ -2326,6 +2547,22 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/upload-progress":
             op = (query.get("op") or [""])[0].strip()
             self._send_json(get_upload_progress(op))
+            return
+        if route == "/api/file-transfers/remote-files":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_json(get_file_transfers_remote_files_payload(selected_uid))
+            return
+        if route == "/api/file-transfers/uploaded-files":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_json(get_file_transfers_uploaded_files_payload(selected_uid))
+            return
+        if route == "/api/file-transfers/history":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_json(get_file_transfers_history_payload(selected_uid))
+            return
+        if route == "/api/maintenance/panels":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_json(get_maintenance_panels_payload(selected_uid))
             return
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
