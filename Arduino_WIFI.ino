@@ -90,6 +90,7 @@ const char GET_CONFIG_MESSAGE[] = "GET_CONFIG";
 const char GET_DIAGNOSTICS_MESSAGE[] = "GET_DIAGNOSTICS";
 const char GET_LAST_DATA_MESSAGE[] = "GET_LAST_DATA";
 const char GET_NET_UID_MESSAGE[] = "GET_NET_UID";
+const char GET_VERSION_MESSAGE[] = "GET_VERSION";
 const char SET_CONFIG_MESSAGE[] = "SET_CONFIG";
 const char REBOOT_MESSAGE[] = "REBOOT";
 const char ENTER_DATA_MODE_MESSAGE[] = "ENTER_DATA_MODE";
@@ -158,6 +159,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
+const char VERSION[] = "1.0";
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
@@ -202,6 +204,10 @@ String getChipIdHex() {
     (unsigned long) uid->unique_id_words[3]
   );
   return String(id);
+}
+
+String getFirmwareVersion() {
+  return String(VERSION);
 }
 
 /***********************
@@ -1488,6 +1494,13 @@ void serviceWifiCommands() {
     Serial.print(F(" (HOST="));
     Serial.print(networkHostname);
     Serial.println(F(")"));
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
+  if (strcmp(incoming, GET_VERSION_MESSAGE) == 0) {
+    String response = "VERSION,";
+    response += getFirmwareVersion();
     sendUdpMessage(response, remoteIp, remotePort);
     return;
   }

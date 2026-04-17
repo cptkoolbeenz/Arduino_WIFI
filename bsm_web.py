@@ -8,6 +8,7 @@ import csv
 import json
 import sqlite3
 import socket
+import re
 import subprocess
 import sys
 import threading
@@ -89,6 +90,71 @@ NORMAL_OPS_CMD = [
 ]
 
 POLL_NOW_ARGS = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
+
+
+def _set_or_append_flag(args_list: list[str], flag: str, value: str) -> list[str]:
+    out: list[str] = []
+    i = 0
+    replaced = False
+    while i < len(args_list):
+        tok = args_list[i]
+        if tok == flag:
+            if not replaced:
+                out.extend([flag, value])
+                replaced = True
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    if not replaced:
+        out.extend([flag, value])
+    return out
+
+
+def _infer_bind_ip_for_prefix(prefix3: str) -> str:
+    try:
+        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return "0.0.0.0"
+    inet_re = re.compile(r"\s+inet\s+(\d+\.\d+\.\d+\.\d+)\s+")
+    for line in out.splitlines():
+        m = inet_re.match(line)
+        if not m:
+            continue
+        ip = m.group(1)
+        if ip.startswith("127."):
+            continue
+        if ip.startswith(prefix3 + "."):
+            return ip
+    return "0.0.0.0"
+
+
+def build_dynamic_poll_now_args() -> tuple[list[str], str]:
+    args_list = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
+    rows = read_devices_rows(Path("data/discovered_devices.csv"))
+    prefixes: dict[str, int] = {}
+    for row in rows:
+        ip = (row.get("device_ip", "") or row.get("recv_ip", "")).strip()
+        parts = ip.split(".")
+        if len(parts) != 4:
+            continue
+        if not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            continue
+        prefix3 = ".".join(parts[:3])
+        prefixes[prefix3] = prefixes.get(prefix3, 0) + 1
+
+    if not prefixes:
+        return args_list, "poll-now auto network: no known device subnet; using profile defaults"
+
+    chosen_prefix = sorted(prefixes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    discover_ip = f"{chosen_prefix}.255"
+    bind_ip = _infer_bind_ip_for_prefix(chosen_prefix)
+    args_list = _set_or_append_flag(args_list, "--discover-ip", discover_ip)
+    args_list = _set_or_append_flag(args_list, "--bind", bind_ip)
+    note = (
+        f"poll-now auto network: subnet={chosen_prefix}.0/24 discover-ip={discover_ip} bind={bind_ip}"
+    )
+    return args_list, note
 
 
 class ProcessManager:
@@ -207,7 +273,9 @@ class ProcessManager:
             logf.write(f"\n=== Manual Poll start {stamp} ===\n")
             logf.flush()
             try:
-                args = parse_args(POLL_NOW_ARGS)
+                dynamic_args, note = build_dynamic_poll_now_args()
+                logf.write(note + "\n")
+                args = parse_args(dynamic_args)
                 with redirect_stdout(logf), redirect_stderr(logf):
                     rc = run_discovery(args)
             except Exception as exc:  # noqa: BLE001
@@ -301,6 +369,11 @@ def read_activity_status() -> str:
     return "\n".join(sections)
 
 
+def read_python_log_status() -> str:
+    txt = read_log_tail(ACTION_LOG_PATH, max_bytes=120_000)
+    return txt.strip() or "(No python web actions logged yet)"
+
+
 def _iso_to_dt(value: str) -> dt.datetime | None:
     try:
         return dt.datetime.fromisoformat(value)
@@ -314,8 +387,18 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
         return "(No devices discovered yet)"
 
     lines = []
-    lines.append("status   burrow_id      short_uid  unique_id                              ap_id       network_uid       device_ip      recv_ip        last_seen")
-    lines.append("------   ------------   --------   ------------------------------------   ---------   ---------------   -----------   -----------    -------------------")
+    mismatches = []
+    for row in rows:
+        dev_ip = (row.get("device_ip", "") or "").strip()
+        recv_ip = (row.get("recv_ip", "") or "").strip()
+        if dev_ip and recv_ip and dev_ip != recv_ip:
+            short_uid = (row.get("short_uid", "") or "").strip()
+            mismatches.append(short_uid if short_uid else (row.get("unique_id", "") or "").strip())
+    if mismatches:
+        lines.append(f"WARNING: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
+        lines.append("")
+    lines.append("status   burrow_id      short_uid  fw_ver   ap_id       network_uid       device_ip      recv_ip        last_seen             unique_id")
+    lines.append("------   ------------   --------   ------   ---------   ---------------   -----------   -----------    -------------------   ------------------------------------")
     for row in rows:
         status = row.get("status", "UNKNOWN")
         burrow_id = row.get("burrow_id", "")
@@ -325,10 +408,11 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
         uid = row.get("unique_id", "")
         ap_id = row.get("ap_id", "")
         net_uid = row.get("network_uid", "")
+        fw_ver = row.get("firmware_version", "")
         dev_ip = row.get("device_ip", "")
         recv_ip = row.get("recv_ip", "")
         last_seen_raw = row.get("last_seen", "")
-        lines.append(f"{status:<6}   {burrow_id:<12}   {short_uid:<8}   {uid:<36}   {ap_id:<9}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw}")
+        lines.append(f"{status:<6}   {burrow_id:<12}   {short_uid:<8}   {fw_ver:<6}   {ap_id:<9}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}")
     return "\n".join(lines)
 
 
@@ -347,13 +431,24 @@ def read_devices_rows(path: Path, online_seconds: int = 600) -> list[dict[str, s
                 row_clean = {k: (v or "").strip() for k, v in row.items()}
                 rows.append(row_clean)
 
+    active_uids: set[str] = set()
+    try:
+        active_rows = list_active_transfers(Path(DEFAULT_DB_PATH))
+        active_uids = {str(r.get("unique_id", "")).strip() for r in active_rows if str(r.get("unique_id", "")).strip()}
+    except Exception:
+        active_uids = set()
+
     now = dt.datetime.now()
     for row in rows:
-        status = "UNKNOWN"
+        uid = (row.get("unique_id", "") or "").strip()
+        status = "Stale"
+        if uid and uid in active_uids:
+            row["status"] = "Upload"
+            continue
         last_seen = _iso_to_dt(row.get("last_seen", ""))
         if last_seen is not None:
             age_s = (now - last_seen).total_seconds()
-            status = "ONLINE" if age_s <= online_seconds else "STALE"
+            status = "Online" if age_s <= online_seconds else "Stale"
         row["status"] = status
     return rows
 
@@ -657,7 +752,11 @@ def read_today_uploads_status(db_path: Path) -> str:
                   COALESCE(d.short_uid, ''),
                   COALESCE(t.network_uid, ''),
                   COALESCE(t.source_filename, ''),
-                  COALESCE(t.event_ts, '')
+                  COALESCE(t.event_ts, ''),
+                  CASE
+                    WHEN t.duration_s IS NULL THEN ''
+                    ELSE CAST(ROUND(t.duration_s / 60.0, 1) AS TEXT)
+                  END
                 FROM transfer_events t
                 LEFT JOIN devices d
                   ON d.unique_id = t.unique_id
@@ -677,12 +776,12 @@ def read_today_uploads_status(db_path: Path) -> str:
         return "(No files uploaded today)"
 
     lines = []
-    lines.append("burrow_id      short_uid  network_uid       filename                uploaded_at")
-    lines.append("------------   --------   ---------------   ----------------------  -------------------")
-    for burrow_id, short_uid, network_uid, filename, uploaded_at in rows:
+    lines.append("burrow_id      short_uid  network_uid       filename                uploaded_at           duration_min")
+    lines.append("------------   --------   ---------------   ----------------------  -------------------   ------------")
+    for burrow_id, short_uid, network_uid, filename, uploaded_at, duration_s in rows:
         lines.append(
             f"{str(burrow_id):<12}   {str(short_uid):<8}   {str(network_uid):<15}   "
-            f"{str(filename):<22}  {str(uploaded_at):<19}"
+            f"{str(filename):<22}  {str(uploaded_at):<19}   {str(duration_s):<10}"
         )
     return "\n".join(lines)
 
@@ -775,41 +874,32 @@ def delete_remote_file(device_ip: str, remote_filename: str, timeout_s: float = 
         sock.close()
 
 
-def _read_uploaded_files_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str, str, float]], str]:
-    if not db_path.exists():
-        return [], "(No upload DB yet)"
+def _read_uploaded_files_for_device(short_uid: str) -> tuple[list[tuple[str, str, str, float]], str]:
+    sid = (short_uid or "").strip().upper()
+    if not sid:
+        return [], "(No short UID available)"
+
+    folder = WEB_FILE_OUTPUT_ROOT / sid
+    if not folder.exists():
+        return [], "(No local upload folder yet)"
+    if not folder.is_dir():
+        return [], f"(Upload path is not a folder: {folder})"
+
+    rows: list[tuple[str, str, str, float]] = []
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
-        try:
-            cur = conn.execute(
-                """
-                SELECT COALESCE(source_filename, ''), COALESCE(event_ts, ''), COALESCE(saved_path, '')
-                FROM transfer_events
-                WHERE status = 'saved' AND unique_id = ?
-                ORDER BY event_ts DESC
-                """,
-                (unique_id,),
-            )
-            rows = cur.fetchall()
-        finally:
-            conn.close()
-    except sqlite3.OperationalError as exc:
-        return [], f"(Upload history unavailable: {exc})"
-    existing_rows: list[tuple[str, str, str, float]] = []
-    for r in rows:
-        name = str(r[0] or "")
-        ts = str(r[1] or "")
-        saved_path = str(r[2] or "")
-        if not saved_path:
-            continue
-        try:
-            p = Path(saved_path).expanduser()
-            if p.exists() and p.is_file():
-                size_mb = float(p.stat().st_size) / (1024.0 * 1024.0)
-                existing_rows.append((name, ts, saved_path, size_mb))
-        except Exception:
-            continue
-    return existing_rows, ""
+        for p in folder.iterdir():
+            if not p.is_file():
+                continue
+            st = p.stat()
+            size_mb = float(st.st_size) / (1024.0 * 1024.0)
+            # Use file modified time as uploaded-at for filesystem-first truth.
+            ts = dt.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+            rows.append((p.name, ts, str(p), size_mb))
+    except Exception as exc:  # noqa: BLE001
+        return [], f"(Could not read upload folder: {exc})"
+
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows, ""
 
 
 def _build_uploaded_rows_html(rows: list[tuple[str, str, str, float]]) -> str:
@@ -851,12 +941,17 @@ def delete_local_uploaded_file(saved_path: str) -> tuple[bool, str]:
 
 
 def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
-    if not rows:
+    filtered = []
+    for name, size in rows:
+        n = (name or "").strip().upper()
+        if n.startswith("TR") or n.startswith("DL") or n.startswith("RF"):
+            filtered.append((name, size))
+    if not filtered:
         return '<div style="font-style:italic;">(No files reported by Arduino)</div>'
     out = []
     out.append('<div class="sd-head">filename                          size_mb</div>')
     out.append('<div class="sd-sep">--------------------------------  -------</div>')
-    for name, size in sorted(rows, key=lambda x: x[0], reverse=True):
+    for name, size in sorted(filtered, key=lambda x: x[0], reverse=True):
         size_mb = float(size) / (1024.0 * 1024.0)
         line = f"{name:<32}  {size_mb:>7.3f}"
         out.append(
@@ -994,7 +1089,9 @@ def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[t
                   SELECT
                     COALESCE(event_ts, '') AS event_ts,
                     'TRANSFER' AS source,
-                    ('status=' || COALESCE(status, '') || ' file=' || COALESCE(source_filename, '') || ' msg=' || COALESCE(message, '')) AS detail
+                    ('status=' || COALESCE(status, '') || ' file=' || COALESCE(source_filename, '') ||
+                     ' duration_min=' || COALESCE(CAST(ROUND(duration_s / 60.0, 1) AS TEXT), '') ||
+                     ' msg=' || COALESCE(message, '')) AS detail
                   FROM transfer_events
                   WHERE unique_id = ?
 
@@ -1281,18 +1378,15 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         if not selected_short:
             selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
 
-        if active_busy:
-            remote_note = "(Live SD file query paused while uploads are active.)"
+        remote_items, remote_err = _request_remote_file_list_with_sizes(selected_ip, timeout_s=8.0)
+        if remote_err:
+            remote_note = f"(Could not fetch files: {remote_err})"
         else:
-            remote_items, remote_err = _request_remote_file_list_with_sizes(selected_ip, timeout_s=8.0)
-            if remote_err:
-                remote_note = f"(Could not fetch files: {remote_err})"
-            else:
-                remote_rows_ui = remote_items
-                if len(remote_rows_ui) == 0:
-                    remote_note = "(No files reported by Arduino)"
+            remote_rows_ui = remote_items
+            if len(remote_rows_ui) == 0:
+                remote_note = "(No files reported by Arduino)"
 
-        uploaded_rows, uploaded_err = _read_uploaded_files_for_device(Path(DEFAULT_DB_PATH), selected_uid)
+        uploaded_rows, uploaded_err = _read_uploaded_files_for_device(selected_short)
         if uploaded_err:
             uploaded_note = uploaded_err
         else:
@@ -1466,6 +1560,9 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 
       <div class="section-title">Complete SQLite History for {html.escape(files_title_suffix)}</div>
       <div class="scrollbox">{history_block}</div>
+
+      <div class="section-title">Python Log</div>
+      <div id="pythonlogbox" class="scrollbox">Loading python log...</div>
     </div>
   </div>
 <div id="upload-progress-overlay" class="progress-overlay">
@@ -1495,6 +1592,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const uploadedDeleteButton = document.getElementById("uploaded-delete-button");
     const selectedPath = document.getElementById("uploaded-selected-path");
     const selectedName = document.getElementById("uploaded-selected-name");
+    const pythonLogBox = document.getElementById("pythonlogbox");
     function updateActionButtons() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
       const hasSd = !!((sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "");
@@ -1661,6 +1759,23 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         if (!ok) ev.preventDefault();
       }});
     }}
+    async function refreshPythonLog() {{
+      if (!pythonLogBox) return;
+      try {{
+        const resp = await fetch("/python-log", {{ cache: "no-store" }});
+        if (!resp.ok) return;
+        const txt = await resp.text();
+        const nearBottom = (pythonLogBox.scrollTop + pythonLogBox.clientHeight) >= (pythonLogBox.scrollHeight - 30);
+        pythonLogBox.textContent = txt || "(No python log output yet)";
+        if (nearBottom) {{
+          pythonLogBox.scrollTop = pythonLogBox.scrollHeight;
+        }}
+      }} catch (_err) {{
+        // Keep last displayed text.
+      }}
+    }}
+    refreshPythonLog();
+    setInterval(refreshPythonLog, 2000);
     updateActionButtons();
   }})();
 </script>
@@ -1679,6 +1794,7 @@ def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dic
 
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
     rows: list[tuple[str, str]] = []
+    mismatches: list[str] = []
     for d in devices:
         uid = (d.get("unique_id", "") or "").strip()
         short_uid = (d.get("short_uid", "") or "").strip()
@@ -1692,20 +1808,30 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             status = status[:6]
         ap_id = (d.get("ap_id", "") or "").strip()
         net_uid = (d.get("network_uid", "") or "").strip()
+        fw_ver = (d.get("firmware_version", "") or "").strip()
         ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
         recv_ip = (d.get("recv_ip", "") or "").strip()
+        dev_ip_raw = (d.get("device_ip", "") or "").strip()
+        if dev_ip_raw and recv_ip and dev_ip_raw != recv_ip:
+            mismatches.append(short_uid if short_uid else uid)
         last_seen_raw = (d.get("last_seen", "") or "").strip()
         line = (
-            f"{status:<6}   {burrow:<12}   {short_uid:<8}   {uid:<36}   "
-            f"{ap_id:<9}   {net_uid:<15}   {ip:<11}   {recv_ip:<11}    {last_seen_raw}"
+            f"{status:<6}   {burrow:<12}   {short_uid:<8}   {fw_ver:<6}   "
+            f"{ap_id:<9}   {net_uid:<15}   {ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}"
         )
         rows.append((uid, line))
     if not rows:
         return '<div style="font-style:italic;">No devices discovered yet.</div>'
 
     out = []
-    out.append('<div class="device-head">status   burrow_id      short_uid  unique_id                              ap_id       network_uid       device_ip      recv_ip        last_seen</div>')
-    out.append('<div class="device-sep">------   ------------   --------   ------------------------------------   ---------   ---------------   -----------   -----------    -------------------</div>')
+    if mismatches:
+        out.append(
+            '<div style="margin-bottom:4px;color:#8a3300;font-weight:700;">'
+            + html.escape(f"Warning: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
+            + "</div>"
+        )
+    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       device_ip      recv_ip        last_seen             unique_id</div>')
+    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   -----------   -----------    -------------------   ------------------------------------</div>')
     for uid, line in rows:
         selected_cls = " selected" if uid == selected_uid else ""
         out.append(
@@ -1993,12 +2119,19 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _safe_write(self, raw: bytes) -> None:
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before receiving full response.
+            return
+
     def _send_html(self, body: bytes, code: int = HTTPStatus.OK) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._safe_write(body)
 
     def _send_text(self, body: str, code: int = HTTPStatus.OK) -> None:
         raw = body.encode("utf-8")
@@ -2007,7 +2140,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        self._safe_write(raw)
 
     def _send_json(self, payload: dict, code: int = HTTPStatus.OK) -> None:
         raw = json.dumps(payload).encode("utf-8")
@@ -2016,7 +2149,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        self._safe_write(raw)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -2031,6 +2164,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/activity":
             self._send_text(read_activity_status())
+            return
+        if route == "/python-log":
+            self._send_text(read_python_log_status())
             return
         if route == "/upload-progress":
             op = (query.get("op") or [""])[0].strip()

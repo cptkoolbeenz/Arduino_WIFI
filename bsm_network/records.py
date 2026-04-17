@@ -32,6 +32,7 @@ def write_discovery_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
                 "unique_id",
                 "short_uid",
                 "network_uid",
+                "firmware_version",
                 "network_hostname",
                 "wifi_mac",
                 "device_ip",

@@ -150,6 +150,15 @@ def parse_net_uid_response(payload: str) -> dict[str, str] | None:
     }
 
 
+def parse_version_response(payload: str) -> str | None:
+    if not payload.startswith("VERSION,"):
+        return None
+    parts = [p.strip() for p in payload.split(",", 1)]
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
 def request_network_uid(
     control_sock: socket.socket,
     device_ip: str,
@@ -173,6 +182,33 @@ def request_network_uid(
             if parsed is not None:
                 return parsed
         return None
+    finally:
+        control_sock.settimeout(original_timeout)
+
+
+def request_device_version(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    timeout_s: float = 1.0,
+) -> str:
+    original_timeout = control_sock.gettimeout()
+    try:
+        control_sock.settimeout(timeout_s)
+        control_sock.sendto(b"GET_VERSION", (device_ip, control_port))
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                data, (src_ip, _src_port) = control_sock.recvfrom(2048)
+            except socket.timeout:
+                return ""
+            if src_ip != device_ip:
+                continue
+            payload = data.decode("utf-8", errors="replace").strip()
+            parsed = parse_version_response(payload)
+            if parsed is not None:
+                return parsed
+        return ""
     finally:
         control_sock.settimeout(original_timeout)
 
@@ -668,6 +704,7 @@ def run_discovery(args: argparse.Namespace) -> int:
             "udp_target_ip": parsed["udp_target_ip"],
             "udp_target_port": parsed["udp_target_port"],
             "network_uid": parsed.get("network_uid", ""),
+            "firmware_version": "",
             "network_hostname": "",
             "wifi_mac": "",
             "recv_ip": src_ip,
@@ -708,11 +745,16 @@ def run_discovery(args: argparse.Namespace) -> int:
             control_port=args.discover_port,
             timeout_s=1.0,
         )
-        if not net:
-            continue
-        row["network_uid"] = net.get("network_uid", "") or row.get("network_uid", "")
-        row["network_hostname"] = net.get("network_hostname", "")
-        row["wifi_mac"] = net.get("wifi_mac", "")
+        if net:
+            row["network_uid"] = net.get("network_uid", "") or row.get("network_uid", "")
+            row["network_hostname"] = net.get("network_hostname", "")
+            row["wifi_mac"] = net.get("wifi_mac", "")
+        row["firmware_version"] = request_device_version(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=args.discover_port,
+            timeout_s=1.0,
+        )
 
     device_to_ap, ap_limits, default_ap, device_to_burrow = _build_ap_routing_config(args)
     default_warned: set[str] = set()
@@ -721,9 +763,12 @@ def run_discovery(args: argparse.Namespace) -> int:
     for row in rows:
         uid = str(row.get("unique_id", ""))
         ap_id, source = _resolve_ap_for_device(row, device_to_ap, default_ap)
-        burrow_id = _resolve_burrow_for_device(row, device_to_burrow)
-        if not burrow_id:
-            burrow_id = existing_burrow_by_uid.get(uid, "")
+        existing_burrow = existing_burrow_by_uid.get(uid, "").strip()
+        mapped_burrow = _resolve_burrow_for_device(row, device_to_burrow)
+        # Persistence policy:
+        # - if DB already has a burrow_id (including user edits), keep it
+        # - otherwise seed from mapping file when available
+        burrow_id = existing_burrow if existing_burrow else mapped_burrow
         short_uid = _short_uid_from_unique_id(uid, 6)
 
         row["ap_id"] = ap_id
@@ -811,10 +856,10 @@ def run_discovery(args: argparse.Namespace) -> int:
                 db_enabled = False
 
     print(f"Discovered {len(rows)} Arduino device(s):")
-    print("unique_id, short_uid, network_uid, udp_target_ip, device_ip, recv_ip")
+    print("unique_id, short_uid, network_uid, firmware_version, udp_target_ip, device_ip, recv_ip")
     for row in rows:
         print(
-            f"{row['unique_id']}, {row.get('short_uid', '')}, {row.get('network_uid', '')}, "
+            f"{row['unique_id']}, {row.get('short_uid', '')}, {row.get('network_uid', '')}, {row.get('firmware_version', '')}, "
             f"{row['udp_target_ip']}, {row['device_ip']}, {row['recv_ip']}"
         )
     ap_counts = Counter(str(row.get("ap_id", default_ap)) for row in rows)
