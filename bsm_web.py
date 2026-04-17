@@ -68,6 +68,9 @@ TZ_PRESET_OFFSETS: dict[str, float] = {
 UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
+WEB_APP_NAME = "NORTH_END_WIFI"
+WEB_APP_VERSION = "1.0"
+WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 
 
 def get_last_set_time_state() -> tuple[float, str]:
@@ -1137,7 +1140,7 @@ def render_page(message: str = "") -> bytes:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Big Science Network</title>
+  <title>{WEB_APP_NAME}</title>
   <style>
     :root {{
       --bg: #f2f4f7;
@@ -1230,7 +1233,7 @@ def render_page(message: str = "") -> bytes:
 <body>
   <div class="shell">
   <div class="panel">
-    <h2 class="title">Big Science Network</h2>
+    <h2 class="title">{WEB_APP_HEADER}</h2>
     <div class="status">Status: <strong>{html.escape(state)}</strong></div>
     <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
     {msg_html}
@@ -1423,7 +1426,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Big Science Network - File Transfers</title>
+  <title>{WEB_APP_NAME} - File Transfers</title>
   <style>
     :root {{
       --bg: #f2f4f7;
@@ -1503,7 +1506,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 <body>
   <div class="shell">
     <div class="panel">
-      <h2 class="title">Big Science Network</h2>
+      <h2 class="title">{WEB_APP_HEADER}</h2>
       <div class="subtitle">File Transfers</div>
       <div class="status">Status: <strong>{html.escape(state)}</strong></div>
       <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
@@ -1994,7 +1997,7 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Big Science Network - Maintenance</title>
+  <title>{WEB_APP_NAME} - Maintenance</title>
   <style>
     :root {{
       --bg: #f2f4f7;
@@ -2028,7 +2031,7 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
 <body>
   <div class="shell">
     <div class="panel">
-      <h2 class="title">Big Science Network</h2>
+      <h2 class="title">{WEB_APP_HEADER}</h2>
       <div class="subtitle">Maintenance</div>
       <div class="status">Status: <strong>{html.escape(state)}</strong></div>
       <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
