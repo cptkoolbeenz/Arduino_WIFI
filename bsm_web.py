@@ -71,6 +71,11 @@ LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_WIFI"
 WEB_APP_VERSION = "1.0"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
+UI_POLL_UPLOADS_MS = 3000
+UI_POLL_DEVICES_MS = 3000
+UI_POLL_ACTIVITY_MS = 2000
+UI_POLL_PYTHON_LOG_MS = 2000
+UI_POLL_UPLOAD_PROGRESS_MS = 500
 
 
 def get_last_set_time_state() -> tuple[float, str]:
@@ -1286,7 +1291,7 @@ def render_page(message: str = "") -> bytes:
       }}
     }}
     refreshUploads();
-    setInterval(refreshUploads, 3000);
+    setInterval(refreshUploads, {UI_POLL_UPLOADS_MS});
 
     async function refreshDevices() {{
       try {{
@@ -1301,7 +1306,7 @@ def render_page(message: str = "") -> bytes:
       }}
     }}
     refreshDevices();
-    setInterval(refreshDevices, 3000);
+    setInterval(refreshDevices, {UI_POLL_DEVICES_MS});
 
     async function refreshActivity() {{
       try {{
@@ -1320,7 +1325,7 @@ def render_page(message: str = "") -> bytes:
       }}
     }}
     refreshActivity();
-    setInterval(refreshActivity, 2000);
+    setInterval(refreshActivity, {UI_POLL_ACTIVITY_MS});
   </script>
 </body>
 </html>
@@ -1445,7 +1450,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
     form {{ margin: 0; }}
     button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
-    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
     button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
     .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
     .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
@@ -1674,7 +1678,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               // Ignore transient poll errors.
             }});
         }};
-        progressTimer = setInterval(pollProgress, 500);
+        progressTimer = setInterval(pollProgress, {UI_POLL_UPLOAD_PROGRESS_MS});
         pollProgress();
 
         const params = new URLSearchParams(new FormData(uploadForm));
@@ -1786,7 +1790,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       }}
     }}
     refreshPythonLog();
-    setInterval(refreshPythonLog, 2000);
+    setInterval(refreshPythonLog, {UI_POLL_PYTHON_LOG_MS});
     updateActionButtons();
   }})();
 </script>
@@ -2579,7 +2583,16 @@ def main() -> int:
     host = DEFAULT_WEB_HOST
     port = DEFAULT_WEB_PORT
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"BSM web control ready: http://{host}:{port}")
+    print(f"{WEB_APP_NAME} web control ready: http://{host}:{port}")
+    print(
+        "Startup config: "
+        f"profile={ACTIVE_NETWORK_PROFILE} "
+        f"source={ACTIVE_NETWORK_PROFILE_SOURCE} "
+        f"db={DEFAULT_DB_PATH} "
+        f"poll_ms(devices={UI_POLL_DEVICES_MS},uploads={UI_POLL_UPLOADS_MS},"
+        f"activity={UI_POLL_ACTIVITY_MS},python_log={UI_POLL_PYTHON_LOG_MS},"
+        f"upload_progress={UI_POLL_UPLOAD_PROGRESS_MS})"
+    )
 
     try:
         server.serve_forever()

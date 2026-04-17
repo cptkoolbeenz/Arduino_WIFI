@@ -1,9 +1,23 @@
 # Arduino
 *.tmp
 *.swp
+.DS_Store
 
 # Build artifacts
 build/
 
 # Local secrets
 secrets.h
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime state/log artifacts
+data/bsm_network.db
+data/bsm_network.db-shm
+data/bsm_network.db-wal
+data/discovered_devices.csv
+data/packets.csv
+data/bsm_network.log
+data/web_*.log
