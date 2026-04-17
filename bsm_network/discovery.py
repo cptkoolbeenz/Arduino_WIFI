@@ -377,7 +377,12 @@ def _build_ap_routing_config(args: argparse.Namespace) -> tuple[dict[str, str], 
             default_ap = file_default_ap
         merged_limits.update(_extract_ap_limits(data))
         merged_mapping.update(_extract_device_mapping(data))
-        merged_burrow.update(_extract_burrow_mapping(data))
+        ignored_burrow_map = _extract_burrow_mapping(data)
+        if ignored_burrow_map:
+            print(
+                f"Warning: {label} '{path_value}' contains burrow mappings. "
+                "Ignoring burrow mapping config; DB/user-edited burrow_id is authoritative."
+            )
 
     if default_ap not in merged_limits:
         merged_limits[default_ap] = default_limit

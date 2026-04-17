@@ -4,6 +4,8 @@ import datetime as dt
 import sqlite3
 from pathlib import Path
 
+DB_SCHEMA_VERSION = "2"
+
 UPSERT_DEVICE_SQL = """
 INSERT INTO devices (
   unique_id, short_uid, network_uid, firmware_version, network_hostname, wifi_mac,
@@ -130,6 +132,18 @@ def init_db(db_path: Path) -> None:
               source_filename TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_active_transfers_started_at ON active_transfers(started_at);
+
+            CREATE TABLE IF NOT EXISTS schema_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_devices_short_uid ON devices(short_uid);
+            CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
+            CREATE INDEX IF NOT EXISTS idx_devices_network_uid ON devices(network_uid);
+            CREATE INDEX IF NOT EXISTS idx_transfer_events_unique_id_ts ON transfer_events(unique_id, event_ts);
+            CREATE INDEX IF NOT EXISTS idx_transfer_events_status_ts ON transfer_events(status, event_ts);
+            CREATE INDEX IF NOT EXISTS idx_discovery_events_unique_id_ts ON discovery_events(unique_id, event_ts);
             """
         )
         # Lightweight migration path for older DB files.
@@ -143,6 +157,14 @@ def init_db(db_path: Path) -> None:
                 conn.execute(f"ALTER TABLE devices ADD COLUMN {col_def}")
             except sqlite3.OperationalError:
                 pass
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            ("db_schema_version", DB_SCHEMA_VERSION),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            ("last_migrated_at", _now_iso()),
+        )
 
 
 def _now_iso() -> str:
@@ -509,3 +531,32 @@ def list_active_transfers(db_path: Path) -> list[dict[str, str]]:
             }
         )
     return out
+
+
+def get_db_schema_info(db_path: Path) -> dict[str, str]:
+    info: dict[str, str] = {
+        "db_exists": "0",
+        "schema_version": "",
+        "table_count": "0",
+        "index_count": "0",
+        "path": str(db_path),
+    }
+    if not db_path.exists():
+        return info
+
+    info["db_exists"] = "1"
+    try:
+        with _connect(db_path) as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
+            info["table_count"] = str(int(cur.fetchone()[0] or 0))
+            cur = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='index'")
+            info["index_count"] = str(int(cur.fetchone()[0] or 0))
+            cur = conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'db_schema_version' LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                info["schema_version"] = str(row[0])
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = str(exc)
+    return info

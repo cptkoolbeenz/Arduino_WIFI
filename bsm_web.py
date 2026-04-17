@@ -35,6 +35,8 @@ from bsm_network.config import (
     parse_args,
 )
 from bsm_network.db import (
+    get_db_schema_info,
+    init_db,
     is_transfer_active,
     list_active_transfers,
     log_transfer_event,
@@ -3070,8 +3072,24 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     host = DEFAULT_WEB_HOST
     port = DEFAULT_WEB_PORT
+    db_path = Path(DEFAULT_DB_PATH).expanduser()
+    try:
+        init_db(db_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: DB init failed for '{db_path}': {exc}")
+    schema_info = get_db_schema_info(db_path)
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"{WEB_APP_NAME} web control ready: http://{host}:{port}")
+    print(
+        "DB schema: "
+        f"path={schema_info.get('path', str(db_path))} "
+        f"exists={schema_info.get('db_exists', '0')} "
+        f"version={schema_info.get('schema_version', '') or 'unknown'} "
+        f"tables={schema_info.get('table_count', '0')} "
+        f"indexes={schema_info.get('index_count', '0')}"
+    )
+    if schema_info.get("error"):
+        print(f"Warning: DB schema inspection error: {schema_info.get('error')}")
     print(
         "Startup config: "
         f"profile={ACTIVE_NETWORK_PROFILE} "

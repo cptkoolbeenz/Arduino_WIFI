@@ -189,7 +189,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--network-map",
         default=DEFAULT_NETWORK_MAP,
-        help="Optional JSON config for AP/burrow mapping (supports keys: device_to_ap, device_to_burrow, ap_limits, default_ap)",
+        help="Optional JSON config for AP mapping (supports keys: device_to_ap, ap_limits, default_ap)",
     )
     parser.add_argument(
         "--runtime-ap-map",
