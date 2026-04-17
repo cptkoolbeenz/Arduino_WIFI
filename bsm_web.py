@@ -69,13 +69,18 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_WIFI"
-WEB_APP_VERSION = "1.0"
+WEB_APP_VERSION = "2.0"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 3000
 UI_POLL_DEVICES_MS = 3000
 UI_POLL_ACTIVITY_MS = 2000
 UI_POLL_PYTHON_LOG_MS = 2000
 UI_POLL_UPLOAD_PROGRESS_MS = 500
+WEB_POLL_NOW_DISCOVER_TIMEOUT_S = "8"
+WEB_POLL_NOW_DISCOVER_ATTEMPTS = "4"
+WEB_POLL_NOW_DISCOVER_INTERVAL_S = "0.25"
+WEB_POLL_NOW_DOWNLOAD_LINES = "0"
+WEB_POLL_NOW_DOWNLOAD_TIMEOUT_S = "0"
 
 
 def get_last_set_time_state() -> tuple[float, str]:
@@ -139,6 +144,12 @@ def _infer_bind_ip_for_prefix(prefix3: str) -> str:
 
 def build_dynamic_poll_now_args() -> tuple[list[str], str]:
     args_list = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
+    args_list = _set_or_append_flag(args_list, "--discover-timeout", WEB_POLL_NOW_DISCOVER_TIMEOUT_S)
+    args_list = _set_or_append_flag(args_list, "--discover-attempts", WEB_POLL_NOW_DISCOVER_ATTEMPTS)
+    args_list = _set_or_append_flag(args_list, "--discover-interval", WEB_POLL_NOW_DISCOVER_INTERVAL_S)
+    args_list = _set_or_append_flag(args_list, "--download-lines", WEB_POLL_NOW_DOWNLOAD_LINES)
+    args_list = _set_or_append_flag(args_list, "--download-timeout", WEB_POLL_NOW_DOWNLOAD_TIMEOUT_S)
+
     rows = read_devices_rows(Path("data/discovered_devices.csv"))
     prefixes: dict[str, int] = {}
     for row in rows:
@@ -152,7 +163,12 @@ def build_dynamic_poll_now_args() -> tuple[list[str], str]:
         prefixes[prefix3] = prefixes.get(prefix3, 0) + 1
 
     if not prefixes:
-        return args_list, "poll-now auto network: no known device subnet; using profile defaults"
+        return (
+            args_list,
+            "poll-now auto network: no known device subnet; using profile defaults "
+            f"(fast mode: timeout={WEB_POLL_NOW_DISCOVER_TIMEOUT_S}s attempts={WEB_POLL_NOW_DISCOVER_ATTEMPTS} "
+            f"interval={WEB_POLL_NOW_DISCOVER_INTERVAL_S}s download_lines={WEB_POLL_NOW_DOWNLOAD_LINES})",
+        )
 
     chosen_prefix = sorted(prefixes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
     discover_ip = f"{chosen_prefix}.255"
@@ -160,7 +176,9 @@ def build_dynamic_poll_now_args() -> tuple[list[str], str]:
     args_list = _set_or_append_flag(args_list, "--discover-ip", discover_ip)
     args_list = _set_or_append_flag(args_list, "--bind", bind_ip)
     note = (
-        f"poll-now auto network: subnet={chosen_prefix}.0/24 discover-ip={discover_ip} bind={bind_ip}"
+        f"poll-now auto network: subnet={chosen_prefix}.0/24 discover-ip={discover_ip} bind={bind_ip} "
+        f"(fast mode: timeout={WEB_POLL_NOW_DISCOVER_TIMEOUT_S}s attempts={WEB_POLL_NOW_DISCOVER_ATTEMPTS} "
+        f"interval={WEB_POLL_NOW_DISCOVER_INTERVAL_S}s download_lines={WEB_POLL_NOW_DOWNLOAD_LINES})"
     )
     return args_list, note
 
@@ -1769,9 +1787,31 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     }});
     if (deleteForm) {{
       deleteForm.addEventListener("submit", (ev) => {{
+        ev.preventDefault();
         const name = (selectedName && selectedName.value) ? selectedName.value : "this file";
         const ok = window.confirm("Delete local uploaded file '" + name + "'?");
-        if (!ok) ev.preventDefault();
+        if (!ok) return;
+        if (deleteOverlay) deleteOverlay.style.display = "flex";
+        if (deleteProgressText) {{
+          deleteProgressText.textContent = "Deleting " + name + ". Please wait.";
+        }}
+        const params = new URLSearchParams(new FormData(deleteForm));
+        fetch(deleteForm.action, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }},
+          body: params.toString(),
+          cache: "no-store",
+        }})
+          .then((resp) => resp.text())
+          .then((htmlText) => {{
+            document.open();
+            document.write(htmlText);
+            document.close();
+          }})
+          .catch((_err) => {{
+            if (deleteOverlay) deleteOverlay.style.display = "none";
+            window.alert("Delete request failed before completion. Check activity log.");
+          }});
       }});
     }}
     async function refreshPythonLog() {{
