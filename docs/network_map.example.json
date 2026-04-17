@@ -1,0 +1,18 @@
+{
+  "default_ap": "AP_HOME",
+  "ap_limits": {
+    "AP_HOME": 2,
+    "AP_FIELD_A": 2,
+    "AP_FIELD_B": 2,
+    "AP_FIELD_C": 2,
+    "DEFAULT": 1
+  },
+  "device_to_ap": {
+    "31011F0B383136326B7F33354B573355": "AP_HOME",
+    "36090B1136313332AEEC33334B572F29": "AP_HOME"
+  },
+  "device_to_burrow": {
+    "31011F0B383136326B7F33354B573355": "BURROW_01",
+    "36090B1136313332AEEC33334B572F29": "BURROW_02"
+  }
+}

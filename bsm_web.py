@@ -752,6 +752,7 @@ def read_today_uploads_status(db_path: Path) -> str:
                   COALESCE(d.short_uid, ''),
                   COALESCE(t.network_uid, ''),
                   COALESCE(t.source_filename, ''),
+                  COALESCE(t.saved_path, ''),
                   COALESCE(t.event_ts, ''),
                   CASE
                     WHEN t.duration_s IS NULL THEN ''
@@ -776,12 +777,19 @@ def read_today_uploads_status(db_path: Path) -> str:
         return "(No files uploaded today)"
 
     lines = []
-    lines.append("burrow_id      short_uid  network_uid       filename                uploaded_at           duration_min")
-    lines.append("------------   --------   ---------------   ----------------------  -------------------   ------------")
-    for burrow_id, short_uid, network_uid, filename, uploaded_at, duration_s in rows:
+    lines.append("burrow_id      short_uid  network_uid       filename                file_size_mb  uploaded_at           duration_min")
+    lines.append("------------   --------   ---------------   ----------------------  ------------  -------------------   ------------")
+    for burrow_id, short_uid, network_uid, filename, saved_path, uploaded_at, duration_s in rows:
+        size_mb_str = ""
+        try:
+            p = Path(str(saved_path or "")).expanduser()
+            if p.exists() and p.is_file():
+                size_mb_str = f"{(p.stat().st_size / (1024.0 * 1024.0)):.3f}"
+        except Exception:
+            size_mb_str = ""
         lines.append(
             f"{str(burrow_id):<12}   {str(short_uid):<8}   {str(network_uid):<15}   "
-            f"{str(filename):<22}  {str(uploaded_at):<19}   {str(duration_s):<10}"
+            f"{str(filename):<22}  {size_mb_str:<12}  {str(uploaded_at):<19}   {str(duration_s):<10}"
         )
     return "\n".join(lines)
 
