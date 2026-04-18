@@ -60,6 +60,16 @@ from bsm_network.protocol import (
     transfer_file_protocol,
 )
 from bsm_network.records import build_local_filename, ensure_unique_filename
+from bsm_web_ui.components import (
+    PageContext,
+    _render_action_form,
+    _render_controls_row,
+    _render_known_arduinos_selector,
+    _render_scrollbox,
+    _render_section_title,
+    _render_shared_page,
+    _render_titled_scroll_panel,
+)
 
 DISCOVER_CONTROL_PORT = DEFAULT_DISCOVER_PORT
 WEB_SET_TIME_OFFSET_HOURS = -4.0
@@ -1481,77 +1491,10 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
 def render_page(message: str = "") -> bytes:
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
-    msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
-    page = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{WEB_APP_NAME}</title>
-  <style>
-    :root {{
-      --bg: #f2f4f7;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --line: #c7d2de;
-      --primary: #0b5ea8;
-      --accent: #e7f1fb;
-    }}
-    body {{
-      margin: 0;
-      background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%);
-      color: var(--text);
-      font-family: "Avenir Next", "Trebuchet MS", sans-serif;
-    }}
-    .shell {{
-      max-width: 1180px;
-      margin: 1.25rem auto;
-      padding: 0 1rem;
-    }}
-    .panel {{
-      border: 1px solid var(--line);
-      background: var(--panel);
-      border-radius: 6px;
-      padding: 1rem;
-      box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08);
-    }}
-    .title {{
-      margin: 0 0 0.75rem 0;
-      color: #0b2d4b;
-      letter-spacing: 0.02em;
-    }}
-    .status {{
-      margin: 0 0 0.75rem 0;
-      font-weight: 600;
-    }}
-    .controls {{
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-      margin-bottom: 0.75rem;
-    }}
-    form {{ margin: 0; }}
-    button {{
-      border: 1px solid #2b6cb0;
-      background: var(--primary);
-      color: white;
-      border-radius: 6px;
-      padding: 0.55rem 0.9rem;
-      font-size: 0.95rem;
-      cursor: pointer;
-    }}
-    .placeholder-btn {{
-      background: var(--accent);
-      color: #0b2d4b;
-      border-color: #8db4da;
-    }}
-    .section-title {{
-      margin: 0.9rem 0 0.4rem 0;
-      font-size: 0.95rem;
-      color: #304a64;
-      font-weight: 700;
-    }}
-    .warn-banner {{
+    ctx = PageContext(page_title=WEB_APP_NAME, state=state, message=message)
+    extra_css = """
+    .placeholder-btn { background: var(--accent); color: #0b2d4b; border-color: #8db4da; }
+    .warn-banner {
       margin: 0.65rem 0 0.5rem 0;
       padding: 0.55rem 0.7rem;
       border: 1px solid #d97706;
@@ -1560,80 +1503,39 @@ def render_page(message: str = "") -> bytes:
       color: #7c2d12;
       font-size: 0.88rem;
       display: none;
-    }}
-    .scrollbox {{
-      border: 1px solid var(--line);
-      background: #fbfdff;
-      border-radius: 6px;
-      height: 260px;
-      overflow: auto;
-      padding: 0.65rem;
-      white-space: pre;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.84rem;
-      line-height: 1.35;
-    }}
-    .known-arduino-box {{
-      height: 320px;
-    }}
-    #healthbox {{
-      height: 5.2em;
-    }}
-    .nav-buttons {{
-      margin-top: 0.9rem;
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }}
-    #activitybox {{
-      margin-top: 0.8rem;
-    }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-  <div class="panel">
-    <h2 class="title">{WEB_APP_HEADER}</h2>
-    <div class="status">Status: <strong>{html.escape(state)}</strong></div>
-    <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
-    {msg_html}
-    <div class="controls">
-      <form method="post" action="/start">
-        <button type="submit">Normal Ops</button>
-      </form>
-      <form method="post" action="/stop">
-        <button type="submit">Stop Normal Ops</button>
-      </form>
-      <form method="post" action="/poll-now">
-        <button type="submit">Poll Now</button>
-      </form>
-    </div>
+    }
+    #healthbox { height: 5.2em; }
+    .nav-buttons { margin-top: 0.9rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    #activitybox { margin-top: 0.8rem; }
+    """
+    body_html = f"""
+      {_render_controls_row([
+          _render_action_form(action="/start", label="Normal Ops", method="post"),
+          _render_action_form(action="/stop", label="Stop Normal Ops", method="post"),
+          _render_action_form(action="/poll-now", label="Poll Now", method="post"),
+      ])}
 
-    <div class="section-title">Known Arduinos</div>
-    <div id="mismatch-banner" class="warn-banner"></div>
-    <div id="devicebox" class="scrollbox known-arduino-box">Loading Arduino status...</div>
+      {_render_section_title("Known Arduinos")}
+      <div id="mismatch-banner" class="warn-banner"></div>
+      {_render_scrollbox("devicebox", "Loading Arduino status...", "known-arduino-box")}
 
-    <div class="section-title">Uploads Today</div>
-    <div id="uploadsbox" class="scrollbox">Loading uploaded-file list...</div>
+      {_render_titled_scroll_panel("Uploads Today", "uploadsbox", "Loading uploaded-file list...")}
 
-    <div class="nav-buttons">
-      <form method="get" action="/file-transfers">
-        <button type="submit" class="placeholder-btn">File Transfers</button>
-      </form>
-      <form method="get" action="/maintenance">
-        <button type="submit" class="placeholder-btn">Maintenance</button>
-      </form>
-      <button type="button" class="placeholder-btn">Other</button>
-    </div>
+      <div class="nav-buttons">
+        <form method="get" action="/file-transfers">
+          <button type="submit" class="placeholder-btn">File Transfers</button>
+        </form>
+        <form method="get" action="/maintenance">
+          <button type="submit" class="placeholder-btn">Maintenance</button>
+        </form>
+        <button type="button" class="placeholder-btn">Other</button>
+      </div>
 
-    <div class="section-title">Health</div>
-    <div id="healthbox" class="scrollbox">Loading health status...</div>
+      {_render_titled_scroll_panel("Health", "healthbox", "Loading health status...")}
 
-    <div class="section-title">Activity Log</div>
-    <div id="activitybox" class="scrollbox">Loading activity output...</div>
-  </div>
-  </div>
-  <script>
+      {_render_titled_scroll_panel("Activity Log", "activitybox", "Loading activity output...")}
+"""
+    script_js = f"""
     const devicebox = document.getElementById("devicebox");
     const healthbox = document.getElementById("healthbox");
     const uploadsbox = document.getElementById("uploadsbox");
@@ -1735,17 +1637,22 @@ def render_page(message: str = "") -> bytes:
     if (!document.hidden) {{
       startPolling();
     }}
-  </script>
-</body>
-</html>
 """
-    return page.encode("utf-8")
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+        script_js=script_js,
+    )
 
 
 def render_file_transfers_page(message: str = "", selected_uid: str = "") -> bytes:
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
-    msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
+    ctx = PageContext(page_title=f"{WEB_APP_NAME} - File Transfers", state=state, message=message, subtitle="File Transfers")
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
 
@@ -1802,50 +1709,23 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         history_text = "Loading SQLite history..."
 
     files_title_suffix = selected_short if selected_short else "..."
-    page = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{WEB_APP_NAME} - File Transfers</title>
-  <style>
-    :root {{
-      --bg: #f2f4f7;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --line: #c7d2de;
-      --primary: #0b5ea8;
-      --accent: #e7f1fb;
-    }}
-    body {{ margin: 0; background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%); color: var(--text); font-family: "Avenir Next", "Trebuchet MS", sans-serif; }}
-    .shell {{ max-width: 1180px; margin: 1.25rem auto; padding: 0 1rem; }}
-    .panel {{ border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 1rem; box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08); }}
-    .title {{ margin: 0; color: #0b2d4b; letter-spacing: 0.02em; }}
-    .subtitle {{ margin: 0.25rem 0 0.8rem 0; color: #304a64; font-weight: 700; }}
-    .status {{ margin: 0 0 0.75rem 0; font-weight: 600; }}
-    .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
-    form {{ margin: 0; }}
-    button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
-    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
-    .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
-    .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
-    .known-arduino-box {{ height: 320px; }}
-    .device-head, .device-sep {{ white-space: pre; }}
-    .device-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
-    .device-row:hover {{ background: #eef5ff; }}
-    .device-row.selected {{ background: #d7e9ff; font-weight: 700; }}
-    .sd-head, .sd-sep {{ white-space: pre; }}
-    .sd-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
-    .sd-row:hover {{ background: #eef5ff; }}
-    .sd-row.selected {{ background: #c8f7d1; font-weight: 700; }}
-    .upload-head, .upload-sep {{ white-space: pre; }}
-    .upload-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
-    .upload-row:hover {{ background: #eef5ff; }}
-    .upload-row.selected {{ background: #ffe1ba; font-weight: 700; }}
-    .grid2 {{ margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
-    .list-actions {{ display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }}
-    .delete-btn {{ background: #c53030; border-color: #9b2c2c; }}
-    .progress-overlay {{
+    extra_css = """
+    .device-head, .device-sep { white-space: pre; }
+    .device-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .device-row:hover { background: #eef5ff; }
+    .device-row.selected { background: #d7e9ff; font-weight: 700; }
+    .sd-head, .sd-sep { white-space: pre; }
+    .sd-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .sd-row:hover { background: #eef5ff; }
+    .sd-row.selected { background: #c8f7d1; font-weight: 700; }
+    .upload-head, .upload-sep { white-space: pre; }
+    .upload-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .upload-row:hover { background: #eef5ff; }
+    .upload-row.selected { background: #ffe1ba; font-weight: 700; }
+    .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
+    .list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }
+    .delete-btn { background: #c53030; border-color: #9b2c2c; }
+    .progress-overlay {
       position: fixed;
       inset: 0;
       background: rgba(13, 29, 47, 0.35);
@@ -1853,8 +1733,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       align-items: center;
       justify-content: center;
       z-index: 9999;
-    }}
-    .progress-card {{
+    }
+    .progress-card {
       background: #ffffff;
       border: 1px solid #9cb2c9;
       border-radius: 8px;
@@ -1864,58 +1744,57 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       text-align: center;
       font-weight: 700;
       color: #1f2937;
-    }}
-    .busy-note {{
+    }
+    .busy-note {
       margin: 0.3rem 0 0.8rem 0;
       border: 1px solid #e5b97a;
       background: #fff4dd;
       border-radius: 6px;
       padding: 0.5rem;
-    }}
-    .busy-note pre {{
+    }
+    .busy-note pre {
       margin: 0;
       white-space: pre;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 0.82rem;
       line-height: 1.3;
       color: #6e4b00;
-    }}
-    @media (max-width: 900px) {{ .grid2 {{ grid-template-columns: 1fr; }} }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <div class="panel">
-      <h2 class="title">{WEB_APP_HEADER}</h2>
-      <div class="subtitle">File Transfers</div>
-      <div class="status">Status: <strong>{html.escape(state)}</strong></div>
-      <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
-      {msg_html}
-      <div class="controls">
-        <form method="get" action="/"><button type="submit">Dashboard</button></form>
-        <form method="get" action="/file-transfers">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <button type="submit">Wait/Refresh</button>
-        </form>
-        <form method="post" action="/file-transfers-stop-safe">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <button type="submit">Stop Normal Ops Safely</button>
-        </form>
-      </div>
+    }
+    @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+    """
+    body_html = f"""
+      {_render_controls_row([
+          _render_action_form(action="/", label="Dashboard", method="get"),
+          _render_action_form(
+              action="/file-transfers",
+              label="Wait/Refresh",
+              method="get",
+              hidden_fields=[("uid", selected_uid)],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+          ),
+          _render_action_form(
+              action="/file-transfers-stop-safe",
+              label="Stop Normal Ops Safely",
+              method="post",
+              hidden_fields=[("uid", selected_uid)],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+          ),
+      ])}
       {busy_note_html}
 
-      <div class="section-title">Known Arduinos (select one)</div>
-      <form method="get" action="/file-transfers">
-        <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-        <div class="scrollbox known-arduino-box">{device_rows_html_block}</div>
-        <div style="margin-top:0.5rem;">
-          <button type="submit" class="needs-device">Load File Lists</button>
-        </div>
-      </form>
+      {_render_known_arduinos_selector(
+          action="/file-transfers",
+          selected_uid=selected_uid,
+          device_rows_html_block=device_rows_html_block,
+          button_label="Load File Lists",
+          show_button=False,
+      )}
 
       <div class="grid2">
         <div>
-          <div class="section-title">Files on {html.escape(files_title_suffix)}</div>
+          <div class="section-title" id="files-on-title">{html.escape(f"Files on {files_title_suffix}")}</div>
           <div class="list-actions">
             <form method="post" action="/file-transfers-upload-selected" id="sd-upload-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -1929,10 +1808,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               <button type="submit" class="delete-btn" id="sd-delete-button">Delete on SD</button>
             </form>
           </div>
-          <div class="scrollbox" id="sd-list-box">{html.escape(remote_note)}</div>
+          {_render_scrollbox("sd-list-box", remote_note)}
         </div>
         <div>
-          <div class="section-title">Files uploaded from {html.escape(files_title_suffix)}</div>
+          <div class="section-title" id="files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
           <div class="list-actions">
             <form method="post" action="/file-transfers-delete-uploaded" id="uploaded-delete-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -1941,24 +1820,22 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               <button type="submit" class="delete-btn" id="uploaded-delete-button">Delete</button>
             </form>
           </div>
-          <div class="scrollbox" id="uploaded-list-box">{html.escape(uploaded_note)}</div>
+          {_render_scrollbox("uploaded-list-box", uploaded_note)}
         </div>
       </div>
 
-      <div class="section-title">Complete SQLite History for {html.escape(files_title_suffix)}</div>
-      <div class="scrollbox" id="history-box">{html.escape(history_text)}</div>
+      {_render_titled_scroll_panel(f"Complete SQLite History for {files_title_suffix}", "history-box", history_text)}
 
-      <div class="section-title">Python Log</div>
-      <div id="pythonlogbox" class="scrollbox">Loading python log...</div>
-    </div>
-  </div>
-<div id="upload-progress-overlay" class="progress-overlay">
-  <div class="progress-card" id="upload-progress-text">Uploading selected file... Please wait.</div>
-</div>
-<div id="delete-progress-overlay" class="progress-overlay">
-  <div class="progress-card" id="delete-progress-text">Deleting selected file... Please wait.</div>
-</div>
-<script>
+      {_render_titled_scroll_panel("Python Log", "pythonlogbox", "Loading python log...")}
+
+      <div id="upload-progress-overlay" class="progress-overlay">
+        <div class="progress-card" id="upload-progress-text">Uploading selected file... Please wait.</div>
+      </div>
+      <div id="delete-progress-overlay" class="progress-overlay">
+        <div class="progress-card" id="delete-progress-text">Deleting selected file... Please wait.</div>
+      </div>
+"""
+    script_js = f"""
   (function() {{
     const rows = Array.from(document.querySelectorAll(".device-row"));
     const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
@@ -1982,6 +1859,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const selectedPath = document.getElementById("uploaded-selected-path");
     const selectedName = document.getElementById("uploaded-selected-name");
     const pythonLogBox = document.getElementById("pythonlogbox");
+    const filesOnTitle = document.getElementById("files-on-title");
+    const filesUploadedTitle = document.getElementById("files-uploaded-title");
     let pythonLogTimer = null;
     function getSelectedUid() {{
       for (const f of uidFields) {{
@@ -2008,11 +1887,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
     }}
     function setSelectedUid(uid, triggerLoad = true) {{
+      let selectedShort = "...";
       uidFields.forEach((f) => {{ f.value = uid; }});
       rows.forEach((r) => {{
-        if (r.dataset.uid === uid) r.classList.add("selected");
-        else r.classList.remove("selected");
+        if (r.dataset.uid === uid) {{
+          r.classList.add("selected");
+          selectedShort = (r.dataset.short || "").trim() || "...";
+        }} else r.classList.remove("selected");
       }});
+      if (filesOnTitle) filesOnTitle.textContent = "Files on " + selectedShort;
+      if (filesUploadedTitle) filesUploadedTitle.textContent = "Files uploaded from " + selectedShort;
       if (sdSelectedName) sdSelectedName.value = "";
       if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
       if (selectedPath) selectedPath.value = "";
@@ -2327,11 +2211,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     bindUploadedRows();
     updateActionButtons();
   }})();
-</script>
-</body>
-</html>
 """
-    return page.encode("utf-8")
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+        script_js=script_js,
+    )
 
 
 def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dict[str, str] | None:
@@ -2342,7 +2231,7 @@ def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dic
 
 
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str]] = []
     mismatches: list[str] = []
     for d in devices:
         uid = (d.get("unique_id", "") or "").strip()
@@ -2368,7 +2257,7 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             f"{status:<6}   {burrow:<12}   {short_uid:<8}   {fw_ver:<6}   "
             f"{ap_id:<9}   {net_uid:<15}   {ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}"
         )
-        rows.append((uid, line))
+        rows.append((uid, short_uid, line))
     if not rows:
         return '<div style="font-style:italic;">No devices discovered yet.</div>'
 
@@ -2381,10 +2270,10 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         )
     out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       device_ip      recv_ip        last_seen             unique_id</div>')
     out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   -----------   -----------    -------------------   ------------------------------------</div>')
-    for uid, line in rows:
+    for uid, short_uid, line in rows:
         selected_cls = " selected" if uid == selected_uid else ""
         out.append(
-            f'<div class="device-row{selected_cls}" data-uid="{html.escape(uid)}">{html.escape(line)}</div>'
+            f'<div class="device-row{selected_cls}" data-uid="{html.escape(uid)}" data-short="{html.escape(short_uid)}">{html.escape(line)}</div>'
         )
     return "".join(out)
 
@@ -2506,7 +2395,7 @@ def _mini_panel_block(header: str, separator: str, values: str) -> str:
 def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_input: str | None = None) -> bytes:
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
-    msg_html = f"<p><strong>{html.escape(message)}</strong></p>" if message else ""
+    ctx = PageContext(page_title=f"{WEB_APP_NAME} - Maintenance", state=state, message=message, subtitle="Maintenance")
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
     selected_device = _find_device_by_uid(devices, selected_uid)
@@ -2534,63 +2423,28 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
         }
     device_rows_html_block = _build_device_select_rows(devices, selected_uid)
 
-    page = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{WEB_APP_NAME} - Maintenance</title>
-  <style>
-    :root {{
-      --bg: #f2f4f7;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --line: #c7d2de;
-      --primary: #0b5ea8;
-    }}
-    body {{ margin: 0; background: linear-gradient(180deg, #f7fafc 0%, var(--bg) 100%); color: var(--text); font-family: "Avenir Next", "Trebuchet MS", sans-serif; }}
-    .shell {{ max-width: 1180px; margin: 1.25rem auto; padding: 0 1rem; }}
-    .panel {{ border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 1rem; box-shadow: 0 6px 20px rgba(23, 43, 77, 0.08); }}
-    .title {{ margin: 0; color: #0b2d4b; letter-spacing: 0.02em; }}
-    .subtitle {{ margin: 0.25rem 0 0.8rem 0; color: #304a64; font-weight: 700; }}
-    .status {{ margin: 0 0 0.75rem 0; font-weight: 600; }}
-    .controls {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }}
-    form {{ margin: 0; }}
-    button {{ border: 1px solid #2b6cb0; background: var(--primary); color: white; border-radius: 6px; padding: 0.55rem 0.9rem; font-size: 0.95rem; cursor: pointer; }}
-    .section-title {{ margin: 0.9rem 0 0.4rem 0; font-size: 0.95rem; color: #304a64; font-weight: 700; }}
-    .scrollbox {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 260px; overflow: auto; padding: 0.65rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.35; }}
-    .known-arduino-box {{ height: 320px; }}
-    .device-head, .device-sep {{ white-space: pre; }}
-    .device-row {{ white-space: pre; cursor: pointer; border-radius: 4px; }}
-    .device-row:hover {{ background: #eef5ff; }}
-    .device-row.selected {{ background: #d7e9ff; font-weight: 700; }}
-    .mini-grid {{ margin-top: 0.9rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }}
-    .mini-title {{ margin: 0 0 0.25rem 0; font-size: 0.9rem; color: #304a64; font-weight: 700; }}
-    .mini-box {{ border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }}
-    @media (max-width: 900px) {{ .mini-grid {{ grid-template-columns: 1fr; }} }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <div class="panel">
-      <h2 class="title">{WEB_APP_HEADER}</h2>
-      <div class="subtitle">Maintenance</div>
-      <div class="status">Status: <strong>{html.escape(state)}</strong></div>
-      <div class="status">Profile: <strong>{html.escape(ACTIVE_NETWORK_PROFILE)}</strong> ({html.escape(ACTIVE_NETWORK_PROFILE_SOURCE)})</div>
-      {msg_html}
+    extra_css = """
+    .device-head, .device-sep { white-space: pre; }
+    .device-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .device-row:hover { background: #eef5ff; }
+    .device-row.selected { background: #d7e9ff; font-weight: 700; }
+    .mini-grid { margin-top: 0.9rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
+    .mini-title { margin: 0 0 0.25rem 0; font-size: 0.9rem; color: #304a64; font-weight: 700; }
+    .mini-box { border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }
+    @media (max-width: 900px) { .mini-grid { grid-template-columns: 1fr; } }
+    """
+    body_html = f"""
+      {_render_controls_row([
+          _render_action_form(action="/", label="Dashboard", method="get"),
+      ])}
 
-      <div class="controls">
-        <form method="get" action="/"><button type="submit">Dashboard</button></form>
-      </div>
-
-      <div class="section-title">Known Arduinos (select one)</div>
-      <form method="get" action="/maintenance">
-        <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-        <div class="scrollbox known-arduino-box">{device_rows_html_block}</div>
-        <div class="controls" style="margin-top:0.5rem;">
-          <button type="submit" class="needs-device">Load Maintenance Info</button>
-        </div>
-      </form>
+      {_render_known_arduinos_selector(
+          action="/maintenance",
+          selected_uid=selected_uid,
+          device_rows_html_block=device_rows_html_block,
+          button_label="Load Maintenance Info",
+          show_button=False,
+      )}
       <form method="post" action="/maintenance-burrow">
         <div class="controls" style="margin-top:0.5rem;">
           <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -2601,30 +2455,46 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
         </div>
       </form>
 
-      <div class="controls" style="margin-top:0.8rem;">
-        <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <input type="hidden" name="action" value="get-time" />
-          <button type="submit" class="needs-device">Get RTC Time</button>
-        </form>
-        <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <input type="hidden" name="action" value="set-time" />
-          <button type="submit" class="needs-device">Set RTC Time</button>
-        </form>
-        <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <input type="hidden" name="action" value="ping" />
-          <button type="submit" class="needs-device">Ping</button>
-        </form>
-        <form method="post" action="/maintenance-action">
-          <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-          <input type="hidden" name="action" value="reboot" />
-          <button type="submit" class="needs-device">Reboot</button>
-        </form>
-      </div>
+      {_render_controls_row([
+          _render_action_form(
+              action="/maintenance-action",
+              label="Get RTC Time",
+              method="post",
+              hidden_fields=[("uid", selected_uid), ("action", "get-time")],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+              button_class="needs-device",
+          ),
+          _render_action_form(
+              action="/maintenance-action",
+              label="Set RTC Time",
+              method="post",
+              hidden_fields=[("uid", selected_uid), ("action", "set-time")],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+              button_class="needs-device",
+          ),
+          _render_action_form(
+              action="/maintenance-action",
+              label="Ping",
+              method="post",
+              hidden_fields=[("uid", selected_uid), ("action", "ping")],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+              button_class="needs-device",
+          ),
+          _render_action_form(
+              action="/maintenance-action",
+              label="Reboot",
+              method="post",
+              hidden_fields=[("uid", selected_uid), ("action", "reboot")],
+              hidden_input_class="selected-uid-field",
+              hidden_class_names={"uid"},
+              button_class="needs-device",
+          ),
+      ], extra_style="margin-top:0.8rem;")}
 
-      <div class="section-title">Maintenance Info for {html.escape(selected_short)}</div>
+      <div class="section-title" id="maintenance-info-title">{html.escape(f"Maintenance Info for {selected_short}")}</div>
       <div class="mini-grid">
         <div>
           <div class="mini-title">RTC Time</div>
@@ -2643,9 +2513,8 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
           <div class="mini-box" id="panel-diagnostics">{html.escape(panel_placeholders["Diagnostics"])}</div>
         </div>
       </div>
-    </div>
-  </div>
-<script>
+"""
+    script_js = f"""
   (function() {{
     const rows = Array.from(document.querySelectorAll(".device-row"));
     const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
@@ -2654,6 +2523,7 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     const panelStatus = document.getElementById("panel-status");
     const panelConfig = document.getElementById("panel-config");
     const panelDiagnostics = document.getElementById("panel-diagnostics");
+    const maintenanceInfoTitle = document.getElementById("maintenance-info-title");
     function getSelectedUid() {{
       for (const f of uidFields) {{
         const v = (f.value || "").trim();
@@ -2701,11 +2571,15 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
       }});
     }}
     function setSelectedUid(uid, triggerLoad = true) {{
+      let selectedShort = "...";
       uidFields.forEach((f) => {{ f.value = uid; }});
       rows.forEach((r) => {{
-        if (r.dataset.uid === uid) r.classList.add("selected");
-        else r.classList.remove("selected");
+        if (r.dataset.uid === uid) {{
+          r.classList.add("selected");
+          selectedShort = (r.dataset.short || "").trim() || "...";
+        }} else r.classList.remove("selected");
       }});
+      if (maintenanceInfoTitle) maintenanceInfoTitle.textContent = "Maintenance Info for " + selectedShort;
       updateNeedsDeviceState();
       if (triggerLoad) {{
         loadMaintenancePanels(uid);
@@ -2720,11 +2594,16 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     }}
     updateNeedsDeviceState();
   }})();
-</script>
-</body>
-</html>
 """
-    return page.encode("utf-8")
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+        script_js=script_js,
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2760,40 +2639,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self._safe_write(raw)
 
-    def do_GET(self) -> None:  # noqa: N802
-        try:
-            self._do_GET_impl()
-        except Exception as exc:  # noqa: BLE001
-            cid = new_correlation_id("WEBGET")
-            msg = f"GET {self.path} failed: {exc} [cid={cid}]"
-            append_action_log("web-get-error", msg)
-            parsed = urlparse(self.path)
-            route = parsed.path
-            if route.startswith("/api/") or route in {"/upload-progress", "/health"}:
-                self._send_json({"ok": False, "error": str(exc), "cid": cid}, HTTPStatus.INTERNAL_SERVER_ERROR)
-                return
-            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    def do_POST(self) -> None:  # noqa: N802
-        try:
-            self._do_POST_impl()
-        except Exception as exc:  # noqa: BLE001
-            cid = new_correlation_id("WEBPOST")
-            msg = f"POST {self.path} failed: {exc} [cid={cid}]"
-            append_action_log("web-post-error", msg)
-            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    def _do_GET_impl(self) -> None:
-        parsed = urlparse(self.path)
-        route = parsed.path
-        query = parse_qs(parsed.query, keep_blank_values=True)
-
+    def _handle_get_monitor_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         if route == "/health":
             self._send_json(get_health_payload())
-            return
+            return True
         if route == "/health-status":
             self._send_text(get_cached_text("health-status", ENDPOINT_CACHE_TTL_S, lambda: format_health_status_text(get_health_payload())))
-            return
+            return True
         if route == "/devices":
             self._send_text(
                 get_cached_text(
@@ -2802,7 +2654,7 @@ class Handler(BaseHTTPRequestHandler):
                     lambda: read_devices_status(Path("data/discovered_devices.csv")),
                 )
             )
-            return
+            return True
         if route == "/uploads-today":
             self._send_text(
                 get_cached_text(
@@ -2811,7 +2663,7 @@ class Handler(BaseHTTPRequestHandler):
                     lambda: read_today_uploads_status(Path(DEFAULT_DB_PATH)),
                 )
             )
-            return
+            return True
         if route == "/activity":
             self._send_text(
                 get_cached_text(
@@ -2820,7 +2672,7 @@ class Handler(BaseHTTPRequestHandler):
                     read_activity_status,
                 )
             )
-            return
+            return True
         if route == "/python-log":
             self._send_text(
                 get_cached_text(
@@ -2829,69 +2681,74 @@ class Handler(BaseHTTPRequestHandler):
                     read_python_log_status,
                 )
             )
-            return
+            return True
         if route == "/upload-progress":
             op = (query.get("op") or [""])[0].strip()
             self._send_json(get_upload_progress(op))
-            return
+            return True
+        return False
+
+    def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         if route == "/api/file-transfers/remote-files":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_file_transfers_remote_files_payload(selected_uid))
-            return
+            return True
         if route == "/api/file-transfers/uploaded-files":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_file_transfers_uploaded_files_payload(selected_uid))
-            return
+            return True
         if route == "/api/file-transfers/history":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_file_transfers_history_payload(selected_uid))
-            return
+            return True
         if route == "/api/maintenance/panels":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_maintenance_panels_payload(selected_uid))
-            return
+            return True
+        return False
+
+    def _handle_get_page_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
-            return
+            return True
         if route == "/file-transfers":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_html(render_file_transfers_page(selected_uid=selected_uid))
-            return
+            return True
         if route == "/maintenance":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_html(render_maintenance_page(selected_uid=selected_uid))
-            return
-        if route != "/":
-            self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
-            return
-        self._send_html(render_page())
+            return True
+        if route == "/":
+            self._send_html(render_page())
+            return True
+        return False
 
-    def _do_POST_impl(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
-        form = parse_qs(body, keep_blank_values=True)
-        invalidate_endpoint_cache()
+    def _handle_post_ops_routes(self, form: dict[str, list[str]]) -> bool:
         if self.path == "/start":
             msg = MANAGER.start()
             append_action_log("start", msg)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/stop":
             msg = MANAGER.stop()
             append_action_log("stop", msg)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/poll-now":
             msg = MANAGER.poll_now()
             append_action_log("poll-now", msg)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/file-transfers-stop-safe":
             selected_uid = (form.get("uid") or [""])[0].strip()
             msg = MANAGER.stop()
             append_action_log("stop-for-file-transfers", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-            return
+            return True
+        return False
+
+    def _handle_post_file_transfer_routes(self, form: dict[str, list[str]]) -> bool:
         if self.path == "/file-transfers-delete-uploaded":
             selected_uid = (form.get("uid") or [""])[0].strip()
             saved_path = (form.get("saved_path") or [""])[0].strip()
@@ -2903,7 +2760,7 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"Delete failed for '{source_filename}': {detail}"
             append_action_log("file-transfers-delete-uploaded", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-            return
+            return True
         if self.path == "/file-transfers-delete-sd":
             selected_uid = (form.get("uid") or [""])[0].strip()
             remote_filename = (form.get("remote_filename") or [""])[0].strip()
@@ -2911,20 +2768,20 @@ class Handler(BaseHTTPRequestHandler):
             selected_device = _find_device_by_uid(devices, selected_uid)
             if selected_device is None:
                 self._send_html(render_file_transfers_page(message="Select a known Arduino first.", selected_uid=selected_uid))
-                return
+                return True
             device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
             if not device_ip:
                 self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
-                return
+                return True
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
-                return
+                return True
             try:
                 if is_transfer_active(Path(DEFAULT_DB_PATH), selected_uid):
                     msg = "Delete on SD blocked: transfer is active for this Arduino."
                     append_action_log("file-transfers-delete-sd", msg)
                     self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                    return
+                    return True
             except Exception:
                 pass
             ok, detail = delete_remote_file(device_ip=device_ip, remote_filename=remote_filename, timeout_s=8.0)
@@ -2934,7 +2791,7 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"Delete on SD failed for '{remote_filename}': {detail}"
             append_action_log("file-transfers-delete-sd", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-            return
+            return True
         if self.path == "/file-transfers-upload-selected":
             selected_uid = (form.get("uid") or [""])[0].strip()
             remote_filename = (form.get("remote_filename") or [""])[0].strip()
@@ -2943,7 +2800,7 @@ class Handler(BaseHTTPRequestHandler):
             selected_device = _find_device_by_uid(devices, selected_uid)
             if selected_device is None:
                 self._send_html(render_file_transfers_page(message="Select a known Arduino first.", selected_uid=selected_uid))
-                return
+                return True
             device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
             short_uid = (selected_device.get("short_uid", "") or "").strip()
             network_uid = (selected_device.get("network_uid", "") or "").strip()
@@ -2951,15 +2808,15 @@ class Handler(BaseHTTPRequestHandler):
             ap_id = (selected_device.get("ap_id", "") or "").strip()
             if not device_ip:
                 self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
-                return
+                return True
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
-                return
+                return True
             running, _pid = MANAGER.status()
             if running:
                 msg = "Stop Normal Ops before uploading a selected SD file (port/bind conflict)."
                 self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                return
+                return True
             set_upload_progress(upload_op_id, 0, "upload starting", done=False, error=False)
 
             def _on_progress(pct: int, written: int, total: int, name: str) -> None:
@@ -2999,7 +2856,10 @@ class Handler(BaseHTTPRequestHandler):
             msg = detail
             append_action_log("file-transfers-upload-selected", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-            return
+            return True
+        return False
+
+    def _handle_post_maintenance_routes(self, form: dict[str, list[str]]) -> bool:
         if self.path == "/maintenance-action":
             selected_uid = (form.get("uid") or [""])[0].strip()
             action = (form.get("action") or [""])[0].strip()
@@ -3007,11 +2867,11 @@ class Handler(BaseHTTPRequestHandler):
             selected_device = _find_device_by_uid(devices, selected_uid)
             if selected_device is None:
                 self._send_html(render_maintenance_page(message="Select a known Arduino first.", selected_uid=selected_uid))
-                return
+                return True
             device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
             if not device_ip:
                 self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
-                return
+                return True
             if action == "get-time":
                 msg = run_maintenance_action_with_retry(
                     action="GET_TIME",
@@ -3020,7 +2880,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 append_action_log("maintenance-get-time", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
-                return
+                return True
             if action == "set-time":
                 msg = run_maintenance_action_with_retry(
                     action="SET_TIME",
@@ -3029,7 +2889,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 append_action_log("maintenance-set-time", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
-                return
+                return True
             if action == "ping":
                 msg = run_maintenance_action_with_retry(
                     action="PING",
@@ -3038,7 +2898,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 append_action_log("maintenance-ping", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
-                return
+                return True
             if action == "reboot":
                 msg = run_maintenance_action_with_retry(
                     action="REBOOT",
@@ -3047,68 +2907,71 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 append_action_log("maintenance-reboot", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
-                return
+                return True
             self._send_html(render_maintenance_page(message=f"Unknown maintenance action: {action}", selected_uid=selected_uid))
-            return
+            return True
         if self.path == "/maintenance-burrow":
             selected_uid = (form.get("uid") or [""])[0].strip()
             burrow_id = (form.get("burrow_id") or [""])[0].strip()
             mode = (form.get("mode") or ["save"])[0].strip().lower()
             if not selected_uid:
                 self._send_html(render_maintenance_page(message="Select a known Arduino first.", selected_uid=selected_uid))
-                return
+                return True
             if mode == "edit":
                 current = _current_burrow_for_uid(selected_uid)
                 msg = f"Loaded current Burrow_ID for {selected_uid}."
                 append_action_log("maintenance-edit-burrow", msg)
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid, burrow_input=current))
-                return
+                return True
             msg = assign_burrow_id_for_uid(unique_id=selected_uid, burrow_id=burrow_id)
             append_action_log("maintenance-save-burrow", msg)
             self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid, burrow_input=burrow_id))
-            return
+            return True
+        return False
+
+    def _handle_post_legacy_routes(self, form: dict[str, list[str]]) -> bool:
         if self.path == "/assign-burrow-id":
             short_uid = (form.get("short_uid") or [""])[0].strip().upper()
             burrow_id = (form.get("burrow_id") or [""])[0].strip()
             if not short_uid:
                 self._send_html(render_page("short_uid is required for burrow assignment."))
-                return
+                return True
             msg = assign_burrow_id(short_uid=short_uid, burrow_id=burrow_id)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/force-upload":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = MANAGER.start_force_upload(uid=uid, device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/query-time":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = query_device_time(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/set-time":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             preset = (form.get("tz_preset") or ["edt"])[0].strip().lower()
             if preset in TZ_PRESET_OFFSETS:
                 offset_hours = TZ_PRESET_OFFSETS[preset]
@@ -3119,80 +2982,80 @@ class Handler(BaseHTTPRequestHandler):
                     offset_hours = float(offset_raw)
                 except ValueError:
                     self._send_html(render_page(f"Invalid offset_hours value: {offset_raw}"))
-                    return
+                    return True
             set_last_set_time_state(offset_hours, preset)
             msg = set_device_time(device_ip=device_ip, offset_hours=offset_hours)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/ping":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = ping_device(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/get-status":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = query_device_status(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/get-config":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = query_device_config(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/get-diag":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = query_device_diagnostics(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/get-last-data":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = query_last_data(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/set-config":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             start_hour_raw = (form.get("start_hour") or [""])[0].strip()
             end_hour_raw = (form.get("end_hour") or [""])[0].strip()
             updates = {}
@@ -3203,10 +3066,10 @@ class Handler(BaseHTTPRequestHandler):
                         updates["START_HOUR"] = str(start_hour)
                     else:
                         self._send_html(render_page("START_HOUR must be 0-23"))
-                        return
+                        return True
                 except ValueError:
                     self._send_html(render_page("Invalid START_HOUR"))
-                    return
+                    return True
             if end_hour_raw:
                 try:
                     end_hour = int(end_hour_raw)
@@ -3214,55 +3077,106 @@ class Handler(BaseHTTPRequestHandler):
                         updates["END_HOUR"] = str(end_hour)
                     else:
                         self._send_html(render_page("END_HOUR must be 0-23"))
-                        return
+                        return True
                 except ValueError:
                     self._send_html(render_page("Invalid END_HOUR"))
-                    return
+                    return True
             if not updates:
                 self._send_html(render_page("No config updates specified"))
-                return
+                return True
             msg = set_device_config(device_ip=device_ip, config_updates=updates)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/reboot":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = reboot_device(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/enter-data-mode":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             ok, reason = can_enter_data_mode(uid=uid)
             if not ok:
                 self._send_html(render_page(reason))
-                return
+                return True
             msg = enter_data_mode(device_ip=device_ip)
             self._send_html(render_page(msg))
-            return
+            return True
         if self.path == "/clear-errors":
             raw = (form.get("device") or [""])[0]
             if "|" not in raw:
                 self._send_html(render_page("Select an ONLINE Arduino first."))
-                return
+                return True
             uid, device_ip = raw.split("|", 1)
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
-                return
+                return True
             msg = clear_device_errors(device_ip=device_ip)
             self._send_html(render_page(msg))
+            return True
+        return False
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._do_GET_impl()
+        except Exception as exc:  # noqa: BLE001
+            cid = new_correlation_id("WEBGET")
+            msg = f"GET {self.path} failed: {exc} [cid={cid}]"
+            append_action_log("web-get-error", msg)
+            parsed = urlparse(self.path)
+            route = parsed.path
+            if route.startswith("/api/") or route in {"/upload-progress", "/health"}:
+                self._send_json({"ok": False, "error": str(exc), "cid": cid}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_POST_impl()
+        except Exception as exc:  # noqa: BLE001
+            cid = new_correlation_id("WEBPOST")
+            msg = f"POST {self.path} failed: {exc} [cid={cid}]"
+            append_action_log("web-post-error", msg)
+            self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def _do_GET_impl(self) -> None:
+        parsed = urlparse(self.path)
+        route = parsed.path
+        query = parse_qs(parsed.query, keep_blank_values=True)
+
+        if self._handle_get_monitor_routes(route, query):
+            return
+        if self._handle_get_api_routes(route, query):
+            return
+        if self._handle_get_page_routes(route, query):
+            return
+        self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
+
+    def _do_POST_impl(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
+        form = parse_qs(body, keep_blank_values=True)
+        invalidate_endpoint_cache()
+        if self._handle_post_ops_routes(form):
+            return
+        if self._handle_post_file_transfer_routes(form):
+            return
+        if self._handle_post_maintenance_routes(form):
+            return
+        if self._handle_post_legacy_routes(form):
             return
         self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
 
