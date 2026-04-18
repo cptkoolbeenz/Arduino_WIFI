@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PageContext:
+    """Minimal shared page metadata used by the HTML wrapper."""
+
     page_title: str
     state: str
     message: str = ""
@@ -13,6 +15,8 @@ class PageContext:
 
 
 def _base_page_css() -> str:
+    """Return shared CSS used by all BSM web pages."""
+
     return """
     :root {
       --bg: #f2f4f7;
@@ -78,6 +82,8 @@ def _render_shared_page(
     extra_css: str = "",
     script_js: str = "",
 ) -> bytes:
+    """Render a full HTML document from shared frame + per-page body/script."""
+
     msg_html = f"<p><strong>{html.escape(ctx.message)}</strong></p>" if ctx.message else ""
     subtitle_html = f'<div class="subtitle">{html.escape(ctx.subtitle)}</div>' if ctx.subtitle else ""
     script_block = f"\n<script>\n{script_js}\n</script>" if script_js else ""
@@ -110,10 +116,14 @@ def _render_shared_page(
 
 
 def _render_section_title(title: str) -> str:
+    """Render a standardized section header."""
+
     return f'<div class="section-title">{html.escape(title)}</div>'
 
 
 def _render_scrollbox(box_id: str, initial_text: str, extra_classes: str = "") -> str:
+    """Render a monospaced scrollable text panel."""
+
     classes = "scrollbox"
     if extra_classes:
         classes = f"{classes} {extra_classes.strip()}"
@@ -121,6 +131,8 @@ def _render_scrollbox(box_id: str, initial_text: str, extra_classes: str = "") -
 
 
 def _render_titled_scroll_panel(title: str, box_id: str, initial_text: str, extra_classes: str = "") -> str:
+    """Render a section title followed by a scrollbox panel."""
+
     return f"{_render_section_title(title)}\n{_render_scrollbox(box_id, initial_text, extra_classes)}"
 
 
@@ -133,6 +145,8 @@ def _render_known_arduinos_selector(
     button_class: str = "needs-device",
     show_button: bool = True,
 ) -> str:
+    """Render the common 'Known Arduinos' selector block."""
+
     button_html = ""
     if show_button:
         button_html = (
@@ -164,6 +178,8 @@ def _render_action_form(
     hidden_input_class: str = "",
     hidden_class_names: set[str] | None = None,
 ) -> str:
+    """Render a reusable form+button control with optional hidden fields."""
+
     attrs = []
     if form_id:
         attrs.append(f'id="{html.escape(form_id)}"')
@@ -196,6 +212,8 @@ def _render_action_form(
 
 
 def _render_controls_row(forms_html: list[str], extra_style: str = "") -> str:
+    """Render a horizontal controls row made of pre-rendered form blocks."""
+
     style_attr = f' style="{html.escape(extra_style)}"' if extra_style else ""
     inner = "\n".join(forms_html)
     return f'<div class="controls"{style_attr}>\n{inner}\n</div>'

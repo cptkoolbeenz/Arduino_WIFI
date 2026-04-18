@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal web UI to start/stop normal BSM operations."""
+"""North End WIFI web control UI.
+
+This module provides dashboard, file-transfer, and maintenance pages for
+monitoring discovered Arduinos and running network/maintenance actions.
+"""
 
 from __future__ import annotations
 
@@ -104,10 +108,12 @@ ENDPOINT_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def new_correlation_id(prefix: str = "CMD") -> str:
+    """Create correlation id."""
     return f"{prefix}{int(time.time() * 1000)}{(time.time_ns() & 0xFFF):03X}"
 
 
 def categorize_command_error(detail: str) -> str:
+    """Classify command error text into a retry/diagnostic category."""
     txt = (detail or "").strip().lower()
     if not txt:
         return "unknown"
@@ -127,20 +133,24 @@ def categorize_command_error(detail: str) -> str:
 
 
 def is_success_message(msg: str) -> bool:
+    """Return whether success message."""
     return " OK " in f" {msg} "
 
 
 def should_retry_message(msg: str) -> bool:
+    """Return whether a command result message should be retried."""
     category = categorize_command_error(msg)
     return category in {"timeout", "unexpected_source"}
 
 
 def get_last_set_time_state() -> tuple[float, str]:
+    """Get last set time state."""
     with UI_STATE_LOCK:
         return LAST_SET_TIME_OFFSET_HOURS, LAST_SET_TIME_PRESET
 
 
 def set_last_set_time_state(offset_hours: float, preset: str) -> None:
+    """Set last set time state."""
     global LAST_SET_TIME_OFFSET_HOURS, LAST_SET_TIME_PRESET
     with UI_STATE_LOCK:
         LAST_SET_TIME_OFFSET_HOURS = offset_hours
@@ -158,6 +168,7 @@ POLL_NOW_ARGS = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
 
 
 def _set_or_append_flag(args_list: list[str], flag: str, value: str) -> list[str]:
+    """Set or append flag."""
     out: list[str] = []
     i = 0
     replaced = False
@@ -177,6 +188,7 @@ def _set_or_append_flag(args_list: list[str], flag: str, value: str) -> list[str
 
 
 def _infer_bind_ip_for_prefix(prefix3: str) -> str:
+    """Pick a local interface IP that matches the discovered /24 prefix."""
     try:
         out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
     except Exception:
@@ -195,6 +207,7 @@ def _infer_bind_ip_for_prefix(prefix3: str) -> str:
 
 
 def build_dynamic_poll_now_args() -> tuple[list[str], str]:
+    """Build dynamic poll now args."""
     args_list = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
     args_list = _set_or_append_flag(args_list, "--discover-timeout", WEB_POLL_NOW_DISCOVER_TIMEOUT_S)
     args_list = _set_or_append_flag(args_list, "--discover-attempts", WEB_POLL_NOW_DISCOVER_ATTEMPTS)
@@ -236,7 +249,9 @@ def build_dynamic_poll_now_args() -> tuple[list[str], str]:
 
 
 class ProcessManager:
+    """Class ProcessManager container."""
     def __init__(self) -> None:
+        """Initialize manager state and runtime paths."""
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
         self._log_path = Path("data/web_normal_ops.log")
@@ -246,6 +261,7 @@ class ProcessManager:
         self._force_log_path = Path("data/web_force_upload.log")
 
     def status(self) -> tuple[bool, int | None]:
+        """Return whether Normal Ops is running and its PID."""
         with self._lock:
             if self._proc is None:
                 return False, None
@@ -255,6 +271,7 @@ class ProcessManager:
             return True, self._proc.pid
 
     def force_status(self) -> tuple[bool, int | None]:
+        """Return whether a manual force-upload task is running."""
         with self._lock:
             if self._force_thread is None:
                 return False, None
@@ -265,6 +282,7 @@ class ProcessManager:
             return True, self._force_active_id
 
     def start(self) -> str:
+        """Start the Normal Ops background process."""
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return f"Normal Ops already running (PID {self._proc.pid})."
@@ -280,6 +298,7 @@ class ProcessManager:
             return f"Normal Ops started (PID {self._proc.pid})."
 
     def stop(self) -> str:
+        """Stop the Normal Ops background process."""
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 self._proc = None
@@ -301,6 +320,7 @@ class ProcessManager:
         return msg
 
     def start_force_upload(self, uid: str, device_ip: str) -> str:
+        """Start a background force-upload task for one Arduino."""
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return "Stop Normal Ops before force upload (port/bind conflict)."
@@ -313,6 +333,7 @@ class ProcessManager:
             args_list = build_force_upload_argv(device_ip=device_ip, discover_csv=DEFAULT_DISCOVER_CSV)
 
         def _run_force_upload() -> None:
+            """Execute force-upload discovery/transfer in a worker thread."""
             self._force_log_path.parent.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().isoformat(timespec="seconds")
             with self._force_log_path.open("a", encoding="utf-8") as logf:
@@ -338,6 +359,7 @@ class ProcessManager:
         return f"Force upload started for {uid} ({device_ip}) (task {task_id})."
 
     def poll_now(self) -> str:
+        """Run one manual discovery cycle immediately."""
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 return "Stop Normal Ops before manual poll (port/bind conflict)."
@@ -366,6 +388,7 @@ class ProcessManager:
         return f"Manual poll finished with non-zero status (rc={rc}). Check log output."
 
     def shutdown(self) -> None:
+        """Stop managed background processes before server shutdown."""
         self.stop()
         return
 
@@ -379,6 +402,7 @@ UPLOAD_PROGRESS: dict[str, dict[str, str | int | bool | float]] = {}
 
 
 def set_upload_progress(op_id: str, pct: int, message: str, done: bool = False, error: bool = False) -> None:
+    """Set upload progress."""
     token = (op_id or "").strip()
     if not token:
         return
@@ -399,6 +423,7 @@ def set_upload_progress(op_id: str, pct: int, message: str, done: bool = False, 
 
 
 def get_upload_progress(op_id: str) -> dict[str, str | int | bool]:
+    """Get upload progress."""
     token = (op_id or "").strip()
     if not token:
         return {"ok": False, "pct": 0, "message": "missing op id", "done": False, "error": True}
@@ -417,6 +442,7 @@ def get_upload_progress(op_id: str) -> dict[str, str | int | bool]:
 
 
 def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
+    """Read log tail."""
     if not path.exists():
         return ""
     size = path.stat().st_size
@@ -428,6 +454,7 @@ def read_log_tail(path: Path, max_bytes: int = 120_000) -> str:
 
 
 def invalidate_endpoint_cache(keys: list[str] | None = None) -> None:
+    """Invalidate endpoint cache."""
     with ENDPOINT_CACHE_LOCK:
         if keys is None:
             ENDPOINT_CACHE.clear()
@@ -437,6 +464,7 @@ def invalidate_endpoint_cache(keys: list[str] | None = None) -> None:
 
 
 def get_cached_text(key: str, ttl_s: float, producer) -> str:
+    """Get cached text."""
     now = time.monotonic()
     cache_key = str(key)
     with ENDPOINT_CACHE_LOCK:
@@ -452,6 +480,7 @@ def get_cached_text(key: str, ttl_s: float, producer) -> str:
 
 
 def append_action_log(action: str, message: str) -> None:
+    """Append action log."""
     ACTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     with ACTION_LOG_PATH.open("a", encoding="utf-8") as f:
@@ -469,6 +498,7 @@ def append_action_log(action: str, message: str) -> None:
 
 
 def read_activity_status() -> str:
+    """Read activity status."""
     action_txt = read_log_tail(ACTION_LOG_PATH, max_bytes=80_000)
     normal_txt = read_log_tail(MANAGER._log_path, max_bytes=80_000)
 
@@ -482,11 +512,13 @@ def read_activity_status() -> str:
 
 
 def read_python_log_status() -> str:
+    """Read python log status."""
     txt = read_log_tail(ACTION_LOG_PATH, max_bytes=120_000)
     return txt.strip() or "(No python web actions logged yet)"
 
 
 def _latest_discovery_timestamp(db_path: Path) -> str:
+    """Read the most recent successful discovery timestamp from SQLite."""
     if not db_path.exists():
         return ""
     try:
@@ -508,6 +540,7 @@ def _latest_discovery_timestamp(db_path: Path) -> str:
 
 
 def get_health_payload() -> dict[str, object]:
+    """Get health payload."""
     db_path = Path(DEFAULT_DB_PATH).expanduser()
     running, pid = MANAGER.status()
     payload: dict[str, object] = {
@@ -565,6 +598,7 @@ def get_health_payload() -> dict[str, object]:
 
 
 def format_health_status_text(payload: dict[str, object]) -> str:
+    """Format health status text."""
     status = str(payload.get("status", "unknown")).upper()
     running = "YES" if bool(payload.get("normal_ops_running", False)) else "NO"
     pid = payload.get("normal_ops_pid")
@@ -605,6 +639,7 @@ def format_health_status_text(payload: dict[str, object]) -> str:
 
 
 def _iso_to_dt(value: str) -> dt.datetime | None:
+    """Parse an ISO timestamp string into a datetime object."""
     try:
         return dt.datetime.fromisoformat(value)
     except Exception:
@@ -612,6 +647,7 @@ def _iso_to_dt(value: str) -> dt.datetime | None:
 
 
 def read_devices_status(path: Path, online_seconds: int = 600) -> str:
+    """Read devices status."""
     rows = read_devices_rows(path, online_seconds=online_seconds)
     if not rows:
         return "(No devices discovered yet)"
@@ -647,6 +683,7 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
 
 
 def read_devices_rows(path: Path, online_seconds: int = 600) -> list[dict[str, str]]:
+    """Read devices rows."""
     db_rows = read_devices_snapshot(Path(DEFAULT_DB_PATH))
     if db_rows:
         rows = db_rows
@@ -684,6 +721,7 @@ def read_devices_rows(path: Path, online_seconds: int = 600) -> list[dict[str, s
 
 
 def query_device_time(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Query device time."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -718,6 +756,7 @@ def query_device_time(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def set_device_time(device_ip: str, offset_hours: float, timeout_s: float = 2.0) -> str:
+    """Set device time."""
     epoch = int(time.time() + (offset_hours * 3600.0))
     msg = f"SET_TIME,{epoch}".encode("utf-8")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -755,6 +794,7 @@ def set_device_time(device_ip: str, offset_hours: float, timeout_s: float = 2.0)
 
 
 def ping_device(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Send PING and return one-line status text."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -774,6 +814,7 @@ def ping_device(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def query_device_status(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Query device status."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -794,6 +835,7 @@ def query_device_status(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def query_device_config(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Query device config."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -814,6 +856,7 @@ def query_device_config(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def query_device_diagnostics(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Query device diagnostics."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -834,6 +877,7 @@ def query_device_diagnostics(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def query_last_data(device_ip: str, timeout_s: float = 2.0) -> str:
+    """Query last data."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -854,6 +898,7 @@ def query_last_data(device_ip: str, timeout_s: float = 2.0) -> str:
 
 
 def set_device_config(device_ip: str, config_updates: dict[str, str], timeout_s: float = 3.0) -> str:
+    """Set device config."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -874,6 +919,7 @@ def set_device_config(device_ip: str, config_updates: dict[str, str], timeout_s:
 
 
 def reboot_device(device_ip: str, timeout_s: float = 3.0) -> str:
+    """Send REBOOT command and return status text."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -893,6 +939,7 @@ def reboot_device(device_ip: str, timeout_s: float = 3.0) -> str:
 
 
 def enter_data_mode(device_ip: str, timeout_s: float = 3.0) -> str:
+    """Send ENTER_DATA_MODE and return status text."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -912,6 +959,7 @@ def enter_data_mode(device_ip: str, timeout_s: float = 3.0) -> str:
 
 
 def can_enter_data_mode(uid: str) -> tuple[bool, str]:
+    """Return whether enter data mode."""
     db_path = Path(DEFAULT_DB_PATH)
     try:
         active = is_transfer_active(db_path, uid)
@@ -926,18 +974,21 @@ def can_enter_data_mode(uid: str) -> tuple[bool, str]:
 
 
 def assign_burrow_id(short_uid: str, burrow_id: str) -> str:
+    """Assign burrow id."""
     db_path = Path(DEFAULT_DB_PATH)
     ok, msg = set_burrow_id_by_short_uid(db_path=db_path, short_uid=short_uid, burrow_id=burrow_id)
     return msg if ok else f"Assign burrow_id failed: {msg}"
 
 
 def assign_burrow_id_for_uid(unique_id: str, burrow_id: str) -> str:
+    """Assign burrow id for uid."""
     db_path = Path(DEFAULT_DB_PATH)
     ok, msg = set_burrow_id_by_unique_id(db_path=db_path, unique_id=unique_id, burrow_id=burrow_id)
     return msg if ok else f"Assign burrow_id failed: {msg}"
 
 
 def _current_burrow_for_uid(unique_id: str) -> str:
+    """Return current burrow_id assignment for a unique device UID."""
     uid = (unique_id or "").strip()
     if not uid:
         return ""
@@ -949,6 +1000,7 @@ def _current_burrow_for_uid(unique_id: str) -> str:
 
 
 def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
+    """Clear device errors."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -968,6 +1020,7 @@ def clear_device_errors(device_ip: str, timeout_s: float = 3.0) -> str:
 
 
 def run_maintenance_action_with_retry(action: str, fn, timeout_s: float) -> str:
+    """Run maintenance action with retry."""
     cid = new_correlation_id("MNT")
     last_msg = ""
     for attempt in range(1, CMD_RETRY_ATTEMPTS + 1):
@@ -986,6 +1039,7 @@ def run_maintenance_action_with_retry(action: str, fn, timeout_s: float) -> str:
 
 
 def read_today_uploads_status(db_path: Path) -> str:
+    """Read today uploads status."""
     if not db_path.exists():
         return "(No upload DB yet)"
 
@@ -1043,6 +1097,7 @@ def read_today_uploads_status(db_path: Path) -> str:
 
 
 def _request_remote_file_list_with_sizes(device_ip: str, timeout_s: float = 8.0) -> tuple[list[tuple[str, int]], str]:
+    """Request remote SD file list and parse (filename, byte_size) tuples."""
     cid = new_correlation_id("LST")
     last_err = ""
     ip = (device_ip or "").strip()
@@ -1106,6 +1161,7 @@ def _request_remote_file_list_with_sizes(device_ip: str, timeout_s: float = 8.0)
 
 
 def delete_remote_file(device_ip: str, remote_filename: str, timeout_s: float = 8.0) -> tuple[bool, str]:
+    """Delete remote file."""
     ip = (device_ip or "").strip()
     name = (remote_filename or "").strip()
     cid = new_correlation_id("DEL")
@@ -1157,6 +1213,7 @@ def delete_remote_file(device_ip: str, remote_filename: str, timeout_s: float = 
 
 
 def _read_uploaded_files_for_device(short_uid: str) -> tuple[list[tuple[str, str, str, float]], str]:
+    """Read uploaded files for device."""
     sid = (short_uid or "").strip().upper()
     if not sid:
         return [], "(No short UID available)"
@@ -1185,6 +1242,7 @@ def _read_uploaded_files_for_device(short_uid: str) -> tuple[list[tuple[str, str
 
 
 def _build_uploaded_rows_html(rows: list[tuple[str, str, str, float]]) -> str:
+    """Build uploaded rows html."""
     if not rows:
         return '<div style="font-style:italic;">(No uploaded files logged for this Arduino)</div>'
     out = []
@@ -1201,6 +1259,7 @@ def _build_uploaded_rows_html(rows: list[tuple[str, str, str, float]]) -> str:
 
 
 def delete_local_uploaded_file(saved_path: str) -> tuple[bool, str]:
+    """Delete local uploaded file."""
     raw = (saved_path or "").strip()
     if not raw:
         return False, "No saved_path provided."
@@ -1223,6 +1282,7 @@ def delete_local_uploaded_file(saved_path: str) -> tuple[bool, str]:
 
 
 def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
+    """Build remote rows html."""
     filtered = []
     for name, size in rows:
         n = (name or "").strip().upper()
@@ -1252,6 +1312,7 @@ def upload_selected_remote_file(
     remote_filename: str,
     progress_callback=None,
 ) -> tuple[bool, str, dict[str, str | float]]:
+    """Upload one selected SD-card file from the chosen Arduino."""
     uid = (unique_id or "").strip()
     sid = (short_uid or "").strip().upper()
     net_uid = (network_uid or "").strip()
@@ -1350,6 +1411,7 @@ def upload_selected_remote_file(
 
 
 def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[tuple[str, str, str]], str]:
+    """Read full history for device."""
     if not db_path.exists():
         return [], "(No SQLite DB yet)"
     try:
@@ -1403,6 +1465,7 @@ def _read_full_history_for_device(db_path: Path, unique_id: str) -> tuple[list[t
 
 
 def _resolve_device_context_for_uid(selected_uid: str) -> tuple[dict[str, str] | None, str, str]:
+    """Resolve selected UID into device row plus IP and short UID."""
     uid = (selected_uid or "").strip()
     if not uid:
         return None, "", ""
@@ -1418,6 +1481,7 @@ def _resolve_device_context_for_uid(selected_uid: str) -> tuple[dict[str, str] |
 
 
 def _history_text_for_device_uid(unique_id: str) -> str:
+    """Render full transfer/discovery history text for one device UID."""
     uid = (unique_id or "").strip()
     if not uid:
         return "(Select a known Arduino to view complete DB history)"
@@ -1435,6 +1499,7 @@ def _history_text_for_device_uid(unique_id: str) -> str:
 
 
 def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, object]:
+    """Get file transfers remote files payload."""
     uid = (selected_uid or "").strip()
     if not uid:
         return {"ok": False, "message": "missing uid"}
@@ -1450,6 +1515,7 @@ def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, obje
 
 
 def get_file_transfers_uploaded_files_payload(selected_uid: str) -> dict[str, object]:
+    """Get file transfers uploaded files payload."""
     uid = (selected_uid or "").strip()
     if not uid:
         return {"ok": False, "message": "missing uid"}
@@ -1465,6 +1531,7 @@ def get_file_transfers_uploaded_files_payload(selected_uid: str) -> dict[str, ob
 
 
 def get_file_transfers_history_payload(selected_uid: str) -> dict[str, object]:
+    """Get file transfers history payload."""
     uid = (selected_uid or "").strip()
     if not uid:
         return {"ok": False, "message": "missing uid"}
@@ -1474,6 +1541,7 @@ def get_file_transfers_history_payload(selected_uid: str) -> dict[str, object]:
 
 
 def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
+    """Get maintenance panels payload."""
     uid = (selected_uid or "").strip()
     if not uid:
         return {"ok": False, "message": "missing uid"}
@@ -1489,6 +1557,7 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
 
 
 def render_page(message: str = "") -> bytes:
+    """Render page."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=WEB_APP_NAME, state=state, message=message)
@@ -1650,6 +1719,7 @@ def render_page(message: str = "") -> bytes:
 
 
 def render_file_transfers_page(message: str = "", selected_uid: str = "") -> bytes:
+    """Render file transfers page."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - File Transfers", state=state, message=message, subtitle="File Transfers")
@@ -2224,6 +2294,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 
 
 def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dict[str, str] | None:
+    """Find the selected device row by unique UID."""
     for d in devices:
         if (d.get("unique_id", "") or "").strip() == selected_uid:
             return d
@@ -2231,6 +2302,7 @@ def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dic
 
 
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
+    """Build device select rows."""
     rows: list[tuple[str, str, str]] = []
     mismatches: list[str] = []
     for d in devices:
@@ -2279,6 +2351,7 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
 
 
 def _maintenance_info_lines(device_ip: str) -> list[str]:
+    """Collect maintenance command output lines for one device IP."""
     status = query_device_status(device_ip=device_ip)
     config = query_device_config(device_ip=device_ip)
     diag = query_device_diagnostics(device_ip=device_ip)
@@ -2294,6 +2367,7 @@ def _maintenance_info_lines(device_ip: str) -> list[str]:
 
 
 def _rtc_panel_lines(device_ip: str, timeout_s: float = 2.0) -> tuple[str, str, str]:
+    """Build two-line RTC panel text (header/separator/value)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -2322,6 +2396,7 @@ def _dict_panel_lines(
     fallback_order: list[str],
     timeout_s: float = 2.0,
 ) -> tuple[str, str, str]:
+    """Query a maintenance payload and render fixed-width header/value rows."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
@@ -2345,6 +2420,7 @@ def _dict_panel_lines(
 
 
 def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
+    """Fetch all maintenance mini-panel payloads for one device."""
     rtc = _rtc_panel_lines(device_ip=device_ip)
     status = _dict_panel_lines(
         fetch_fn=protocol_get_device_status,
@@ -2373,6 +2449,7 @@ def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
 
 
 def _format_two_line_columns(cols: list[tuple[str, str]]) -> tuple[str, str, str]:
+    """Format two line columns."""
     if not cols:
         return "result", "------", ""
     # Add one trailing space to every column width so columns are separated by one space.
@@ -2385,6 +2462,7 @@ def _format_two_line_columns(cols: list[tuple[str, str]]) -> tuple[str, str, str
 
 
 def _mini_panel_block(header: str, separator: str, values: str) -> str:
+    """Render one maintenance mini-panel block."""
     # Build a dashboard-style 3-line block:
     # header row
     # dashed separator row
@@ -2393,6 +2471,7 @@ def _mini_panel_block(header: str, separator: str, values: str) -> str:
 
 
 def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_input: str | None = None) -> bytes:
+    """Render maintenance page."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - Maintenance", state=state, message=message, subtitle="Maintenance")
@@ -2607,7 +2686,9 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
 
 
 class Handler(BaseHTTPRequestHandler):
+    """HTTP request handler for dashboard, API, and action routes."""
     def _safe_write(self, raw: bytes) -> None:
+        """Write response bytes while tolerating disconnected clients."""
         try:
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError):
@@ -2615,6 +2696,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def _send_html(self, body: bytes, code: int = HTTPStatus.OK) -> None:
+        """Send an HTML response payload."""
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -2622,6 +2704,7 @@ class Handler(BaseHTTPRequestHandler):
         self._safe_write(body)
 
     def _send_text(self, body: str, code: int = HTTPStatus.OK) -> None:
+        """Send a plain-text response payload."""
         raw = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -2631,6 +2714,7 @@ class Handler(BaseHTTPRequestHandler):
         self._safe_write(raw)
 
     def _send_json(self, payload: dict, code: int = HTTPStatus.OK) -> None:
+        """Send a JSON response payload."""
         raw = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2640,6 +2724,7 @@ class Handler(BaseHTTPRequestHandler):
         self._safe_write(raw)
 
     def _handle_get_monitor_routes(self, route: str, query: dict[str, list[str]]) -> bool:
+        """Serve monitor/status GET endpoints used by polling UI widgets."""
         if route == "/health":
             self._send_json(get_health_payload())
             return True
@@ -2689,6 +2774,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
+        """Serve JSON data endpoints for File Transfers/Maintenance pages."""
         if route == "/api/file-transfers/remote-files":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_file_transfers_remote_files_payload(selected_uid))
@@ -2708,6 +2794,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_get_page_routes(self, route: str, query: dict[str, list[str]]) -> bool:
+        """Serve full HTML page routes."""
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
             return True
@@ -2725,6 +2812,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_post_ops_routes(self, form: dict[str, list[str]]) -> bool:
+        """Process POST controls for scheduler lifecycle and manual poll."""
         if self.path == "/start":
             msg = MANAGER.start()
             append_action_log("start", msg)
@@ -2749,6 +2837,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_post_file_transfer_routes(self, form: dict[str, list[str]]) -> bool:
+        """Process POST actions for upload/delete file operations."""
         if self.path == "/file-transfers-delete-uploaded":
             selected_uid = (form.get("uid") or [""])[0].strip()
             saved_path = (form.get("saved_path") or [""])[0].strip()
@@ -2820,6 +2909,7 @@ class Handler(BaseHTTPRequestHandler):
             set_upload_progress(upload_op_id, 0, "upload starting", done=False, error=False)
 
             def _on_progress(pct: int, written: int, total: int, name: str) -> None:
+                """Update web upload progress state from transfer callbacks."""
                 set_upload_progress(
                     upload_op_id,
                     pct,
@@ -2860,6 +2950,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_post_maintenance_routes(self, form: dict[str, list[str]]) -> bool:
+        """Process POST maintenance commands and Burrow_ID edits."""
         if self.path == "/maintenance-action":
             selected_uid = (form.get("uid") or [""])[0].strip()
             action = (form.get("action") or [""])[0].strip()
@@ -2930,6 +3021,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle_post_legacy_routes(self, form: dict[str, list[str]]) -> bool:
+        """Process older POST routes retained for backward compatibility."""
         if self.path == "/assign-burrow-id":
             short_uid = (form.get("short_uid") or [""])[0].strip().upper()
             burrow_id = (form.get("burrow_id") or [""])[0].strip()
@@ -3130,6 +3222,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
+        """Serve GET requests with centralized exception handling."""
         try:
             self._do_GET_impl()
         except Exception as exc:  # noqa: BLE001
@@ -3144,6 +3237,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_POST(self) -> None:  # noqa: N802
+        """Serve POST requests with centralized exception handling."""
         try:
             self._do_POST_impl()
         except Exception as exc:  # noqa: BLE001
@@ -3153,6 +3247,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(render_page(f"Internal error. cid={cid}"), HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _do_GET_impl(self) -> None:
+        """Dispatch GET requests to monitor/API/page route groups."""
         parsed = urlparse(self.path)
         route = parsed.path
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -3166,6 +3261,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
 
     def _do_POST_impl(self) -> None:
+        """Dispatch POST requests to route groups after parsing form data."""
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
         form = parse_qs(body, keep_blank_values=True)
@@ -3181,10 +3277,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(render_page("Not found."), HTTPStatus.NOT_FOUND)
 
     def log_message(self, fmt: str, *args: object) -> None:
+        """Suppress default HTTP request logging noise."""
         return
 
 
 def main() -> int:
+    """Initialize DB/server and run the web UI event loop."""
     host = DEFAULT_WEB_HOST
     port = DEFAULT_WEB_PORT
     db_path = Path(DEFAULT_DB_PATH).expanduser()
