@@ -15,7 +15,7 @@ DEFAULT_DISCOVER_PORT = 8888
 DEFAULT_LOCAL_OFFSET = -3 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
 DEFAULT_HOST_LABEL = "NORTH_END_WIFI"
 DEFAULT_START_HOUR = 7
-DEFAULT_END_HOUR = 19
+DEFAULT_END_HOUR = 20
 DEFAULT_CLOUD_START = "0100"
 DEFAULT_CLOUD_END = "0400"
 DEFAULT_PREFER_FILE_PREFIX = "TR"
@@ -113,7 +113,7 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
         "TR",
         "--file-day",
         "yesterday",
-        "--no-sync-time",
+        "--sync-time",
         "--transfer-tolerant",
         "--cloud-enabled",
     ]

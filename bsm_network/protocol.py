@@ -143,45 +143,63 @@ def request_remote_file_list(
     control_port: int,
     timeout_s: float,
 ) -> list[str]:
-    transfer_id = _new_transfer_id("L")
-    cmd = f"LIST_FILES,{transfer_id}".encode("utf-8")
-    control_sock.sendto(cmd, (device_ip, control_port))
+    retry_attempts = 3
+    retry_backoff_s = 0.25
+    last_err = f"LIST_FILES timeout for {device_ip}"
 
-    files: list[str] = []
-    seen: set[str] = set()
-    got_end = False
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    for attempt in range(1, retry_attempts + 1):
+        transfer_id = _new_transfer_id("L")
+        cmd = f"LIST_FILES,{transfer_id}".encode("utf-8")
+        control_sock.sendto(cmd, (device_ip, control_port))
+
+        files: list[str] = []
+        seen: set[str] = set()
+        got_end = False
+        deadline = time.monotonic() + timeout_s
         try:
-            data, (src_ip, _) = control_sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-        if src_ip != device_ip:
-            continue
+            while time.monotonic() < deadline:
+                try:
+                    data, (src_ip, _) = control_sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                if src_ip != device_ip:
+                    continue
 
-        line = data.decode("utf-8", errors="replace").strip()
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2 or parts[1] != transfer_id:
-            continue
+                line = data.decode("utf-8", errors="replace").strip()
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2 or parts[1] != transfer_id:
+                    continue
 
-        msg_type = parts[0]
-        if msg_type == "ERROR":
-            raise RuntimeError(line)
-        if msg_type == "FILE_LIST_BEGIN":
-            continue
-        if msg_type == "FILE_ITEM" and len(parts) >= 3:
-            name = parts[2]
-            if name and name not in seen:
-                seen.add(name)
-                files.append(name)
-            continue
-        if msg_type == "FILE_LIST_END":
-            got_end = True
-            break
+                msg_type = parts[0]
+                if msg_type == "ERROR":
+                    last_err = line
+                    raise RuntimeError(line)
+                if msg_type == "FILE_LIST_BEGIN":
+                    continue
+                if msg_type == "FILE_ITEM" and len(parts) >= 3:
+                    name = parts[2]
+                    if name and name not in seen:
+                        seen.add(name)
+                        files.append(name)
+                    continue
+                if msg_type == "FILE_LIST_END":
+                    got_end = True
+                    break
+        except RuntimeError:
+            # Retry device-reported transient errors with the same policy as timeout.
+            pass
 
-    if not got_end:
-        raise TimeoutError(f"LIST_FILES timeout for {device_ip}")
-    return files
+        if got_end:
+            return files
+
+        if not last_err.startswith("ERROR,"):
+            last_err = f"LIST_FILES timeout for {device_ip}"
+        if attempt < retry_attempts:
+            time.sleep(retry_backoff_s * attempt)
+
+    if last_err.startswith("ERROR,"):
+        raise RuntimeError(last_err)
+    raise TimeoutError(f"{last_err} (attempts={retry_attempts})")
 
 
 def send_time_sync(

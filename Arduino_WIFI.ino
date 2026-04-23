@@ -102,6 +102,12 @@ uint32_t rtcBaseUnixTs = 0;          // Unix time from last successful RTC read
 uint32_t rtcBaseMs = 0;              // millis() at last successful RTC read
 const uint32_t RTC_REFRESH_INTERVAL_MS = 6000;   // refresh RTC every ~6 seconds
 uint32_t rtcFallbackUnixTs = 0;      // startup-derived fallback epoch if RTC read glitches
+const uint8_t RTC_STABLE_READ_MAX = 12;
+const uint16_t RTC_STABLE_READ_DELAY_MS = 80;
+const uint8_t RTC_BOOT_RECOVERY_PASSES = 2;
+const uint8_t RTC_NTP_ATTEMPTS = 8;
+const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
+const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time).
 uint8_t START_HOUR = 7;
@@ -330,19 +336,49 @@ bool isRtcDateSane(const DateTime &dt) {
   return (y >= 2024 && y <= 2099 && m >= 1 && m <= 12 && d >= 1 && d <= 31);
 }
 
+void logRtcReadSample(const char *tag, uint8_t attemptIdx, const DateTime &dt) {
+  Serial.print(F("RTC bad read"));
+  if (tag != nullptr && tag[0] != '\0') {
+    Serial.print(F(" ["));
+    Serial.print(tag);
+    Serial.print(F("]"));
+  }
+  Serial.print(F(" attempt "));
+  Serial.print((unsigned int)(attemptIdx + 1));
+  Serial.print(F(": "));
+  Serial.print(dt.year());
+  Serial.print(F("-"));
+  Serial.print(dt.month());
+  Serial.print(F("-"));
+  Serial.print(dt.day());
+  Serial.print(F("T"));
+  Serial.print(dt.hour());
+  Serial.print(F(":"));
+  Serial.print(dt.minute());
+  Serial.print(F(":"));
+  Serial.print(dt.second());
+  Serial.print(F(" unix="));
+  Serial.println((unsigned long)dt.unixtime());
+}
+
 /***********************
  * Reads RTC repeatedly until values are stable/sane.
  * @param out Populated with a stable DateTime on success.
  * @return True if a stable/sane time was obtained; false otherwise.
  ***********************/
-bool readRtcStable(DateTime &out) {
+bool readRtcStable(
+  DateTime &out,
+  const char *tag = "",
+  uint8_t maxReads = RTC_STABLE_READ_MAX,
+  uint16_t delayMs = RTC_STABLE_READ_DELAY_MS
+) {
   DateTime prev((uint32_t)0);
   bool hasPrev = false;
-  const uint8_t maxReads = 6;
   for (uint8_t i = 0; i < maxReads; ++i) {
     DateTime cur = RTC.now();
     if (!isRtcDateSane(cur)) {
-      delay(30);
+      logRtcReadSample(tag, i, cur);
+      delay(delayMs);
       continue;
     }
     if (hasPrev) {
@@ -356,9 +392,43 @@ bool readRtcStable(DateTime &out) {
     }
     prev = cur;
     hasPrev = true;
-    delay(30);
+    delay(delayMs);
   }
   return false;
+}
+
+bool syncRtcFromWifiNtp() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  unsigned long epochUtc = 0;
+  for (uint8_t i = 0; i < RTC_NTP_ATTEMPTS; ++i) {
+    epochUtc = WiFi.getTime();
+    if (epochUtc > 1700000000UL) break;  // basic sanity gate (after 2023).
+    delay(RTC_NTP_RETRY_DELAY_MS);
+  }
+  if (epochUtc <= 1700000000UL) {
+    Serial.println(F("RTC NTP sync skipped: WiFi time unavailable."));
+    return false;
+  }
+
+  long long adjusted = (long long)epochUtc + (long long)RTC_NTP_LOCAL_OFFSET_SECONDS;
+  if (adjusted <= 0LL) {
+    Serial.println(F("RTC NTP sync skipped: adjusted epoch invalid."));
+    return false;
+  }
+
+  RTC.adjust(DateTime((uint32_t)adjusted));
+  delay(50);
+  DateTime verify((uint32_t)0);
+  if (!readRtcStable(verify, "ntp-verify")) {
+    Serial.println(F("RTC NTP sync failed: verify read unstable."));
+    return false;
+  }
+
+  Serial.print(F("RTC synced from WiFi time. TIMESTAMP:\t"));
+  Serial.println(verify.timestamp(DateTime::TIMESTAMP_FULL));
+  Update_TimeStamp_Cache_From_RTC();
+  return true;
 }
 
 /***********************
@@ -1157,6 +1227,9 @@ void runStartupWiFiCheck() {
     delay(3000);
   }
 
+  // If WiFi has internet time available, refresh RTC immediately on startup.
+  syncRtcFromWifiNtp();
+
   WiFi.disconnect();
   udp.stop();
   wifiInitialized = false;
@@ -1201,7 +1274,15 @@ void exitWifiMode() {
  * @param replyPort Destination UDP port for replies.
  ***********************/
 void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t replyPort) {
+  Serial.print(F("LIST_FILES begin: transferId="));
+  Serial.print(transferId);
+  Serial.print(F(" reply="));
+  Serial.print(replyIp);
+  Serial.print(F(":"));
+  Serial.println(replyPort);
+
   if (!sdReady) {
+    Serial.println(F("LIST_FILES error: SD not ready"));
     sendUdpMessage("ERROR," + transferId + ",SD_NOT_READY,SD init failed", replyIp, replyPort);
     return;
   }
@@ -1209,6 +1290,7 @@ void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t r
   int fileCount = 0;
   File root = SD.open("/");
   if (!root || !root.isDirectory()) {
+    Serial.println(F("LIST_FILES error: cannot open root"));
     sendUdpMessage("ERROR," + transferId + ",SD_OPEN_FAILED,Cannot open root", replyIp, replyPort);
     return;
   }
@@ -1220,6 +1302,8 @@ void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t r
   }
   root.close();
 
+  Serial.print(F("LIST_FILES sending FILE_LIST_BEGIN count="));
+  Serial.println(fileCount);
   sendUdpMessage("FILE_LIST_BEGIN," + transferId + "," + String(fileCount), replyIp, replyPort);
   root = SD.open("/");
   while (true) {
@@ -1239,6 +1323,7 @@ void sendFileList(const String &transferId, const IPAddress &replyIp, uint16_t r
   }
   root.close();
   sendUdpMessage("FILE_LIST_END," + transferId, replyIp, replyPort);
+  Serial.println(F("LIST_FILES sent FILE_LIST_END"));
 }
 
 /***********************
@@ -1465,6 +1550,12 @@ void serviceWifiCommands() {
 
   IPAddress remoteIp = udp.remoteIP();
   uint16_t remotePort = udp.remotePort();
+  Serial.print(F("UDP CMD from "));
+  Serial.print(remoteIp);
+  Serial.print(F(":"));
+  Serial.print(remotePort);
+  Serial.print(F(" -> "));
+  Serial.println(incoming);
 
   if (strcmp(incoming, POLL_MESSAGE) == 0) {
     String response = "ID,";
@@ -1499,6 +1590,7 @@ void serviceWifiCommands() {
   }
 
   if (strcmp(incoming, GET_VERSION_MESSAGE) == 0) {
+    Serial.println(F("GET_VERSION received"));
     String response = "VERSION,";
     response += getFirmwareVersion();
     sendUdpMessage(response, remoteIp, remotePort);
@@ -1546,6 +1638,8 @@ void serviceWifiCommands() {
 
   if (fieldCount >= 1 && strcmp(fields[0], LIST_FILES_MESSAGE) == 0) {
     String transferId = (fieldCount >= 2) ? String(fields[1]) : String("T0");
+    Serial.print(F("LIST_FILES received transferId="));
+    Serial.println(transferId);
     sendFileList(transferId, remoteIp, remotePort);
     return;
   }
@@ -1964,25 +2058,63 @@ void setup() {
   }
 
   DateTime rtcNow((uint32_t)0);
-  bool rtcStable = readRtcStable(rtcNow);
-  if (!RTC.isrunning() || !rtcStable) {
-    Serial.println("RTC invalid/unset. Applying compile time.");
-    RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    delay(50);
+  bool rtcStable = readRtcStable(rtcNow, "boot-initial");
+  bool rtcRunning = RTC.isrunning();
 
-    DateTime verify((uint32_t)0);
-    if (!readRtcStable(verify)) {
-      Serial.println("RTC verify failed after adjust.");
-      lcd.print("                ");
-      lcd.setCursor(0, 0);
-      lcd.print("RTC verify fail ");
-      lcd.setCursor(0, 1);
-      lcd.print("Check module    ");
-      while (1) { delay(1000); }
+  if (!rtcRunning || !rtcStable) {
+    Serial.println("RTC invalid/unset at boot. Trying recovery passes.");
+    bool recovered = false;
+    for (uint8_t pass = 0; pass < RTC_BOOT_RECOVERY_PASSES; ++pass) {
+      Serial.print(F("RTC recovery pass "));
+      Serial.print((unsigned int)(pass + 1));
+      Serial.println(F("..."));
+
+      recoverI2CBus();
+      Wire.end();
+      delay(10);
+      Wire.begin();
+      Wire.setClock(50000);
+      delay(120);
+
+      if (!beginRtcWithRetry(3)) {
+        Serial.println(F("RTC begin failed in recovery pass."));
+        continue;
+      }
+
+      DateTime passNow((uint32_t)0);
+      bool passStable = readRtcStable(passNow, "boot-recover");
+      bool passRunning = RTC.isrunning();
+      if (passRunning && passStable) {
+        rtcNow = passNow;
+        recovered = true;
+        Serial.print(F("RTC recovery pass succeeded. TIMESTAMP:\t"));
+        Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
+        break;
+      }
     }
-    rtcNow = verify;
-    Serial.print("RTC set. TIMESTAMP:\t");
-    Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
+
+    if (!recovered) {
+      Serial.println("RTC still invalid after retries. Applying compile time (last resort).");
+      RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      delay(50);
+
+      DateTime verify((uint32_t)0);
+      if (!readRtcStable(verify, "boot-compile-fallback")) {
+        Serial.println("RTC verify failed after compile-time adjust.");
+        lcd.print("                ");
+        lcd.setCursor(0, 0);
+        lcd.print("RTC verify fail ");
+        lcd.setCursor(0, 1);
+        lcd.print("Check module    ");
+        while (1) { delay(1000); }
+      }
+      rtcNow = verify;
+      Serial.print("RTC set. TIMESTAMP:\t");
+      Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
+    } else {
+      Serial.print("RTC running. TIMESTAMP:\t");
+      Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
+    }
   } else {
     Serial.print("RTC running. TIMESTAMP:\t");
     Serial.println(rtcNow.timestamp(DateTime::TIMESTAMP_FULL));
