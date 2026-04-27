@@ -13,7 +13,7 @@ DEFAULT_DISCOVER_BROADCAST_IP = "192.168.10.255"
 DEFAULT_LISTEN_PORT = 5005
 DEFAULT_DISCOVER_PORT = 8888
 DEFAULT_LOCAL_OFFSET = -3 # hrs offset from UTC, -4 is EDT in summer, -5 in winter, for ADT use -3, for AST use -4 year-round
-DEFAULT_HOST_LABEL = "NORTH_END_WIFI"
+DEFAULT_HOST_LABEL = "NORTH_END_IOT"
 DEFAULT_START_HOUR = 7
 DEFAULT_END_HOUR = 20
 DEFAULT_CLOUD_START = "0100"
@@ -115,7 +115,6 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
         "yesterday",
         "--sync-time",
         "--transfer-tolerant",
-        "--cloud-enabled",
     ]
 
 
@@ -168,7 +167,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         discover=True,
         transfer_latest_file=True,
         sync_time=False,
-        cloud_enabled=True,
+        cloud_enabled=False,
         scheduled=True,
         db_log=True,
     )

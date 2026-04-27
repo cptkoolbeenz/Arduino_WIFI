@@ -81,38 +81,42 @@ def run_cloud_upload_cycle(args: argparse.Namespace) -> int:
     if not args.cloud_enabled:
         return 0
 
-    source_root = Path(args.cloud_source_dir).expanduser()
-    sent_log = Path(args.cloud_sent_log).expanduser()
-    files = _iter_source_files(source_root)
-    if not files:
-        print("Cloud cycle: no local files found.")
-        return 0
+    try:
+        source_root = Path(args.cloud_source_dir).expanduser()
+        sent_log = Path(args.cloud_sent_log).expanduser()
+        files = _iter_source_files(source_root)
+        if not files:
+            print("Cloud cycle: no local files found.")
+            return 0
 
-    sent_rel, sent_keys = _load_sent_set(sent_log)
-    pending: list[Path] = []
-    for p in files:
-        rel = p.relative_to(source_root).as_posix()
-        key = _logical_key_from_relative_path(rel)
-        if rel not in sent_rel and key not in sent_keys:
-            pending.append(p)
+        sent_rel, sent_keys = _load_sent_set(sent_log)
+        pending: list[Path] = []
+        for p in files:
+            rel = p.relative_to(source_root).as_posix()
+            key = _logical_key_from_relative_path(rel)
+            if rel not in sent_rel and key not in sent_keys:
+                pending.append(p)
 
-    if not pending:
-        print("Cloud cycle: no unsent files.")
-        return 0
+        if not pending:
+            print("Cloud cycle: no unsent files.")
+            return 0
 
-    use_local_dir = bool(args.cloud_local_dir)
-    use_rclone = bool(args.cloud_rclone_remote)
-    if not use_local_dir and not use_rclone:
-        print(
-            "Cloud cycle: pending files found but no cloud target is set; "
-            "set --cloud-local-dir or --cloud-rclone-remote. "
-            "skipping upload."
-        )
+        use_local_dir = bool(args.cloud_local_dir)
+        use_rclone = bool(args.cloud_rclone_remote)
+        if not use_local_dir and not use_rclone:
+            print(
+                "Cloud cycle: pending files found but no cloud target is set; "
+                "set --cloud-local-dir or --cloud-rclone-remote. "
+                "skipping upload."
+            )
+            return 1
+
+        dest_root = Path(args.cloud_local_dir).expanduser() if use_local_dir else None
+        if dest_root:
+            dest_root.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Cloud cycle setup FAILED ({exc}); skipping this cycle.")
         return 1
-
-    dest_root = Path(args.cloud_local_dir).expanduser() if use_local_dir else None
-    if dest_root:
-        dest_root.mkdir(parents=True, exist_ok=True)
 
     print(f"Cloud cycle: uploading {len(pending)} unsent file(s)...")
     uploaded = 0

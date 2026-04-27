@@ -86,7 +86,7 @@ TZ_PRESET_OFFSETS: dict[str, float] = {
 UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
-WEB_APP_NAME = "NORTH_END_WIFI"
+WEB_APP_NAME = "NORTH_END_IOT"
 WEB_APP_VERSION = "2.0"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
@@ -3311,6 +3311,14 @@ def main() -> int:
         f"poll_ms(devices={UI_POLL_DEVICES_MS},uploads={UI_POLL_UPLOADS_MS},"
         f"activity={UI_POLL_ACTIVITY_MS},python_log={UI_POLL_PYTHON_LOG_MS},"
         f"upload_progress={UI_POLL_UPLOAD_PROGRESS_MS})"
+    )
+    access_host = host
+    if host in {"0.0.0.0", "::", ""}:
+        access_host = DEFAULT_BIND_IP
+    print(
+        "Laptop access: "
+        f"join WiFi '{WEB_APP_NAME}' and open http://{access_host}:{port} "
+        "(or use routed/VPN access)."
     )
 
     try:

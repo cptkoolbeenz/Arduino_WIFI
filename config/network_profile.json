@@ -5,7 +5,7 @@
       "bind": "192.168.10.1",
       "discover_ip": "192.168.10.255",
       "discover_port": 8888,
-      "host_label": "NORTH_END_WIFI",
+      "host_label": "NORTH_END_IOT",
       "web_host": "0.0.0.0",
       "web_port": 5001,
       "time_offset_hours": -3,
