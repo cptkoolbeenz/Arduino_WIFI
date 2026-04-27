@@ -635,6 +635,30 @@ String trimFilenameFromRaw(const String &rawName) {
 }
 
 /***********************
+ * Sidecar marker filename used to validate completed trim outputs.
+ * @param trimName Trimmed data filename.
+ * @return Marker filename.
+ ***********************/
+String trimReadyMarkerFilename(const String &trimName) {
+  return trimName + ".ok";
+}
+
+/***********************
+ * Returns true only when a trim completion marker exists and is non-empty.
+ * @param trimName Trimmed data filename.
+ * @return True when marker indicates a completed trim write.
+ ***********************/
+bool hasTrimReadyMarker(const String &trimName) {
+  String markerName = trimReadyMarkerFilename(trimName);
+  if (!SD.exists(markerName.c_str())) return false;
+  File marker = SD.open(markerName.c_str(), FILE_READ);
+  if (!marker) return false;
+  unsigned long sz = (unsigned long) marker.size();
+  marker.close();
+  return sz > 0;
+}
+
+/***********************
  * Builds DL filename from epoch date.
  * @param epoch Unix epoch seconds.
  * @return Filename in DLYYMMDD.TXT format.
@@ -938,6 +962,9 @@ bool buildTrimIntervalsForFile(const String &inputName, const CalibrationThresho
 bool writeTrimmedFileFromIntervals(const String &inputName, const String &outputName) {
   File in = SD.open(inputName.c_str(), FILE_READ);
   if (!in) return false;
+  String markerName = trimReadyMarkerFilename(outputName);
+  // Invalidate previous completion state before rewriting output.
+  SD.remove(markerName.c_str());
   SD.remove(outputName.c_str());
   File out = SD.open(outputName.c_str(), FILE_WRITE);
   if (!out) {
@@ -979,6 +1006,14 @@ bool writeTrimmedFileFromIntervals(const String &inputName, const String &output
   Serial.print(total);
   Serial.print(F(" kept="));
   Serial.println(kept);
+  File marker = SD.open(markerName.c_str(), FILE_WRITE);
+  if (!marker) {
+    Serial.println(F("TRIM fail: marker write"));
+    return false;
+  }
+  marker.print(F("READY,"));
+  marker.println(kept);
+  marker.close();
   return true;
 }
 
@@ -1027,10 +1062,14 @@ bool ensureTrimmedFileReadyForWifi() {
     File f = SD.open(trimName.c_str(), FILE_READ);
     unsigned long sz = f ? (unsigned long) f.size() : 0UL;
     if (f) f.close();
-    if (sz > 0) {
+    bool markerOk = hasTrimReadyMarker(trimName);
+    if (sz > 0 && markerOk) {
       Serial.print(F("TRIM ready: "));
       Serial.println(trimName);
       return true;
+    }
+    if (sz > 0 && !markerOk) {
+      Serial.println(F("TRIM incomplete: missing ready marker, rebuilding."));
     }
   }
 
