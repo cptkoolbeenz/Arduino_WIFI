@@ -472,6 +472,8 @@ def transfer_file_protocol(
     mark_partial_received: bool = False,
     progress_callback: Callable[[int, int, int, str], None] | None = None,
 ) -> Path:
+    if not str(requested_filename or "").lower().endswith(".txt"):
+        raise ValueError(f"Refusing non-.txt transfer request: {requested_filename}")
     transfer_id = _new_transfer_id("T")
     transfer_start = time.monotonic()
     output_dir.mkdir(parents=True, exist_ok=True)

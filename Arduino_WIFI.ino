@@ -73,6 +73,10 @@ bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
 bool wifiIdleAnnounced = false;
 uint32_t wifiOutWindowSinceTs = 0;
+bool wifiLowPowerStandby = false;
+uint32_t wifiLastActivityTs = 0;
+uint32_t wifiNextStandbyProbeTs = 0;
+bool wifiCommandHandled = false;
 bool haveLastAcqSample = false;
 long lastAcqSampleValue = 0;
 // Error tracking for diagnostics
@@ -141,6 +145,12 @@ const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
 const int MAX_TRIM_INTERVALS = 128;
 // Require this many seconds continuously outside the WiFi window before leaving WiFi mode.
 const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
+// WiFi-window low-power behavior.
+// After idle timeout in active WiFi mode, drop to standby and wake periodically.
+const bool WIFI_STANDBY_ENABLED = true;
+const uint32_t WIFI_MAINTENANCE_IDLE_SECONDS = 15UL * 60UL;
+const uint32_t WIFI_STANDBY_CHECK_INTERVAL_SECONDS = 30UL;
+const uint32_t WIFI_STANDBY_LISTEN_SECONDS = 8UL;
 // Raw file selection policy for trim phase.
 // false: default to yesterday's DL file
 // true : use today's DL file (test mode)
@@ -177,7 +187,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "2.1";
+const char VERSION[] = "2.2";
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
@@ -1434,6 +1444,8 @@ void enterWifiMode() {
   udp.begin(UDP_LOCAL_PORT);
   showWiFiInfo();
   wifiInitialized = true;
+  wifiLowPowerStandby = false;
+  wifiLastActivityTs = Get_TimeStamp();
   setLcdStatusLine1("WiFi: waiting");
 }
 
@@ -1721,6 +1733,7 @@ void sendFileOverTcp(
  * Commands include polling, list files, start file transfer, and RTC sync.
  ***********************/
 void serviceWifiCommands() {
+  wifiCommandHandled = false;
   if (!wifiInitialized) return;
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
@@ -1733,6 +1746,7 @@ void serviceWifiCommands() {
     incoming[n - 1] = '\0';
     n--;
   }
+  wifiCommandHandled = true;
 
   IPAddress remoteIp = udp.remoteIP();
   uint16_t remotePort = udp.remotePort();
@@ -1898,7 +1912,7 @@ void serviceWifiCommands() {
   // GET_STATUS: Report device status (uptime, mode, SD space, last data timestamp)
   if (strcmp(incoming, GET_STATUS_MESSAGE) == 0) {
     uint32_t uptime = millis() / 1000;
-    String mode = wifiModeActive ? "WIFI" : "DATA";
+    String mode = wifiModeActive ? "WIFI" : (wifiLowPowerStandby ? "WIFI_STBY" : "DATA");
     uint32_t sdFree = 0; // TODO: SD.totalBytes() may not be available in all libraries
     uint32_t lastTs = 0; // TODO: Get_TimeStamp() may hang if RTC bad
     String response = "STATUS,UPTIME=" + String(uptime) + ",MODE=" + mode + ",SD_FREE_KB=" + String(sdFree) + ",LAST_DATA_TS=" + String(lastTs) + ",BATTERY=N/A";
@@ -2533,13 +2547,25 @@ void loop() {
         wifiModeActive = false;
         wifiIdleAnnounced = false;
         wifiOutWindowSinceTs = 0;
+        wifiLowPowerStandby = false;
+        wifiNextStandbyProbeTs = 0;
       } else {
         // Keep processing commands during debounce window to tolerate transient RTC/window glitches.
         serviceWifiCommands();
+        if (wifiCommandHandled) wifiLastActivityTs = unixTs;
       }
     } else {
       wifiOutWindowSinceTs = 0;
       serviceWifiCommands();
+      if (wifiCommandHandled) wifiLastActivityTs = unixTs;
+      if (WIFI_STANDBY_ENABLED && wifiLastActivityTs > 0 && unixTs >= (wifiLastActivityTs + WIFI_MAINTENANCE_IDLE_SECONDS)) {
+        Serial.println(F("WiFi idle timeout -> standby"));
+        exitWifiMode();
+        wifiModeActive = false;
+        wifiLowPowerStandby = true;
+        wifiNextStandbyProbeTs = unixTs + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
+        if (printLCD) setLcdStatusLine1("WiFi: standby");
+      }
     }
     return;
   }
@@ -2557,6 +2583,44 @@ void loop() {
       return;
     }
 
+    if (wifiLowPowerStandby && WIFI_STANDBY_ENABLED) {
+      if (unixTs < wifiNextStandbyProbeTs) {
+        delay(250);
+        return;
+      }
+      Serial.println(F("WiFi standby probe"));
+      enterWifiMode();
+      wifiModeActive = wifiInitialized;
+      if (!wifiModeActive) {
+        wifiNextStandbyProbeTs = unixTs + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
+        delay(250);
+        return;
+      }
+      uint32_t listenUntil = unixTs + WIFI_STANDBY_LISTEN_SECONDS;
+      bool promoted = false;
+      while (Get_TimeStamp() < listenUntil) {
+        serviceWifiCommands();
+        if (wifiCommandHandled) {
+          promoted = true;
+          wifiLastActivityTs = Get_TimeStamp();
+          break;
+        }
+        delay(50);
+      }
+      if (promoted) {
+        Serial.println(F("WiFi standby wake -> active"));
+        wifiLowPowerStandby = false;
+        wifiOutWindowSinceTs = 0;
+      } else {
+        exitWifiMode();
+        wifiModeActive = false;
+        wifiLowPowerStandby = true;
+        wifiNextStandbyProbeTs = Get_TimeStamp() + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
+        if (printLCD) setLcdStatusLine1("WiFi: standby");
+      }
+      return;
+    }
+
     // Reboot-armed path: trim first, then open WiFi listener.
     if (!ensureTrimmedFileReadyForWifi()) {
       delay(1000);
@@ -2569,12 +2633,16 @@ void loop() {
       // additional WiFi activity can continue without another reboot.
       wifiIdleAnnounced = false;
       wifiOutWindowSinceTs = 0;
+      wifiLowPowerStandby = false;
+      wifiLastActivityTs = unixTs;
     }
     return;
   }
 
   // Outside WiFi window: normal acquisition.
   wifiIdleAnnounced = false;
+  wifiLowPowerStandby = false;
+  wifiNextStandbyProbeTs = 0;
   String nextFilename = rtnFilename();
   if (nextFilename.length() > 0 && nextFilename != myFilename) {
     closeAcqDataFile();

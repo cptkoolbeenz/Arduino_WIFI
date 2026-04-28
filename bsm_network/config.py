@@ -106,6 +106,12 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
     return [
         "--scheduled",
         "--discover",
+        "--discover-attempts",
+        "70",
+        "--discover-interval",
+        "0.6",
+        "--discover-timeout",
+        "50",
         "--discover-csv",
         discover_csv,
         "--transfer-latest-file",
@@ -121,6 +127,12 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
 def build_poll_now_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
     return [
         "--discover",
+        "--discover-attempts",
+        "70",
+        "--discover-interval",
+        "0.6",
+        "--discover-timeout",
+        "50",
         "--discover-csv",
         discover_csv,
         "--no-transfer-latest-file",

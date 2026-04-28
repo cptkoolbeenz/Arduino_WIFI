@@ -536,18 +536,23 @@ def _transfer_latest_file_for_device(
             base_result["status"] = "skip"
             base_result["message"] = f"No files reported by {display_id} ({device_ip})."
             return base_result
+        remote_txt_files = [name for name in remote_files if str(name).lower().endswith(".txt")]
+        if not remote_txt_files:
+            base_result["status"] = "skip"
+            base_result["message"] = f"No .txt files reported by {display_id} ({device_ip})."
+            return base_result
 
         seen = load_received_filenames(file_log_root, uid, device_short_uid=short_uid)
         if args.transfer_latest_even_if_seen:
             next_file = select_most_recent_file(
-                remote_files,
+                remote_txt_files,
                 prefer_prefix=args.prefer_file_prefix,
                 target_yymmdd=target_yymmdd,
                 tr_only=args.tr_only,
             )
         else:
             next_file = select_most_recent_unsaved_file(
-                remote_files,
+                remote_txt_files,
                 seen,
                 prefer_prefix=args.prefer_file_prefix,
                 target_yymmdd=target_yymmdd,
@@ -560,7 +565,10 @@ def _transfer_latest_file_for_device(
             return base_result
 
         base_result["source_filename"] = next_file
-        print(f"{display_id}: {len(remote_files)} remote file(s), {len(seen)} already saved, next={next_file}")
+        print(
+            f"{display_id}: {len(remote_files)} remote file(s), "
+            f"{len(remote_txt_files)} txt candidate(s), {len(seen)} already saved, next={next_file}"
+        )
         extra_tag = ""
         if args.transfer_latest_even_if_seen:
             extra_tag = dt.datetime.now().strftime("R%Y%m%d_%H%M%S")

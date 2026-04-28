@@ -87,7 +87,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "2.0"
+WEB_APP_VERSION = "2.2"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -1335,6 +1335,25 @@ def upload_selected_remote_file(
                 "status": "error",
                 "message": "Missing uid/device_ip/remote filename.",
                 "error_text": "missing-required-input",
+                "duration_s": 0.0,
+            },
+        )
+    if not rfn.lower().endswith(".txt"):
+        msg = f"Only .txt files can be uploaded (selected: {rfn})."
+        return (
+            False,
+            msg,
+            {
+                "unique_id": uid,
+                "network_uid": net_uid,
+                "burrow_id": burrow,
+                "ap_id": ap,
+                "device_ip": ip,
+                "source_filename": rfn,
+                "saved_path": "",
+                "status": "error",
+                "message": msg,
+                "error_text": "non-txt-file-blocked",
                 "duration_s": 0.0,
             },
         )
