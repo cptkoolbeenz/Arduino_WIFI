@@ -68,14 +68,18 @@ String deviceID_6;
 bool startupCalWindowInitialized = false;
 bool startupCalWindowComplete = false;
 uint32_t startupCalWindowEndTs = 0;
+bool startupWifiCheckPending = true;
 bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
 bool wifiIdleAnnounced = false;
 uint32_t wifiOutWindowSinceTs = 0;
+bool haveLastAcqSample = false;
+long lastAcqSampleValue = 0;
 // Error tracking for diagnostics
 uint32_t i2cErrorCount = 0;
 uint32_t rtcErrorCount = 0;
 uint32_t sdErrorCount = 0;
+uint32_t lastAcqLcdUpdateMs = 0;
 
 const char POLL_MESSAGE[] = "POLL_UID";
 const char LIST_FILES_MESSAGE[] = "LIST_FILES";
@@ -109,14 +113,14 @@ const uint8_t RTC_NTP_ATTEMPTS = 8;
 const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
-// Time window for WiFi phase (hours in local controller time).
+// Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
 uint8_t START_HOUR = 7;
 uint8_t END_HOUR = 19;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
 // Set to 300s for normal time to reach WiFi mode quickly after reboot. 10 for testing
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 10UL; // 300UL;
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 60UL; // 300UL;
 // Duration from file start treated as calibration section for trim logic.
 const uint32_t TRIM_CALIBRATION_SECONDS = 300UL;
 // Optional guard from file start before event detection can begin.
@@ -159,13 +163,21 @@ const bool verbose = true;
 
 // set flag for printing to LCD
 const bool printLCD = true;
+// LCD refresh cadence during startup calibration acquisition phase.
+const uint32_t LCD_CAL_UPDATE_INTERVAL_MS = 1000UL;
+// LCD refresh cadence during normal acquisition phase.
+// Set to 0 to disable periodic normal-run sample display updates.
+const uint32_t LCD_RUN_UPDATE_INTERVAL_MS = 30000UL;
+// Acquisition write batching: keep chunk small to reduce pause spikes.
+const uint16_t ACQ_LINES_PER_CHUNK = 12;
+const uint32_t ACQ_FLUSH_INTERVAL_MS = 5000UL;
 
 // set flag to print somethnig only if debugging
 const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "1.0";
+const char VERSION[] = "2.1";
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
@@ -193,6 +205,12 @@ IPAddress targetIp;
 bool wifiInitialized = false;
 bool wifiModeActive = false;
 String networkHostname;
+File acqDataFile;
+bool acqDataFileOpen = false;
+String acqOpenFilename = "";
+char acqWriteBuf[512];
+size_t acqWriteLen = 0;
+uint32_t lastAcqFlushMs = 0;
 
 /***********************
  * Returns the MCU unique ID as a 32-hex-character string.
@@ -546,6 +564,117 @@ void setLcdUidLine(bool showCalTag) {
 }
 
 /***********************
+ * Writes acquisition line 1 with mode prefix and latest sample value.
+ * Ensures "Cal:"/"Data:" are never shown without a value.
+ * @param inCalibrationPhase True to use "Cal:" prefix, false for "Data:".
+ * @param sampleValue Latest acquisition sample to display.
+ ***********************/
+void setLcdAcqLine1WithValue(bool inCalibrationPhase, long sampleValue) {
+  if (!printLCD) return;
+  (void) inCalibrationPhase;
+  const char *prefix = "Data:";
+  char line[32];
+  snprintf(line, sizeof(line), "%s%ld", prefix, sampleValue);
+  String text = String(line);
+  while (text.length() < 16) text += " ";
+  lcd.setCursor(0, 0);
+  lcd.print(text.substring(0, 16));
+}
+
+/***********************
+ * Determines whether acquisition-path sample LCD display should update now.
+ * @param inCalibrationPhase True during startup calibration capture phase.
+ * @return True when sample display should be refreshed.
+ ***********************/
+bool shouldUpdateAcqLcd(bool inCalibrationPhase) {
+  if (!printLCD) return false;
+  uint32_t intervalMs = inCalibrationPhase ? LCD_CAL_UPDATE_INTERVAL_MS : LCD_RUN_UPDATE_INTERVAL_MS;
+  if (intervalMs == 0UL) return false;
+  uint32_t nowMs = millis();
+  if (lastAcqLcdUpdateMs == 0 || (uint32_t)(nowMs - lastAcqLcdUpdateMs) >= intervalMs) {
+    lastAcqLcdUpdateMs = nowMs;
+    return true;
+  }
+  return false;
+}
+
+/***********************
+ * Flushes pending acquisition-buffer bytes to SD and optionally syncs media.
+ * @param syncToCard True to call File.flush() after writing buffered bytes.
+ * @return True on success.
+ ***********************/
+bool flushAcqBuffer(bool syncToCard) {
+  if (!acqDataFileOpen) return false;
+  if (acqWriteLen > 0) {
+    size_t written = acqDataFile.write((const uint8_t *) acqWriteBuf, acqWriteLen);
+    if (written != acqWriteLen) {
+      acqWriteLen = 0;
+      return false;
+    }
+    acqWriteLen = 0;
+  }
+  if (syncToCard) {
+    acqDataFile.flush();
+    lastAcqFlushMs = millis();
+  }
+  return true;
+}
+
+/***********************
+ * Closes active acquisition file after writing buffered bytes.
+ ***********************/
+void closeAcqDataFile() {
+  if (!acqDataFileOpen) {
+    acqWriteLen = 0;
+    return;
+  }
+  flushAcqBuffer(true);
+  acqDataFile.close();
+  acqDataFileOpen = false;
+  acqOpenFilename = "";
+  acqWriteLen = 0;
+}
+
+/***********************
+ * Ensures acquisition file is open for append using current filename.
+ * @param filename Target filename.
+ * @return True when file is ready for buffered appends.
+ ***********************/
+bool ensureAcqDataFileOpen(const String &filename) {
+  if (acqDataFileOpen && acqOpenFilename == filename) return true;
+  if (acqDataFileOpen) closeAcqDataFile();
+  acqDataFile = SD.open(filename.c_str(), FILE_WRITE);
+  if (!acqDataFile) {
+    acqDataFileOpen = false;
+    acqOpenFilename = "";
+    return false;
+  }
+  acqDataFileOpen = true;
+  acqOpenFilename = filename;
+  acqWriteLen = 0;
+  lastAcqFlushMs = millis();
+  return true;
+}
+
+/***********************
+ * Appends one acquisition CSV line to in-memory write buffer.
+ * @param sampleValue ADC sample value.
+ * @param unixTs Cached timestamp for this acquisition batch.
+ * @return True when buffered/written successfully.
+ ***********************/
+bool appendAcqLineToBuffer(long sampleValue, uint32_t unixTs) {
+  char line[40];
+  int n = snprintf(line, sizeof(line), "%ld, %lu\n", sampleValue, (unsigned long) unixTs);
+  if (n <= 0 || (size_t) n >= sizeof(line)) return false;
+  if (acqWriteLen + (size_t) n > sizeof(acqWriteBuf)) {
+    if (!flushAcqBuffer(false)) return false;
+  }
+  memcpy(acqWriteBuf + acqWriteLen, line, (size_t) n);
+  acqWriteLen += (size_t) n;
+  return true;
+}
+
+/***********************
  * Sends one UDP text message.
  * @param msg Message payload.
  * @param ip Destination IP.
@@ -640,7 +769,13 @@ String trimFilenameFromRaw(const String &rawName) {
  * @return Marker filename.
  ***********************/
 String trimReadyMarkerFilename(const String &trimName) {
-  return trimName + ".ok";
+  // Keep marker filename SD/FAT 8.3-safe.
+  // Example: TR260427.TXT -> TR260427.OK
+  int dot = trimName.lastIndexOf('.');
+  if (dot > 0) {
+    return trimName.substring(0, dot) + ".OK";
+  }
+  return trimName + ".OK";
 }
 
 /***********************
@@ -1263,7 +1398,7 @@ void runStartupWiFiCheck() {
     String line2 = "R" + String(WiFi.RSSI()) + " U:" + deviceID_6;
     while (line2.length() < 16) line2 += " ";
     lcd.print(line2.substring(0, 16));
-    delay(3000);
+    delay(1500);
   }
 
   // If WiFi has internet time available, refresh RTC immediately on startup.
@@ -1280,6 +1415,7 @@ void runStartupWiFiCheck() {
  * Enters active WiFi command mode (connect + UDP bind).
  ***********************/
 void enterWifiMode() {
+  closeAcqDataFile();
   Serial.println(F("Entering WiFi mode"));
   setLcdStatusLine1("WiFi: connect");
   if (!connectWiFi()) {
@@ -1288,6 +1424,12 @@ void enterWifiMode() {
   if (!resolveTargetIp()) {
     Serial.println(F("Invalid UDP target config."));
     return;
+  }
+  if (startupWifiCheckPending) {
+    // Perform one-time startup RTC sync on this real WiFi session
+    // so we avoid an extra pre-trim connect/disconnect cycle.
+    syncRtcFromWifiNtp();
+    startupWifiCheckPending = false;
   }
   udp.begin(UDP_LOCAL_PORT);
   showWiFiInfo();
@@ -1299,11 +1441,16 @@ void enterWifiMode() {
  * Leaves WiFi command mode and returns to local data state.
  ***********************/
 void exitWifiMode() {
+  closeAcqDataFile();
   Serial.println(F("Exiting WiFi mode"));
   udp.stop();
   WiFi.disconnect();
   wifiInitialized = false;
-  setLcdStatusLine1("Data:");
+  if (haveLastAcqSample) {
+    setLcdAcqLine1WithValue(false, lastAcqSampleValue);
+  } else {
+    setLcdStatusLine1("Data mode");
+  }
 }
 
 /***********************
@@ -1822,6 +1969,7 @@ void serviceWifiCommands() {
   if (strcmp(incoming, REBOOT_MESSAGE) == 0) {
     sendUdpMessage("ACK_REBOOT", remoteIp, remotePort);
     Serial.println(F("Rebooting via REBOOT command"));
+    closeAcqDataFile();
     delay(1000);
     NVIC_SystemReset();
     return;
@@ -1855,28 +2003,10 @@ void serviceWifiCommands() {
  * Performs one acquisition batch and appends it to current data file.
  * @param unixTs Timestamp value recorded for this acquisition batch.
  ***********************/
-void runAcquisitionCycle(uint32_t unixTs) {
-  unsigned long sampleValue;
-  File dataFile = SD.open(myFilename, FILE_WRITE);
-
-  if (dataFile) {
-    for (int i = 0; i < 300; i++) {
-      sampleValue = Get_Data();
-      dataFile.print(sampleValue);
-      dataFile.print(", ");
-      dataFile.println(unixTs);
-
-      if (debug) {
-        Serial.print(sampleValue);
-        Serial.print(", ");
-        Serial.println(unixTs);
-      }
-    }
-
-    lcd.setCursor(6, 0);
-    lcd.print(sampleValue);
-    dataFile.close();
-  } else {
+void runAcquisitionCycle(uint32_t unixTs, bool inCalibrationPhase) {
+  unsigned long sampleValue = 0;
+  uint16_t linesInChunk = 0;
+  if (!ensureAcqDataFileOpen(myFilename)) {
     Serial.println("Error opening file ");
     lcd.setCursor(0, 0);
     lcd.print("Can't open file!!");
@@ -1884,6 +2014,51 @@ void runAcquisitionCycle(uint32_t unixTs) {
     lcd.setCursor(0, 1);
     lcd.print("Figure it out!");
     delay(10000);
+    return;
+  }
+
+  for (int i = 0; i < 300; i++) {
+    sampleValue = Get_Data();
+    if (!appendAcqLineToBuffer((long) sampleValue, unixTs)) {
+      Serial.println(F("Error buffering data line."));
+      closeAcqDataFile();
+      return;
+    }
+    linesInChunk++;
+    if (linesInChunk >= ACQ_LINES_PER_CHUNK) {
+      if (!flushAcqBuffer(false)) {
+        Serial.println(F("Error writing buffered chunk."));
+        closeAcqDataFile();
+        return;
+      }
+      linesInChunk = 0;
+    }
+
+    if (debug) {
+      Serial.print(sampleValue);
+      Serial.print(", ");
+      Serial.println(unixTs);
+    }
+  }
+  haveLastAcqSample = true;
+  lastAcqSampleValue = (long) sampleValue;
+
+  if (acqWriteLen > 0 && !flushAcqBuffer(false)) {
+    Serial.println(F("Error writing trailing buffered chunk."));
+    closeAcqDataFile();
+    return;
+  }
+  uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - lastAcqFlushMs) >= ACQ_FLUSH_INTERVAL_MS) {
+    if (!flushAcqBuffer(true)) {
+      Serial.println(F("Error flushing acquisition data."));
+      closeAcqDataFile();
+      return;
+    }
+  }
+
+  if (shouldUpdateAcqLcd(inCalibrationPhase)) {
+    setLcdAcqLine1WithValue(inCalibrationPhase, (long) sampleValue);
   }
 }
 
@@ -2144,8 +2319,8 @@ void setup() {
         lcd.setCursor(0, 0);
         lcd.print("RTC verify fail ");
         lcd.setCursor(0, 1);
-        lcd.print("Check module    ");
-        while (1) { delay(1000); }
+        lcd.print("Can't proceed!     ");
+        while (1) { delay(1000); } // Halt if we can't get a stable RTC read even after setting compile time, as this is critical for operation.
       }
       rtcNow = verify;
       Serial.print("RTC set. TIMESTAMP:\t");
@@ -2168,7 +2343,7 @@ void setup() {
   lcd.print("RTC Running!    ");
   lcd.setCursor(0, 1);
   lcd.print(String(rtcNow.timestamp(DateTime::TIMESTAMP_FULL)).substring(0, 16));
-  delay(3000);
+  delay(1500);
 
 
   ///////////////////////////
@@ -2251,7 +2426,7 @@ void setup() {
       lcd.setCursor(0, 0);
       lcd.print("Load cell works");
       Serial.println("Load cell working properly.");
-      delay(1000);
+      delay(750);
     }
 
   if(countdown){
@@ -2279,28 +2454,16 @@ void setup() {
     lcd.print(Get_Data());  // do this while we are messing with closing the datafile
   }
 
-  runStartupWiFiCheck();
-
-  // Re-initialize SD after startup WiFi check to avoid SPI/driver state issues
-  // before entering acquisition mode.
-  sdReady = SD.begin(chipSelect);
-  if (!sdReady) {
-    Serial.println(F("SD re-init failed after WiFi check."));
-    if (printLCD) {
-      lcd.setCursor(0, 0);
-      lcd.print("SD re-init fail ");
-      lcd.setCursor(0, 1);
-      lcd.print("Disconnect!     ");
-    }
-    while (1) { delay(1000); }
-  }
   myFilename = rtnFilename();
   Serial.print(F("Saving to: "));
   Serial.println(myFilename);
 
   if (printLCD) {
     lcd.setCursor(0, 0);
-    lcd.print("Data:           ");
+    lcd.print("Data:");
+    lcd.setCursor(0, 1);
+    lcd.print("...           ");
+    // delay(500);
     setLcdUidLine(false);
   }
 }
@@ -2328,18 +2491,29 @@ void loop() {
     Serial.print(F("Startup capture begin. bootedInWifiWindow="));
     Serial.println(bootedInWifiWindow ? F("YES") : F("NO"));
     if (printLCD) {
-      setLcdStatusLine1("Data:");
+      if (haveLastAcqSample) {
+        setLcdAcqLine1WithValue(true, lastAcqSampleValue);
+      }
       setLcdUidLine(true);
     }
   }
 
   if (!startupCalWindowComplete) {
-    runAcquisitionCycle(unixTs);
+    String nextFilename = rtnFilename();
+    if (nextFilename.length() > 0 && nextFilename != myFilename) {
+      closeAcqDataFile();
+      myFilename = nextFilename;
+      Serial.print(F("Saving to: "));
+      Serial.println(myFilename);
+    }
+    runAcquisitionCycle(unixTs, true);
     if (unixTs >= startupCalWindowEndTs) {
       startupCalWindowComplete = true;
       Serial.println(F("Startup capture complete."));
       if (printLCD) {
-        setLcdStatusLine1("Data:");
+        if (haveLastAcqSample) {
+          setLcdAcqLine1WithValue(false, lastAcqSampleValue);
+        }
         setLcdUidLine(false);
       }
     }
@@ -2372,6 +2546,7 @@ void loop() {
 
   // In WiFi window: acquisition must remain stopped.
   if (inWifiWindow) {
+    closeAcqDataFile();
     if (!wifiSessionArmed) {
       if (!wifiIdleAnnounced) {
         Serial.println(F("WiFi window active. Waiting for reboot-armed session."));
@@ -2384,14 +2559,14 @@ void loop() {
 
     // Reboot-armed path: trim first, then open WiFi listener.
     if (!ensureTrimmedFileReadyForWifi()) {
-      wifiSessionArmed = false;  // consume even on failure to prevent endless retry
       delay(1000);
       return;
     }
     enterWifiMode();
     wifiModeActive = wifiInitialized;
     if (wifiModeActive) {
-      wifiSessionArmed = false;  // consume one armed session per reboot
+      // Keep session armed for the rest of the current WiFi window so
+      // additional WiFi activity can continue without another reboot.
       wifiIdleAnnounced = false;
       wifiOutWindowSinceTs = 0;
     }
@@ -2400,7 +2575,14 @@ void loop() {
 
   // Outside WiFi window: normal acquisition.
   wifiIdleAnnounced = false;
-  runAcquisitionCycle(unixTs);
+  String nextFilename = rtnFilename();
+  if (nextFilename.length() > 0 && nextFilename != myFilename) {
+    closeAcqDataFile();
+    myFilename = nextFilename;
+    Serial.print(F("Saving to: "));
+    Serial.println(myFilename);
+  }
+  runAcquisitionCycle(unixTs, false);
 }
 
 
