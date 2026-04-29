@@ -71,6 +71,8 @@ uint32_t startupCalWindowEndTs = 0;
 bool startupWifiCheckPending = true;
 bool bootedInWifiWindow = false;
 bool wifiSessionArmed = false;
+bool wasInWifiWindow = false;
+bool wifiWindowCycleInitialized = false;
 bool wifiIdleAnnounced = false;
 uint32_t wifiOutWindowSinceTs = 0;
 bool wifiLowPowerStandby = false;
@@ -187,7 +189,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "2.2";
+const char VERSION[] = "2.21";
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
@@ -2443,17 +2445,6 @@ void setup() {
       delay(750);
     }
 
-  if(countdown){
-    int N = 10;
-    for (int i = 1; i < N; i++) {
-      lcd.setCursor(0, 1);
-      lcd.print("Start in: ");
-      lcd.print(N - i);
-      lcd.print(" secs");
-      delay(800);
-    }
-  }
-    
   }
 
   // turn off the lcd?
@@ -2471,6 +2462,17 @@ void setup() {
   myFilename = rtnFilename();
   Serial.print(F("Saving to: "));
   Serial.println(myFilename);
+
+  if (countdown && printLCD) {
+    int N = 10;
+    for (int i = 1; i < N; i++) {
+      lcd.setCursor(0, 1);
+      lcd.print("Start in: ");
+      lcd.print(N - i);
+      lcd.print(" secs");
+      delay(800);
+    }
+  }
 
   if (printLCD) {
     lcd.setCursor(0, 0);
@@ -2494,6 +2496,9 @@ void loop() {
   tCounter = tCounter + 1;
   uint32_t unixTs = Get_TimeStamp();
   bool inWifiWindow = IsBetweenHours(unixTs);
+  bool enteredWifiWindow = (inWifiWindow && !wasInWifiWindow);
+  bool exitedWifiWindow = (!inWifiWindow && wasInWifiWindow);
+  wasInWifiWindow = inWifiWindow;
 
   // Always capture 10 minutes of raw data after each reboot before any WiFi workflow.
   if (!startupCalWindowInitialized) {
@@ -2501,7 +2506,10 @@ void loop() {
     startupCalWindowComplete = false;
     startupCalWindowEndTs = unixTs + STARTUP_CAL_CAPTURE_SECONDS;
     bootedInWifiWindow = inWifiWindow;
-    wifiSessionArmed = bootedInWifiWindow;  // WiFi session only allowed after reboot that occurred in WiFi window.
+    // If boot occurs inside WiFi window, this boot satisfies the reboot gate.
+    // Otherwise, the gate is armed later on first window entry transition.
+    wifiSessionArmed = bootedInWifiWindow;
+    wifiWindowCycleInitialized = inWifiWindow;
     Serial.print(F("Startup capture begin. bootedInWifiWindow="));
     Serial.println(bootedInWifiWindow ? F("YES") : F("NO"));
     if (printLCD) {
@@ -2532,6 +2540,32 @@ void loop() {
       }
     }
     return;
+  }
+
+  if (enteredWifiWindow) {
+    // New WiFi window cycle: require one reboot-calibration cycle unless this
+    // very boot occurred inside the window and has already been calibrated.
+    if (!wifiWindowCycleInitialized) {
+      wifiSessionArmed = false;
+      wifiLowPowerStandby = false;
+      wifiModeActive = false;
+      wifiInitialized = false;
+      wifiOutWindowSinceTs = 0;
+      wifiNextStandbyProbeTs = 0;
+      wifiIdleAnnounced = false;
+      Serial.println(F("WiFi window entered: reboot/calibration required for this window."));
+    }
+    wifiWindowCycleInitialized = true;
+  }
+
+  if (exitedWifiWindow) {
+    // Reset cycle state so next day's WiFi window requires a fresh reboot.
+    wifiWindowCycleInitialized = false;
+    wifiSessionArmed = false;
+    wifiLowPowerStandby = false;
+    wifiNextStandbyProbeTs = 0;
+    wifiIdleAnnounced = false;
+    Serial.println(F("WiFi window exited: reboot gate reset for next window."));
   }
 
   // If already in live WiFi mode, keep servicing commands.
