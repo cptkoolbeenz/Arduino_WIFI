@@ -87,7 +87,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "2.2"
+WEB_APP_VERSION = "2.21"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -539,6 +539,52 @@ def _latest_discovery_timestamp(db_path: Path) -> str:
         return ""
 
 
+def _latest_transfer_skip_summary(db_path: Path) -> str:
+    """Build one-line summary for latest run's completed-upload skip filter."""
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT run_id
+                FROM transfer_events
+                WHERE run_id LIKE 'DISC_%'
+                ORDER BY event_ts DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            run_id = str((row[0] if row else "") or "").strip()
+            if not run_id:
+                return ""
+
+            cur = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN status = 'skip' AND message LIKE '%already uploaded today%' THEN 1 ELSE 0 END) AS skip_done,
+                  SUM(CASE WHEN NOT (status = 'skip' AND message LIKE '%already uploaded today%') THEN 1 ELSE 0 END) AS eligible
+                FROM transfer_events
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+            sums = cur.fetchone()
+            skip_done = int((sums[0] if sums and sums[0] is not None else 0) or 0)
+            eligible = int((sums[1] if sums and sums[1] is not None else 0) or 0)
+            if skip_done <= 0:
+                return ""
+            return (
+                f"Transfer skip filter: {skip_done} device(s) already uploaded today "
+                f"(TR/RF target date), {eligible} device(s) still eligible."
+            )
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return ""
+
+
 def get_health_payload() -> dict[str, object]:
     """Get health payload."""
     db_path = Path(DEFAULT_DB_PATH).expanduser()
@@ -555,6 +601,7 @@ def get_health_payload() -> dict[str, object]:
         "last_discovery_ts": "",
         "last_discovery_age_s": None,
         "device_ip_recv_ip_mismatch_count": 0,
+        "transfer_skip_summary": "",
         "status": "ok",
     }
 
@@ -586,6 +633,7 @@ def get_health_payload() -> dict[str, object]:
     except Exception:
         mismatch_count = 0
     payload["device_ip_recv_ip_mismatch_count"] = mismatch_count
+    payload["transfer_skip_summary"] = _latest_transfer_skip_summary(db_path)
 
     if not payload["db_writable"]:
         payload["ok"] = False
@@ -635,6 +683,9 @@ def format_health_status_text(payload: dict[str, object]) -> str:
     header_line = " ".join(f"{name:<{width}}" for name, width in col_defs)
     sep_line = " ".join("-" * width for _name, width in col_defs)
     data_line = " ".join(f"{val:<{col_defs[idx][1]}}" for idx, val in enumerate(data_vals))
+    summary = str(payload.get("transfer_skip_summary", "") or "").strip()
+    if summary:
+        return f"{header_line}\n{sep_line}\n{data_line}\n{summary}"
     return f"{header_line}\n{sep_line}\n{data_line}"
 
 

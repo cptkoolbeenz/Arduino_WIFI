@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -304,6 +305,55 @@ def log_transfer_event(db_path: Path, run_id: str, result: dict[str, str | float
                 float(result.get("duration_s", 0.0) or 0.0),
             ),
         )
+
+
+def read_completed_uploads_for_day(
+    db_path: Path,
+    *,
+    target_yymmdd: str,
+    prefixes: tuple[str, ...] = ("TR", "RF"),
+    local_day_iso: str | None = None,
+) -> dict[str, tuple[str, str]]:
+    """
+    Return latest successful source filename per unique_id for today's local date
+    when filename matches <PREFIX><YYMMDD>.TXT and prefix is in `prefixes`.
+    """
+    if not db_path.exists():
+        return {}
+    day_iso = (local_day_iso or dt.datetime.now().strftime("%Y-%m-%d")).strip()
+    yymmdd = (target_yymmdd or "").strip()
+    if not re.fullmatch(r"\d{6}", yymmdd):
+        return {}
+    up_prefixes = tuple(p.strip().upper() for p in prefixes if p and p.strip())
+    if not up_prefixes:
+        return {}
+    pat = re.compile(rf"^({'|'.join(re.escape(p) for p in up_prefixes)}){re.escape(yymmdd)}\.TXT$")
+
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT unique_id, source_filename, event_ts
+            FROM transfer_events
+            WHERE status = 'saved'
+              AND substr(event_ts, 1, 10) = ?
+            ORDER BY event_ts DESC
+            """,
+            (day_iso,),
+        )
+        rows = cur.fetchall()
+
+    out: dict[str, tuple[str, str]] = {}
+    for unique_id_raw, source_filename_raw, event_ts_raw in rows:
+        uid = str(unique_id_raw or "").strip()
+        src = str(source_filename_raw or "").strip()
+        ts = str(event_ts_raw or "").strip()
+        if not uid or not src:
+            continue
+        if not pat.fullmatch(src.upper()):
+            continue
+        if uid not in out:
+            out[uid] = (src, ts)
+    return out
 
 
 def log_slot_event(

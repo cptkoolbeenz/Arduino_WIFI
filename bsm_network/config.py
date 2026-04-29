@@ -106,6 +106,7 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
     return [
         "--scheduled",
         "--discover",
+        "--skip-if-uploaded-today",
         "--discover-attempts",
         "70",
         "--discover-interval",
@@ -276,6 +277,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--transfer-latest-even-if-seen",
         action="store_true",
         help="Download the most recent remote file even if it was already received before",
+    )
+    parser.add_argument(
+        "--skip-if-uploaded-today",
+        action="store_true",
+        help=(
+            "Skip transfer work for devices that already have a successful upload today "
+            "for target day files (TR/RF + YYMMDD + .TXT)."
+        ),
+    )
+    parser.add_argument(
+        "--no-skip-if-uploaded-today",
+        action="store_false",
+        dest="skip_if_uploaded_today",
+        help="Disable same-day transfer skip filter.",
     )
     parser.add_argument(
         "--file-day",

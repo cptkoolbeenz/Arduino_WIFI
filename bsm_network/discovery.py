@@ -20,6 +20,7 @@ from .db import (
     log_discovery_event,
     log_slot_event,
     log_transfer_event,
+    read_completed_uploads_for_day,
     read_devices_snapshot,
     set_transfer_active,
     self_test_db_writes,
@@ -941,11 +942,54 @@ def run_discovery(args: argparse.Namespace) -> int:
             global_limit = max(1, sum(max(1, v) for v in ap_limits.values()))
         print(f"Transfer concurrency: global={global_limit}, ap_limits={ap_limits}")
 
+        completed_today: dict[str, tuple[str, str]] = {}
+        if bool(getattr(args, "skip_if_uploaded_today", False)) and target_yymmdd:
+            try:
+                completed_today = read_completed_uploads_for_day(
+                    db_path=db_path,
+                    target_yymmdd=target_yymmdd,
+                    prefixes=("TR", "RF"),
+                ) if db_enabled else {}
+            except Exception as exc:
+                completed_today = {}
+                print(f"Warning: completed-upload filter lookup failed: {exc}")
+
+        transfer_results: list[dict[str, str | float]] = []
+        rows_for_transfer: list[dict[str, str | int]] = []
+        for row in rows:
+            uid = str(row.get("unique_id", "") or "")
+            if uid in completed_today:
+                src, ts = completed_today[uid]
+                short_uid = str(row.get("short_uid", "") or "").strip()
+                display_id = short_uid if short_uid else (uid[-6:] if len(uid) >= 6 else uid)
+                transfer_results.append(
+                    {
+                        "unique_id": uid,
+                        "network_uid": str(row.get("network_uid", "") or ""),
+                        "burrow_id": str(row.get("burrow_id", "") or ""),
+                        "ap_id": str(row.get("ap_id", default_ap) or default_ap),
+                        "device_ip": str(row.get("device_ip", row.get("recv_ip", "")) or ""),
+                        "source_filename": src,
+                        "saved_path": "",
+                        "status": "skip",
+                        "message": f"Skip {display_id}: already uploaded today ({src} at {ts}).",
+                        "error_text": "",
+                        "duration_s": 0.0,
+                    }
+                )
+                continue
+            rows_for_transfer.append(row)
+
+        if completed_today:
+            print(
+                f"Completed-upload filter: skipping {len(completed_today)} device(s) "
+                f"already uploaded today for target {target_yymmdd} (TR/RF .TXT)."
+            )
+
         slot_manager = APSlotManager(ap_limits=ap_limits, global_limit=global_limit)
         # Use one worker per device so waiting on AP slot limits does not
         # starve tasks assigned to other AP buckets.
-        worker_count = max(1, len(rows))
-        transfer_results: list[dict[str, str | float]] = []
+        worker_count = max(1, len(rows_for_transfer))
 
         def _worker(row: dict[str, str | int]) -> dict[str, str | float]:
             ap_id = str(row.get("ap_id", default_ap))
@@ -997,7 +1041,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                         print(f"Warning: DB write failed (slot release): {exc}")
 
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            futures = [pool.submit(_worker, row) for row in rows]
+            futures = [pool.submit(_worker, row) for row in rows_for_transfer]
             for fut in as_completed(futures):
                 try:
                     result = fut.result()
@@ -1016,6 +1060,18 @@ def run_discovery(args: argparse.Namespace) -> int:
                         log_transfer_event(db_path=db_path, run_id=run_id, result=result)
                     except Exception as exc:
                         print(f"Warning: DB write failed (transfer event): {exc}")
+
+        for result in transfer_results:
+            if str(result.get("status", "")) != "skip":
+                continue
+            msg = str(result.get("message", ""))
+            if "already uploaded today" in msg:
+                print(msg)
+                if db_enabled:
+                    try:
+                        log_transfer_event(db_path=db_path, run_id=run_id, result=result)
+                    except Exception as exc:
+                        print(f"Warning: DB write failed (transfer skip event): {exc}")
 
         status_counts = Counter(str(r.get("status", "")) for r in transfer_results)
         ap_saved_counts = Counter(str(r.get("ap_id", default_ap)) for r in transfer_results if str(r.get("status", "")) == "saved")
