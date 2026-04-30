@@ -164,6 +164,14 @@ NORMAL_OPS_CMD = [
     *build_normal_ops_argv(DEFAULT_DISCOVER_CSV),
 ]
 
+
+def _normal_ops_discovery_mode() -> str:
+    """Return configured discovery mode label for Normal Ops command."""
+    cmd = [str(x) for x in NORMAL_OPS_CMD]
+    if "--ready-driven" in cmd and "--no-ready-driven" not in cmd:
+        return "READY-driven"
+    return "Poll-driven"
+
 POLL_NOW_ARGS = build_poll_now_argv(DEFAULT_DISCOVER_CSV)
 
 
@@ -602,6 +610,7 @@ def get_health_payload() -> dict[str, object]:
         "last_discovery_age_s": None,
         "device_ip_recv_ip_mismatch_count": 0,
         "transfer_skip_summary": "",
+        "discovery_mode": _normal_ops_discovery_mode(),
         "status": "ok",
     }
 
@@ -655,6 +664,7 @@ def format_health_status_text(payload: dict[str, object]) -> str:
     db_writable = "YES" if bool(payload.get("db_writable", False)) else "NO"
     active = int(payload.get("active_transfer_count", 0) or 0)
     mismatch = int(payload.get("device_ip_recv_ip_mismatch_count", 0) or 0)
+    discovery_mode = str(payload.get("discovery_mode", "") or "")
     last_ts = str(payload.get("last_discovery_ts", "") or "")
     age = payload.get("last_discovery_age_s")
     age_min_text = f"{(float(age) / 60.0):.1f}" if isinstance(age, (int, float)) else ""
@@ -666,6 +676,7 @@ def format_health_status_text(payload: dict[str, object]) -> str:
         ("db_writable", 11),
         ("active_xfers", 12),
         ("ip_mismatch", 11),
+        ("discovery_mode", 14),
         ("last_discovery", 19),
         ("age_min", 7),
     ]
@@ -677,6 +688,7 @@ def format_health_status_text(payload: dict[str, object]) -> str:
         db_writable,
         str(active),
         str(mismatch),
+        (discovery_mode or "-"),
         (last_ts or "-"),
         (age_min_text or "-"),
     ]
@@ -1107,6 +1119,8 @@ def read_today_uploads_status(db_path: Path) -> str:
                   COALESCE(t.source_filename, ''),
                   COALESCE(t.saved_path, ''),
                   COALESCE(t.event_ts, ''),
+                  COALESCE(t.status, ''),
+                  COALESCE(t.message, ''),
                   CASE
                     WHEN t.duration_s IS NULL THEN ''
                     ELSE CAST(ROUND(t.duration_s / 60.0, 1) AS TEXT)
@@ -1114,8 +1128,7 @@ def read_today_uploads_status(db_path: Path) -> str:
                 FROM transfer_events t
                 LEFT JOIN devices d
                   ON d.unique_id = t.unique_id
-                WHERE t.status = 'saved'
-                  AND date(substr(t.event_ts, 1, 10)) = ?
+                WHERE date(substr(t.event_ts, 1, 10)) = ?
                 ORDER BY t.event_ts DESC
                 """,
                 (today,),
@@ -1129,10 +1142,52 @@ def read_today_uploads_status(db_path: Path) -> str:
     if not rows:
         return "(No files uploaded today)"
 
+    def _rtc_sync_from_message(msg: str) -> str:
+        return "FAILED" if "RTC sync failed (upload proceeded)" in (msg or "") else "OK"
+
+    def _reason_label(status: str, msg: str) -> str:
+        txt = (msg or "").lower()
+        st = (status or "").lower()
+        if "already uploaded today" in txt:
+            return "already uploaded today"
+        if "no new files" in txt:
+            return "no new files"
+        if st == "saved":
+            return "transferred"
+        if st == "skip":
+            return "skipped"
+        if st == "error":
+            return "error"
+        return st or "unknown"
+
+    latest_by_device: dict[str, tuple[str, str, str, str, str]] = {}
+    for burrow_id, short_uid, network_uid, filename, _saved_path, uploaded_at, status, message, _duration_s in rows:
+        key = str(short_uid or network_uid or burrow_id or "").strip()
+        if not key:
+            key = str(network_uid or "").strip()
+        if key and key not in latest_by_device:
+            latest_by_device[key] = (
+                str(burrow_id),
+                str(short_uid),
+                _rtc_sync_from_message(str(message)),
+                _reason_label(str(status), str(message)),
+                str(uploaded_at),
+            )
+
     lines = []
+    lines.append("Today Device Summary")
+    lines.append("burrow_id      short_uid  rtc_sync  last_result             updated_at")
+    lines.append("------------   --------   --------  ----------------------  -------------------")
+    for _key, item in sorted(latest_by_device.items(), key=lambda kv: kv[1][4], reverse=True):
+        burrow_id, short_uid, rtc_sync, result_label, updated_at = item
+        lines.append(f"{burrow_id:<12}   {short_uid:<8}   {rtc_sync:<8}  {result_label:<22}  {updated_at:<19}")
+    lines.append("")
+    lines.append("Saved Uploads Today")
     lines.append("burrow_id      short_uid  network_uid       filename                file_size_mb  uploaded_at           duration_min")
     lines.append("------------   --------   ---------------   ----------------------  ------------  -------------------   ------------")
-    for burrow_id, short_uid, network_uid, filename, saved_path, uploaded_at, duration_s in rows:
+    for burrow_id, short_uid, network_uid, filename, saved_path, uploaded_at, status, message, duration_s in rows:
+        if str(status).lower() != "saved":
+            continue
         size_mb_str = ""
         try:
             p = Path(str(saved_path or "")).expanduser()
@@ -1140,9 +1195,10 @@ def read_today_uploads_status(db_path: Path) -> str:
                 size_mb_str = f"{(p.stat().st_size / (1024.0 * 1024.0)):.3f}"
         except Exception:
             size_mb_str = ""
+        rtc_sync = _rtc_sync_from_message(str(message))
         lines.append(
             f"{str(burrow_id):<12}   {str(short_uid):<8}   {str(network_uid):<15}   "
-            f"{str(filename):<22}  {size_mb_str:<12}  {str(uploaded_at):<19}   {str(duration_s):<10}"
+            f"{str(filename):<22}  {size_mb_str:<12}  {str(uploaded_at):<19}   {str(duration_s):<10}  rtc={rtc_sync}"
         )
     return "\n".join(lines)
 
@@ -1653,6 +1709,10 @@ def render_page(message: str = "") -> bytes:
           _render_action_form(action="/stop", label="Stop Normal Ops", method="post"),
           _render_action_form(action="/poll-now", label="Poll Now", method="post"),
       ])}
+      <div class="warn-banner" style="display:block;">
+        Poll Now sends repeated POLL_UID broadcasts (poll-driven discovery) and increases Arduino WiFi activity.
+        Use it only for manual diagnostics.
+      </div>
 
       {_render_section_title("Known Arduinos")}
       <div id="mismatch-banner" class="warn-banner"></div>

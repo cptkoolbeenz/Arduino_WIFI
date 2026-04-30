@@ -1816,7 +1816,14 @@ void sendFileOverTcp(
   sendUdpMessage("FILE_SENT," + transferId + "," + String(fileSize) + "," + crc32Hex(fullCrc), replyIp, replyPort);
   uploadCompletedThisWindow = true;
   readyBeaconAcked = true;
+  Serial.print(F("UPLOAD COMPLETE: "));
+  Serial.print(filename);
+  Serial.print(F(" ("));
+  Serial.print(fileSize);
+  Serial.println(F(" bytes)"));
   setLcdStatusLine1("Xfer: done");
+  delay(2000);
+  setLcdStatusLine1("WiFi: waiting");
 }
 
 /***********************
