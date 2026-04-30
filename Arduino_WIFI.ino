@@ -2464,6 +2464,8 @@ void setup() {
   Serial.println(myFilename);
 
   if (countdown && printLCD) {
+    lcd.setCursor(0, 0);
+    lcd.print("Data:         ");
     int N = 10;
     for (int i = 1; i < N; i++) {
       lcd.setCursor(0, 1);
@@ -2476,11 +2478,10 @@ void setup() {
 
   if (printLCD) {
     lcd.setCursor(0, 0);
-    lcd.print("Data:");
-    lcd.setCursor(0, 1);
-    lcd.print("...           ");
-    // delay(500);
+    lcd.print("Data:           ");
     setLcdUidLine(false);
+    lcd.setCursor(6, 0);
+    lcd.print(Get_Data());  // do this while we are messing with closing the datafile
   }
 }
 
