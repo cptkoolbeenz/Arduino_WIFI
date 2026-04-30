@@ -189,7 +189,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "2.21";
+const char VERSION[] = "3.0";
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
