@@ -85,7 +85,7 @@ TZ_PRESET_OFFSETS: dict[str, float] = {
 }
 UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
-LAST_SET_TIME_PRESET = "edt"
+LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
 WEB_APP_VERSION = "3.01"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
@@ -2610,9 +2610,9 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     selected_device = _find_device_by_uid(devices, selected_uid)
     selected_burrow = (burrow_input if burrow_input is not None else "").strip()
     _last_offset_hours, last_preset = get_last_set_time_state()
-    tz_selected = (last_preset or "edt").strip().lower()
+    tz_selected = (last_preset or "ast").strip().lower()
     if tz_selected not in TZ_PRESET_OFFSETS:
-        tz_selected = "edt"
+        tz_selected = "ast"
 
     panel_placeholders: dict[str, str] = {
         "RTC Time": "select a known Arduino",
@@ -3120,7 +3120,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return True
             if action == "set-time":
-                preset = (form.get("tz_preset") or ["edt"])[0].strip().lower()
+                preset = (form.get("tz_preset") or ["ast"])[0].strip().lower()
                 if preset not in TZ_PRESET_OFFSETS:
                     self._send_html(
                         render_maintenance_page(
@@ -3222,7 +3222,7 @@ class Handler(BaseHTTPRequestHandler):
             if not uid or not device_ip:
                 self._send_html(render_page("Invalid device selection."))
                 return True
-            preset = (form.get("tz_preset") or ["edt"])[0].strip().lower()
+            preset = (form.get("tz_preset") or ["ast"])[0].strip().lower()
             if preset in TZ_PRESET_OFFSETS:
                 offset_hours = TZ_PRESET_OFFSETS[preset]
             else:
