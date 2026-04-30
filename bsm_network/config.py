@@ -106,11 +106,8 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
     return [
         "--scheduled",
         "--discover",
+        "--ready-driven",
         "--skip-if-uploaded-today",
-        "--discover-attempts",
-        "70",
-        "--discover-interval",
-        "0.6",
         "--discover-timeout",
         "50",
         "--discover-csv",
@@ -128,6 +125,7 @@ def build_normal_ops_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]
 def build_poll_now_argv(discover_csv: str = DEFAULT_DISCOVER_CSV) -> list[str]:
     return [
         "--discover",
+        "--no-ready-driven",
         "--discover-attempts",
         "70",
         "--discover-interval",
@@ -192,6 +190,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host-label", default=DEFAULT_HOST_LABEL, help=f"Name shown in startup output for the host machine (default: {DEFAULT_HOST_LABEL})")
     parser.add_argument("--discover", action="store_true", help="Broadcast poll request and print discovered Arduino unique IDs")
     parser.add_argument("--no-discover", action="store_false", dest="discover", help="Disable discovery mode")
+    parser.add_argument(
+        "--ready-driven",
+        action="store_true",
+        help="Listen for READY_TO_UPLOAD beacons and ACK them instead of driving broadcast POLL discovery.",
+    )
+    parser.add_argument(
+        "--no-ready-driven",
+        action="store_false",
+        dest="ready_driven",
+        help="Disable READY-driven discovery and use broadcast POLL behavior.",
+    )
     parser.add_argument("--discover-ip", default=DEFAULT_DISCOVER_BROADCAST_IP, help=f"Broadcast IP for discovery polls (default: {DEFAULT_DISCOVER_BROADCAST_IP})")
     parser.add_argument("--discover-port", type=int, default=DEFAULT_DISCOVER_PORT, help=f"UDP port Arduino listens on for discovery polls (default: {DEFAULT_DISCOVER_PORT})")
     parser.add_argument("--discover-timeout", type=float, default=30.0, help="Seconds to wait for discovery replies (default: 30.0)")

@@ -160,6 +160,27 @@ def parse_version_response(payload: str) -> str | None:
     return parts[1]
 
 
+def parse_ready_to_upload(payload: str) -> dict[str, str] | None:
+    # READY_TO_UPLOAD,<uid>,<filename>,<size>,<unix_ts>
+    if not payload.startswith("READY_TO_UPLOAD,"):
+        return None
+    parts = [p.strip() for p in payload.split(",")]
+    if len(parts) < 3:
+        return None
+    uid = parts[1]
+    filename = parts[2]
+    if not uid or not filename:
+        return None
+    size = parts[3] if len(parts) > 3 else ""
+    ts = parts[4] if len(parts) > 4 else ""
+    return {
+        "unique_id": uid,
+        "filename": filename,
+        "size": size,
+        "unix_ts": ts,
+    }
+
+
 def request_network_uid(
     control_sock: socket.socket,
     device_ip: str,
@@ -496,6 +517,7 @@ def _transfer_latest_file_for_device(
     ap_id = str(row.get("ap_id", "DEFAULT"))
     network_uid = str(row.get("network_uid", ""))
     burrow_id = str(row.get("burrow_id", ""))
+    ready_filename = str(row.get("ready_filename", "") or "").strip()
 
     base_result: dict[str, str | float] = {
         "unique_id": uid,
@@ -544,21 +566,39 @@ def _transfer_latest_file_for_device(
             return base_result
 
         seen = load_received_filenames(file_log_root, uid, device_short_uid=short_uid)
-        if args.transfer_latest_even_if_seen:
-            next_file = select_most_recent_file(
-                remote_txt_files,
-                prefer_prefix=args.prefer_file_prefix,
-                target_yymmdd=target_yymmdd,
-                tr_only=args.tr_only,
-            )
-        else:
-            next_file = select_most_recent_unsaved_file(
-                remote_txt_files,
-                seen,
-                prefer_prefix=args.prefer_file_prefix,
-                target_yymmdd=target_yymmdd,
-                tr_only=args.tr_only,
-            )
+        next_file = ""
+        # READY-driven mode: prefer explicit filename announced by Arduino beacon.
+        if bool(getattr(args, "ready_driven", False)) and ready_filename:
+            ready_match = None
+            for name in remote_txt_files:
+                if str(name).strip().lower() == ready_filename.lower():
+                    ready_match = str(name).strip()
+                    break
+            if ready_match:
+                if args.transfer_latest_even_if_seen or ready_match not in seen:
+                    next_file = ready_match
+                else:
+                    base_result["status"] = "skip"
+                    base_result["source_filename"] = ready_match
+                    base_result["message"] = f"No new files to fetch for {display_id} (READY file already saved)."
+                    return base_result
+
+        if not next_file:
+            if args.transfer_latest_even_if_seen:
+                next_file = select_most_recent_file(
+                    remote_txt_files,
+                    prefer_prefix=args.prefer_file_prefix,
+                    target_yymmdd=target_yymmdd,
+                    tr_only=args.tr_only,
+                )
+            else:
+                next_file = select_most_recent_unsaved_file(
+                    remote_txt_files,
+                    seen,
+                    prefer_prefix=args.prefer_file_prefix,
+                    target_yymmdd=target_yymmdd,
+                    tr_only=args.tr_only,
+                )
 
         if not next_file:
             base_result["status"] = "skip"
@@ -674,6 +714,7 @@ def run_discovery(args: argparse.Namespace) -> int:
     sock.settimeout(0.2)
 
     poll_message = b"POLL_UID"
+    ready_driven = bool(getattr(args, "ready_driven", False))
     if args.discover_ip:
         discover_ips = [args.discover_ip]
     else:
@@ -685,22 +726,30 @@ def run_discovery(args: argparse.Namespace) -> int:
     start = time.monotonic()
 
     print(f"{args.host_label} discovery started.")
-    print(
-        f"Polling {', '.join(f'udp://{ip}:{args.discover_port}' for ip in discover_ips)} "
-        f"from local udp://{bound_bind}:{args.port}"
-    )
+    if ready_driven:
+        print(
+            f"READY-driven discovery: listening on udp://{bound_bind}:{args.port} "
+            "for READY_TO_UPLOAD beacons."
+        )
+    else:
+        print(
+            f"Polling {', '.join(f'udp://{ip}:{args.discover_port}' for ip in discover_ips)} "
+            f"from local udp://{bound_bind}:{args.port}"
+        )
     print(
         f"Waiting up to {args.discover_timeout:.1f}s for replies @ "
         f"{dt.datetime.now().strftime('%H:%M:%S')}"
     )
 
-    for _ in range(args.discover_attempts):
-        for discover_ip in discover_ips:
-            sock.sendto(poll_message, (discover_ip, args.discover_port))
-        if args.discover_interval > 0:
-            time.sleep(args.discover_interval)
+    if not ready_driven:
+        for _ in range(args.discover_attempts):
+            for discover_ip in discover_ips:
+                sock.sendto(poll_message, (discover_ip, args.discover_port))
+            if args.discover_interval > 0:
+                time.sleep(args.discover_interval)
 
     deadline = start + args.discover_timeout
+    ready_by_uid: dict[str, dict[str, str]] = {}
     while time.monotonic() < deadline:
         try:
             data, (src_ip, src_port) = sock.recvfrom(args.buffer_size)
@@ -708,6 +757,45 @@ def run_discovery(args: argparse.Namespace) -> int:
             continue
 
         payload = data.decode("utf-8", errors="replace").strip()
+        ready = parse_ready_to_upload(payload)
+        if ready is not None:
+            uid = str(ready["unique_id"])
+            ready_by_uid[uid] = {
+                "filename": str(ready["filename"]),
+                "size": str(ready["size"]),
+                "unix_ts": str(ready["unix_ts"]),
+                "src_ip": src_ip,
+                "src_port": str(src_port),
+            }
+            # ACK_READY,<uid>,<filename>
+            ack = f"ACK_READY,{uid},{ready['filename']}".encode("utf-8")
+            sock.sendto(ack, (src_ip, args.discover_port))
+            if uid not in discovered:
+                discovered[uid] = {
+                    "unique_id": uid,
+                    "device_ip": src_ip,
+                    "udp_target_ip": "",
+                    "udp_target_port": args.port,
+                    "network_uid": "",
+                    "firmware_version": "",
+                    "network_hostname": "",
+                    "wifi_mac": "",
+                    "recv_ip": src_ip,
+                    "recv_port": src_port,
+                    "last_seen": dt.datetime.now().isoformat(timespec="seconds"),
+                    "ready_filename": str(ready["filename"]),
+                    "ready_size": str(ready["size"]),
+                    "ready_unix_ts": str(ready["unix_ts"]),
+                }
+            else:
+                discovered[uid]["recv_ip"] = src_ip
+                discovered[uid]["recv_port"] = src_port
+                discovered[uid]["last_seen"] = dt.datetime.now().isoformat(timespec="seconds")
+                discovered[uid]["ready_filename"] = str(ready["filename"])
+                discovered[uid]["ready_size"] = str(ready["size"])
+                discovered[uid]["ready_unix_ts"] = str(ready["unix_ts"])
+            continue
+
         parsed = parse_id_response(payload)
         if parsed is None:
             continue
@@ -725,6 +813,10 @@ def run_discovery(args: argparse.Namespace) -> int:
             "recv_port": src_port,
             "last_seen": dt.datetime.now().isoformat(timespec="seconds"),
         }
+        if uid in ready_by_uid:
+            discovered[uid]["ready_filename"] = ready_by_uid[uid]["filename"]
+            discovered[uid]["ready_size"] = ready_by_uid[uid]["size"]
+            discovered[uid]["ready_unix_ts"] = ready_by_uid[uid]["unix_ts"]
 
     if not discovered:
         sock.close()
@@ -870,6 +962,8 @@ def run_discovery(args: argparse.Namespace) -> int:
                 db_enabled = False
 
     print(f"Discovered {len(rows)} Arduino device(s):")
+    if ready_driven:
+        print(f"READY beacons received from {len(ready_by_uid)} device(s).")
     print("unique_id, short_uid, network_uid, firmware_version, udp_target_ip, device_ip, recv_ip")
     for row in rows:
         print(
@@ -958,6 +1052,8 @@ def run_discovery(args: argparse.Namespace) -> int:
         rows_for_transfer: list[dict[str, str | int]] = []
         for row in rows:
             uid = str(row.get("unique_id", "") or "")
+            if ready_driven and uid not in ready_by_uid:
+                continue
             if uid in completed_today:
                 src, ts = completed_today[uid]
                 short_uid = str(row.get("short_uid", "") or "").strip()
@@ -985,6 +1081,8 @@ def run_discovery(args: argparse.Namespace) -> int:
                 f"Completed-upload filter: skipping {len(completed_today)} device(s) "
                 f"already uploaded today for target {target_yymmdd} (TR/RF .TXT)."
             )
+        if ready_driven:
+            print(f"READY-driven transfer candidates: {len(rows_for_transfer)}")
 
         slot_manager = APSlotManager(ap_limits=ap_limits, global_limit=global_limit)
         # Use one worker per device so waiting on AP slot limits does not
