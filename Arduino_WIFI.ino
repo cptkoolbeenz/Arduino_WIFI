@@ -79,6 +79,11 @@ bool wifiLowPowerStandby = false;
 uint32_t wifiLastActivityTs = 0;
 uint32_t wifiNextStandbyProbeTs = 0;
 bool wifiCommandHandled = false;
+bool readyBeaconAcked = false;
+bool uploadCompletedThisWindow = false;
+uint32_t nextReadyBeaconMs = 0;
+String readyUploadFilename = "";
+uint32_t readyBeaconSendCount = 0;
 bool haveLastAcqSample = false;
 long lastAcqSampleValue = 0;
 // Error tracking for diagnostics
@@ -106,6 +111,8 @@ const char REBOOT_MESSAGE[] = "REBOOT";
 const char ENTER_DATA_MODE_MESSAGE[] = "ENTER_DATA_MODE";
 const char GET_LOGS_MESSAGE[] = "GET_LOGS";
 const char CLEAR_ERRORS_MESSAGE[] = "CLEAR_ERRORS";
+const char READY_TO_UPLOAD_MESSAGE[] = "READY_TO_UPLOAD";
+const char ACK_READY_MESSAGE[] = "ACK_READY";
 
 // Cached RTC time support
 uint32_t rtcBaseUnixTs = 0;          // Unix time from last successful RTC read
@@ -150,9 +157,14 @@ const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
 // WiFi-window low-power behavior.
 // After idle timeout in active WiFi mode, drop to standby and wake periodically.
 const bool WIFI_STANDBY_ENABLED = true;
+// Runtime policy gate: keep standby code compiled but disabled in normal flow.
+// Set true in future versions to re-enable standby transitions.
+const bool WIFI_STANDBY_POLICY_ACTIVE = false;
 const uint32_t WIFI_MAINTENANCE_IDLE_SECONDS = 15UL * 60UL;
 const uint32_t WIFI_STANDBY_CHECK_INTERVAL_SECONDS = 30UL;
 const uint32_t WIFI_STANDBY_LISTEN_SECONDS = 8UL;
+const uint32_t READY_BEACON_INTERVAL_MS = 45000UL;
+const uint32_t READY_BEACON_JITTER_MS = 10000UL;
 // Raw file selection policy for trim phase.
 // false: default to yesterday's DL file
 // true : use today's DL file (test mode)
@@ -857,6 +869,81 @@ String findLatestRawDlFilename() {
   }
   root.close();
   return best;
+}
+
+/***********************
+ * Scans SD root and returns latest TR*.TXT by lexical date token.
+ * @return Latest matching filename or empty string.
+ ***********************/
+String findLatestTrimmedTrFilename() {
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return "";
+
+  String best = "";
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      String n = String(entry.name());
+      if (n.length() == 11 && n.startsWith("TR") && n.endsWith(".TXT")) {
+        if (best.length() == 0 || n > best) best = n;
+      }
+    }
+    entry.close();
+  }
+  root.close();
+  return best;
+}
+
+/***********************
+ * Determines preferred READY_TO_UPLOAD filename for this WiFi window.
+ * @return Upload candidate filename.
+ ***********************/
+String determineReadyUploadFilename() {
+  String rawName = trimRawFilenameByDatePolicy();
+  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) rawName = myFilename;
+  if (rawName.length() > 0 && SD.exists(rawName.c_str())) {
+    String trimName = trimFilenameFromRaw(rawName);
+    if (SD.exists(trimName.c_str())) return trimName;
+  }
+  String latestTr = findLatestTrimmedTrFilename();
+  if (latestTr.length() > 0) return latestTr;
+  return myFilename;
+}
+
+/***********************
+ * Sends READY_TO_UPLOAD beacon when due and not yet acknowledged.
+ ***********************/
+void maybeSendReadyToUploadBeacon() {
+  if (!wifiInitialized || !wifiModeActive) return;
+  if (readyBeaconAcked || uploadCompletedThisWindow) return;
+  uint32_t nowMs = millis();
+  if ((int32_t)(nowMs - nextReadyBeaconMs) < 0) return;
+
+  if (readyUploadFilename.length() == 0) readyUploadFilename = determineReadyUploadFilename();
+  if (readyUploadFilename.length() == 0) return;
+
+  unsigned long fileSize = 0UL;
+  File f = SD.open(readyUploadFilename.c_str(), FILE_READ);
+  if (f) {
+    fileSize = (unsigned long)f.size();
+    f.close();
+  }
+
+  String msg = String(READY_TO_UPLOAD_MESSAGE) + "," + deviceId + "," + readyUploadFilename + "," + String(fileSize) + "," + String((unsigned long)Get_TimeStamp());
+  sendUdpMessage(msg, targetIp, UDP_TARGET_PORT);
+  readyBeaconSendCount++;
+  Serial.print(F("Sent I'm ready signal ("));
+  Serial.print(readyBeaconSendCount);
+  Serial.println(F(")"));
+  Serial.print(F("READY payload: "));
+  Serial.println(msg);
+  if (!readyBeaconAcked) {
+    Serial.println(F("Waiting for ACK_READY from bsm_network..."));
+  }
+
+  uint32_t jitter = (READY_BEACON_JITTER_MS > 0) ? (uint32_t)random(0L, (long)READY_BEACON_JITTER_MS + 1L) : 0UL;
+  nextReadyBeaconMs = nowMs + READY_BEACON_INTERVAL_MS + jitter;
 }
 
 /***********************
@@ -1727,6 +1814,8 @@ void sendFileOverTcp(
   client.stop();
   file.close();
   sendUdpMessage("FILE_SENT," + transferId + "," + String(fileSize) + "," + crc32Hex(fullCrc), replyIp, replyPort);
+  uploadCompletedThisWindow = true;
+  readyBeaconAcked = true;
   setLcdStatusLine1("Xfer: done");
 }
 
@@ -1837,6 +1926,21 @@ void serviceWifiCommands() {
   parseBuf[sizeof(parseBuf) - 1] = '\0';
   char *fields[6] = {nullptr};
   int fieldCount = splitCsv(parseBuf, fields, 6);
+
+  if (fieldCount >= 3 && strcmp(fields[0], ACK_READY_MESSAGE) == 0) {
+    String ackUid = String(fields[1]);
+    String ackFile = String(fields[2]);
+    if (ackUid == deviceId) {
+      readyBeaconAcked = true;
+      if (ackFile.length() > 0) readyUploadFilename = ackFile;
+      Serial.print(F("READY handshake complete after "));
+      Serial.print(readyBeaconSendCount);
+      Serial.println(F(" ready signal(s)."));
+      Serial.print(F("READY ACK received for "));
+      Serial.println(readyUploadFilename);
+    }
+    return;
+  }
 
   if (fieldCount >= 1 && strcmp(fields[0], LIST_FILES_MESSAGE) == 0) {
     String transferId = (fieldCount >= 2) ? String(fields[1]) : String("T0");
@@ -2554,6 +2658,11 @@ void loop() {
       wifiOutWindowSinceTs = 0;
       wifiNextStandbyProbeTs = 0;
       wifiIdleAnnounced = false;
+      readyBeaconAcked = false;
+      uploadCompletedThisWindow = false;
+      readyUploadFilename = "";
+      nextReadyBeaconMs = 0;
+      readyBeaconSendCount = 0;
       Serial.println(F("WiFi window entered: reboot/calibration required for this window."));
     }
     wifiWindowCycleInitialized = true;
@@ -2566,6 +2675,11 @@ void loop() {
     wifiLowPowerStandby = false;
     wifiNextStandbyProbeTs = 0;
     wifiIdleAnnounced = false;
+    readyBeaconAcked = false;
+    uploadCompletedThisWindow = false;
+    readyUploadFilename = "";
+    nextReadyBeaconMs = 0;
+    readyBeaconSendCount = 0;
     Serial.println(F("WiFi window exited: reboot gate reset for next window."));
   }
 
@@ -2593,7 +2707,8 @@ void loop() {
       wifiOutWindowSinceTs = 0;
       serviceWifiCommands();
       if (wifiCommandHandled) wifiLastActivityTs = unixTs;
-      if (WIFI_STANDBY_ENABLED && wifiLastActivityTs > 0 && unixTs >= (wifiLastActivityTs + WIFI_MAINTENANCE_IDLE_SECONDS)) {
+      maybeSendReadyToUploadBeacon();
+      if (WIFI_STANDBY_ENABLED && WIFI_STANDBY_POLICY_ACTIVE && wifiLastActivityTs > 0 && unixTs >= (wifiLastActivityTs + WIFI_MAINTENANCE_IDLE_SECONDS)) {
         Serial.println(F("WiFi idle timeout -> standby"));
         exitWifiMode();
         wifiModeActive = false;
@@ -2618,7 +2733,7 @@ void loop() {
       return;
     }
 
-    if (wifiLowPowerStandby && WIFI_STANDBY_ENABLED) {
+    if (wifiLowPowerStandby && WIFI_STANDBY_ENABLED && WIFI_STANDBY_POLICY_ACTIVE) {
       if (unixTs < wifiNextStandbyProbeTs) {
         delay(250);
         return;
@@ -2670,6 +2785,11 @@ void loop() {
       wifiOutWindowSinceTs = 0;
       wifiLowPowerStandby = false;
       wifiLastActivityTs = unixTs;
+      readyBeaconAcked = false;
+      uploadCompletedThisWindow = false;
+      readyUploadFilename = determineReadyUploadFilename();
+      nextReadyBeaconMs = 0;
+      readyBeaconSendCount = 0;
     }
     return;
   }
