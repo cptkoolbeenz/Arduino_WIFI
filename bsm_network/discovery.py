@@ -532,6 +532,7 @@ def _transfer_latest_file_for_device(
         "error_text": "",
         "duration_s": 0.0,
     }
+    rtc_sync_note = ""
 
     control_sock = _open_device_control_socket(bind_ip)
     try:
@@ -548,6 +549,7 @@ def _transfer_latest_file_for_device(
                 print(f"{uid}: RTC sync OK")
             else:
                 print(f"{uid}: RTC sync failed/timeout")
+                rtc_sync_note = " RTC sync failed (upload proceeded)."
 
         remote_files = request_remote_file_list(
             control_sock=control_sock,
@@ -557,12 +559,12 @@ def _transfer_latest_file_for_device(
         )
         if not remote_files:
             base_result["status"] = "skip"
-            base_result["message"] = f"No files reported by {display_id} ({device_ip})."
+            base_result["message"] = f"No files reported by {display_id} ({device_ip}).{rtc_sync_note}"
             return base_result
         remote_txt_files = [name for name in remote_files if str(name).lower().endswith(".txt")]
         if not remote_txt_files:
             base_result["status"] = "skip"
-            base_result["message"] = f"No .txt files reported by {display_id} ({device_ip})."
+            base_result["message"] = f"No .txt files reported by {display_id} ({device_ip}).{rtc_sync_note}"
             return base_result
 
         seen = load_received_filenames(file_log_root, uid, device_short_uid=short_uid)
@@ -580,7 +582,7 @@ def _transfer_latest_file_for_device(
                 else:
                     base_result["status"] = "skip"
                     base_result["source_filename"] = ready_match
-                    base_result["message"] = f"No new files to fetch for {display_id} (READY file already saved)."
+                    base_result["message"] = f"No new files to fetch for {display_id} (READY file already saved).{rtc_sync_note}"
                     return base_result
 
         if not next_file:
@@ -602,7 +604,7 @@ def _transfer_latest_file_for_device(
 
         if not next_file:
             base_result["status"] = "skip"
-            base_result["message"] = f"No new files to fetch for {display_id}."
+            base_result["message"] = f"No new files to fetch for {display_id}.{rtc_sync_note}"
             return base_result
 
         base_result["source_filename"] = next_file
@@ -657,14 +659,14 @@ def _transfer_latest_file_for_device(
 
         base_result["saved_path"] = str(saved_path)
         base_result["status"] = "saved"
-        base_result["message"] = f"Saved file for {display_id}: {saved_path}"
+        base_result["message"] = f"Saved file for {display_id}: {saved_path}{rtc_sync_note}"
         return base_result
     except Exception as exc:
         source = str(base_result.get("source_filename", "")).strip()
         if source:
-            base_result["message"] = f"Transfer failed for {display_id} file {source}: {exc}"
+            base_result["message"] = f"Transfer failed for {display_id} file {source}: {exc}{rtc_sync_note}"
         else:
-            base_result["message"] = f"Transfer failed for {display_id}: {exc}"
+            base_result["message"] = f"Transfer failed for {display_id}: {exc}{rtc_sync_note}"
         base_result["error_text"] = str(exc)
         base_result["status"] = "error"
         return base_result
