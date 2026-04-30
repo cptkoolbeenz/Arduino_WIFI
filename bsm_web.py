@@ -87,7 +87,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "edt"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.0"
+WEB_APP_VERSION = "3.01"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2609,6 +2609,10 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     selected_uid = (selected_uid or "").strip()
     selected_device = _find_device_by_uid(devices, selected_uid)
     selected_burrow = (burrow_input if burrow_input is not None else "").strip()
+    _last_offset_hours, last_preset = get_last_set_time_state()
+    tz_selected = (last_preset or "edt").strip().lower()
+    if tz_selected not in TZ_PRESET_OFFSETS:
+        tz_selected = "edt"
 
     panel_placeholders: dict[str, str] = {
         "RTC Time": "select a known Arduino",
@@ -2632,6 +2636,17 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
         }
     device_rows_html_block = _build_device_select_rows(devices, selected_uid)
 
+    tz_options = [
+        ("ast", "AST (UTC-4)"),
+        ("adt", "ADT (UTC-3)"),
+        ("est", "EST (UTC-5)"),
+        ("edt", "EDT (UTC-4)"),
+    ]
+    tz_options_html = "\n".join(
+        f'<option value="{html.escape(value)}"{" selected" if tz_selected == value else ""}>{html.escape(label)}</option>'
+        for value, label in tz_options
+    )
+
     extra_css = """
     .device-head, .device-sep { white-space: pre; }
     .device-row { white-space: pre; cursor: pointer; border-radius: 4px; }
@@ -2640,6 +2655,8 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     .mini-grid { margin-top: 0.9rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
     .mini-title { margin: 0 0 0.25rem 0; font-size: 0.9rem; color: #304a64; font-weight: 700; }
     .mini-box { border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }
+    .set-rtc-inline { display:flex; align-items:center; gap:0.45rem; flex-wrap:wrap; }
+    .set-rtc-inline select { padding:0.45rem; border:1px solid #9cb2c9; border-radius:4px; background:#fff; color:#1f2937; font-size:0.92rem; }
     @media (max-width: 900px) { .mini-grid { grid-template-columns: 1fr; } }
     """
     body_html = f"""
@@ -2674,14 +2691,14 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
               hidden_class_names={"uid"},
               button_class="needs-device",
           ),
-          _render_action_form(
-              action="/maintenance-action",
-              label="Set RTC Time",
-              method="post",
-              hidden_fields=[("uid", selected_uid), ("action", "set-time")],
-              hidden_input_class="selected-uid-field",
-              hidden_class_names={"uid"},
-              button_class="needs-device",
+          (
+              '<form method="post" action="/maintenance-action" class="set-rtc-inline">'
+              f'<input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />'
+              '<input type="hidden" name="action" value="set-time" />'
+              '<label for="tz_preset">TZ:</label>'
+              f'<select id="tz_preset" name="tz_preset" class="needs-device">{tz_options_html}</select>'
+              '<button type="submit" class="needs-device">Set RTC Time</button>'
+              '</form>'
           ),
           _render_action_form(
               action="/maintenance-action",
@@ -3103,9 +3120,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
                 return True
             if action == "set-time":
+                preset = (form.get("tz_preset") or ["edt"])[0].strip().lower()
+                if preset not in TZ_PRESET_OFFSETS:
+                    self._send_html(
+                        render_maintenance_page(
+                            message=f"Invalid timezone preset: {preset}",
+                            selected_uid=selected_uid,
+                        )
+                    )
+                    return True
+                offset_hours = TZ_PRESET_OFFSETS[preset]
+                set_last_set_time_state(offset_hours, preset)
                 msg = run_maintenance_action_with_retry(
                     action="SET_TIME",
-                    fn=lambda: set_device_time(device_ip=device_ip, offset_hours=WEB_SET_TIME_OFFSET_HOURS),
+                    fn=lambda: set_device_time(device_ip=device_ip, offset_hours=offset_hours),
                     timeout_s=2.0,
                 )
                 append_action_log("maintenance-set-time", msg)
