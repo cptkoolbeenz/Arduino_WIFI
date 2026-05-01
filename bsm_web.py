@@ -1738,6 +1738,17 @@ def render_batch_downloads_page(message: str = "") -> bytes:
           window.alert("Download failed (HTTP " + resp.status + ").");
           return;
         }
+        const ctype = (resp.headers.get("Content-Type") || "").toLowerCase();
+        if (ctype.indexOf("application/zip") < 0) {
+          const errText = await resp.text();
+          setProgress(false, "", 0, "");
+          appendLog("Download failed: expected ZIP response, got '" + ctype + "'.");
+          window.alert("Download failed: server did not return a ZIP file.");
+          if (errText && errText.length > 0) {
+            appendLog("Server response snippet: " + errText.slice(0, 120).replace(/\\s+/g, " "));
+          }
+          return;
+        }
         const total = Number(resp.headers.get("Content-Length") || "0");
         const filename = parseFilenameFromDisposition(resp.headers.get("Content-Disposition") || "");
         const reader = resp.body.getReader();
@@ -1758,15 +1769,21 @@ def render_batch_downloads_page(message: str = "") -> bytes:
           }
         }
         setProgress(true, "Finalizing download...", 100, "Saving file to browser...");
+        if (received < 1) {
+          setProgress(false, "", 0, "");
+          appendLog("Download failed: ZIP payload was empty.");
+          window.alert("Download failed: empty ZIP payload.");
+          return;
+        }
         const blob = new Blob(chunks, { type: "application/zip" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = filename;
+        a.download = (filename && filename.trim().length > 0) ? filename : "batch_download.zip";
         document.body.appendChild(a);
         a.click();
         a.remove();
-        URL.revokeObjectURL(url);
+        window.setTimeout(() => { URL.revokeObjectURL(url); }, 60000);
         appendLog("Download complete: " + filename + " (" + (received / (1024 * 1024)).toFixed(3) + " MB)");
       } catch (_err) {
         appendLog("Download failed: network/stream error.");
