@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import csv
 import json
+import mimetypes
 import sqlite3
 import socket
 import re
@@ -87,7 +88,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.01"
+WEB_APP_VERSION = "3.02"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -1388,6 +1389,31 @@ def delete_local_uploaded_file(saved_path: str) -> tuple[bool, str]:
         return False, f"Delete failed: {exc}"
 
 
+def resolve_local_uploaded_file_for_download(saved_path: str, selected_uid: str = "") -> tuple[Path | None, str]:
+    """Validate and resolve a Gateway-uploaded file path for browser download."""
+    raw = (saved_path or "").strip()
+    if not raw:
+        return None, "No saved_path provided."
+    try:
+        target = Path(raw).expanduser().resolve()
+        output_root = WEB_FILE_OUTPUT_ROOT.resolve()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Invalid path: {exc}"
+    if output_root not in target.parents:
+        return None, f"Refusing download outside upload folder: {target}"
+    if selected_uid:
+        _device, short_uid, _ip = _resolve_device_context_for_uid(selected_uid)
+        if short_uid:
+            expected_dir = (WEB_FILE_OUTPUT_ROOT / short_uid.upper()).resolve()
+            if target.parent != expected_dir:
+                return None, f"File does not belong to selected device folder ({short_uid.upper()})."
+    if not target.exists():
+        return None, f"File not found: {target}"
+    if not target.is_file():
+        return None, f"Not a file: {target}"
+    return target, ""
+
+
 def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
     """Build remote rows html."""
     filtered = []
@@ -2013,6 +2039,12 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         <div>
           <div class="section-title" id="files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
           <div class="list-actions">
+            <form method="get" action="/file-transfers-download-uploaded" id="uploaded-download-form">
+              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+              <input type="hidden" name="saved_path" value="" id="uploaded-download-path" />
+              <input type="hidden" name="source_filename" value="" id="uploaded-download-name" />
+              <button type="submit" id="uploaded-download-button">Download</button>
+            </form>
             <form method="post" action="/file-transfers-delete-uploaded" id="uploaded-delete-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
               <input type="hidden" name="saved_path" value="" id="uploaded-selected-path" />
@@ -2052,12 +2084,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const uploadProgressText = document.getElementById("upload-progress-text");
     const deleteOverlay = document.getElementById("delete-progress-overlay");
     const deleteProgressText = document.getElementById("delete-progress-text");
+    const downloadForm = document.getElementById("uploaded-download-form");
     const deleteForm = document.getElementById("uploaded-delete-form");
     const sdUploadButton = document.getElementById("sd-upload-button");
     const sdDeleteButton = document.getElementById("sd-delete-button");
+    const uploadedDownloadButton = document.getElementById("uploaded-download-button");
     const uploadedDeleteButton = document.getElementById("uploaded-delete-button");
     const selectedPath = document.getElementById("uploaded-selected-path");
     const selectedName = document.getElementById("uploaded-selected-name");
+    const downloadPath = document.getElementById("uploaded-download-path");
+    const downloadName = document.getElementById("uploaded-download-name");
     const pythonLogBox = document.getElementById("pythonlogbox");
     const filesOnTitle = document.getElementById("files-on-title");
     const filesUploadedTitle = document.getElementById("files-uploaded-title");
@@ -2084,6 +2120,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
       if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
       if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
+      if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && hasUploaded);
       if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
     }}
     function setSelectedUid(uid, triggerLoad = true) {{
@@ -2133,12 +2170,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       if (!row) {{
         if (selectedPath) selectedPath.value = "";
         if (selectedName) selectedName.value = "";
+        if (downloadPath) downloadPath.value = "";
+        if (downloadName) downloadName.value = "";
         updateActionButtons();
         return;
       }}
       row.classList.add("selected");
       if (selectedPath) selectedPath.value = row.dataset.path || "";
       if (selectedName) selectedName.value = row.dataset.name || "";
+      if (downloadPath) downloadPath.value = row.dataset.path || "";
+      if (downloadName) downloadName.value = row.dataset.name || "";
       updateActionButtons();
     }}
     function bindUploadedRows() {{
@@ -2362,6 +2403,15 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
             if (deleteOverlay) deleteOverlay.style.display = "none";
             window.alert("Delete request failed before completion. Check activity log.");
           }});
+      }});
+    }}
+    if (downloadForm) {{
+      downloadForm.addEventListener("submit", (ev) => {{
+        const name = (downloadName && downloadName.value) ? downloadName.value : "selected file";
+        const ok = window.confirm("Download selected Gateway file '" + name + "' to this laptop?");
+        if (!ok) {{
+          ev.preventDefault();
+        }}
       }});
     }}
     async function refreshPythonLog() {{
@@ -2944,6 +2994,35 @@ class Handler(BaseHTTPRequestHandler):
         """Serve full HTML page routes."""
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
+            return True
+        if route == "/file-transfers-download-uploaded":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            saved_path = (query.get("saved_path") or [""])[0].strip()
+            source_filename = (query.get("source_filename") or [""])[0].strip()
+            target, err = resolve_local_uploaded_file_for_download(saved_path=saved_path, selected_uid=selected_uid)
+            if target is None:
+                msg = f"Download failed for '{source_filename or 'selected file'}': {err}"
+                append_action_log("file-transfers-download-uploaded", msg)
+                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                return True
+            content_type, _enc = mimetypes.guess_type(str(target))
+            if not content_type:
+                content_type = "application/octet-stream"
+            dl_name = (source_filename or target.name).replace('"', "_")
+            file_size = target.stat().st_size
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{dl_name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(file_size))
+            self.end_headers()
+            with target.open("rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self._safe_write(chunk)
+            append_action_log("file-transfers-download-uploaded", f"Downloaded '{target.name}' ({file_size} bytes).")
             return True
         if route == "/file-transfers":
             selected_uid = (query.get("uid") or [""])[0].strip()
