@@ -90,7 +90,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.03"
+WEB_APP_VERSION = "3.04"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -1546,14 +1546,7 @@ def render_batch_downloads_page(message: str = "") -> bytes:
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - Batch Downloads", state=state, message=message, subtitle="Batch Downloads")
 
     folders = _list_batch_download_folders()
-    dates = _collect_available_batch_dates()
     yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
-
-    date_options = ['<option value="">Choose a date...</option>']
-    for d in [yesterday] + [x for x in dates if x != yesterday]:
-        label = f"{d} (yesterday)" if d == yesterday else d
-        date_options.append(f'<option value="{html.escape(d)}">{html.escape(label)}</option>')
-    date_options_html = "\n".join(date_options)
 
     type_options_html = "\n".join(
         [
@@ -1584,10 +1577,10 @@ def render_batch_downloads_page(message: str = "") -> bytes:
       <form method="get" action="/batch-downloads-download" id="batch-download-form">
         <div class="batch-controls">
           <label for="batch-date">Date:</label>
-          <select id="batch-date" name="date">{date_options_html}</select>
+          <input id="batch-date" name="date" type="date" value="{html.escape(yesterday)}" />
           <label for="batch-kind">Type:</label>
           <select id="batch-kind" name="kind">{type_options_html}</select>
-          <button type="submit" id="batch-download-button">Download to laptop</button>
+          <button type="submit" id="batch-download-button" disabled>Download to laptop</button>
         </div>
       </form>
       <div class="batch-note">Search scope: all Arduino folders under <code>data/files</code>.</div>
@@ -1599,7 +1592,15 @@ def render_batch_downloads_page(message: str = "") -> bytes:
     const form = document.getElementById("batch-download-form");
     const dateSel = document.getElementById("batch-date");
     const kindSel = document.getElementById("batch-kind");
-    if (!form || !dateSel || !kindSel) return;
+    const dlBtn = document.getElementById("batch-download-button");
+    if (!form || !dateSel || !kindSel || !dlBtn) return;
+
+    function refreshButtonState() {
+      const kind = (kindSel.value || "").trim();
+      dlBtn.disabled = (kind.length < 1);
+    }
+    kindSel.addEventListener("change", refreshButtonState);
+    refreshButtonState();
 
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
