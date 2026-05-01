@@ -2159,12 +2159,6 @@ def render_page(message: str = "") -> bytes:
         Use it only for manual diagnostics.
       </div>
 
-      {_render_section_title("Known Arduinos")}
-      <div id="mismatch-banner" class="warn-banner"></div>
-      {_render_scrollbox("devicebox", "Loading Arduino status...", "known-arduino-box")}
-
-      {_render_titled_scroll_panel("Uploads Today", "uploadsbox", "Loading uploaded-file list...")}
-
       <div class="nav-buttons">
         <form method="get" action="/file-transfers">
           <button type="submit" class="placeholder-btn">File Transfers</button>
@@ -2176,6 +2170,12 @@ def render_page(message: str = "") -> bytes:
           <button type="submit" class="placeholder-btn">Batch Downloads</button>
         </form>
       </div>
+
+      {_render_section_title("Known Arduinos")}
+      <div id="mismatch-banner" class="warn-banner"></div>
+      {_render_scrollbox("devicebox", "Loading Arduino status...", "known-arduino-box")}
+
+      {_render_titled_scroll_panel("Uploads Today", "uploadsbox", "Loading uploaded-file list...")}
 
       {_render_titled_scroll_panel("Health", "healthbox", "Loading health status...")}
 
