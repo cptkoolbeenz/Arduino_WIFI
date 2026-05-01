@@ -19,6 +19,8 @@ import sys
 import threading
 import datetime as dt
 import time
+import tempfile
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
@@ -88,7 +90,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.02"
+WEB_APP_VERSION = "3.03"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -1414,6 +1416,89 @@ def resolve_local_uploaded_file_for_download(saved_path: str, selected_uid: str 
     return target, ""
 
 
+def _parse_bundle_date(date_raw: str) -> tuple[dt.date | None, str]:
+    """Parse YYYY-MM-DD date for bundle export; default to yesterday when blank."""
+    txt = (date_raw or "").strip()
+    if not txt:
+        return dt.date.today() - dt.timedelta(days=1), ""
+    try:
+        return dt.datetime.strptime(txt, "%Y-%m-%d").date(), ""
+    except ValueError:
+        return None, f"Invalid date '{txt}'. Use YYYY-MM-DD."
+
+
+def _file_matches_kind(name: str, kind: str) -> bool:
+    """Return whether filename matches requested prefix kind."""
+    u = (name or "").strip().upper()
+    k = (kind or "TRRF").strip().upper()
+    if k == "TR":
+        return u.startswith("TR")
+    if k == "RF":
+        return u.startswith("RF")
+    if k == "TRRF":
+        return u.startswith("TR") or u.startswith("RF")
+    if k == "DL":
+        return u.startswith("DL")
+    if k == "ALL":
+        return u.startswith(("TR", "RF", "DL"))
+    return False
+
+
+def _file_matches_date(p: Path, target_date: dt.date) -> bool:
+    """Match file date using filename token YYMMDD first; fallback to mtime date."""
+    name_u = p.name.upper()
+    m = re.search(r"(TR|RF|DL)(\d{6})", name_u)
+    if m:
+        yymmdd = m.group(2)
+        try:
+            file_date = dt.datetime.strptime(yymmdd, "%y%m%d").date()
+            return file_date == target_date
+        except ValueError:
+            pass
+    try:
+        mtime_date = dt.date.fromtimestamp(p.stat().st_mtime)
+        return mtime_date == target_date
+    except Exception:
+        return False
+
+
+def _iter_bundle_source_files(selected_uid: str, kind: str, target_date: dt.date) -> tuple[list[tuple[Path, str]], str]:
+    """Collect matching Gateway files for bundle download."""
+    files: list[tuple[Path, str]] = []
+    uid = (selected_uid or "").strip()
+    if uid:
+        _device, short_uid, _ip = _resolve_device_context_for_uid(uid)
+        if not short_uid:
+            return [], "No short UID available for selected Arduino."
+        scope_dirs = [WEB_FILE_OUTPUT_ROOT / short_uid.upper()]
+    else:
+        scope_dirs = []
+        if WEB_FILE_OUTPUT_ROOT.exists():
+            for p in WEB_FILE_OUTPUT_ROOT.iterdir():
+                if p.is_dir():
+                    scope_dirs.append(p)
+    if not scope_dirs:
+        return [], "No Gateway upload folders found."
+    for folder in scope_dirs:
+        if not folder.exists() or not folder.is_dir():
+            continue
+        folder_name = folder.name
+        try:
+            for p in folder.iterdir():
+                if not p.is_file():
+                    continue
+                if not _file_matches_kind(p.name, kind):
+                    continue
+                if not _file_matches_date(p, target_date):
+                    continue
+                arcname = f"{folder_name}/{p.name}"
+                files.append((p, arcname))
+        except Exception as exc:  # noqa: BLE001
+            return [], f"Could not read upload folder '{folder}': {exc}"
+    files.sort(key=lambda x: x[1])
+    return files, ""
+
+
 def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
     """Build remote rows html."""
     filtered = []
@@ -2039,6 +2124,12 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         <div>
           <div class="section-title" id="files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
           <div class="list-actions">
+            <form method="get" action="/file-transfers-download-bundle" id="uploaded-bundle-form">
+              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+              <input type="hidden" name="kind" value="TRRF" id="bundle-kind" />
+              <input type="hidden" name="date" value="" id="bundle-date" />
+              <button type="submit" id="uploaded-bundle-button">Download Date Bundle</button>
+            </form>
             <form method="get" action="/file-transfers-download-uploaded" id="uploaded-download-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
               <input type="hidden" name="saved_path" value="" id="uploaded-download-path" />
@@ -2084,10 +2175,14 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const uploadProgressText = document.getElementById("upload-progress-text");
     const deleteOverlay = document.getElementById("delete-progress-overlay");
     const deleteProgressText = document.getElementById("delete-progress-text");
+    const bundleForm = document.getElementById("uploaded-bundle-form");
+    const bundleKind = document.getElementById("bundle-kind");
+    const bundleDate = document.getElementById("bundle-date");
     const downloadForm = document.getElementById("uploaded-download-form");
     const deleteForm = document.getElementById("uploaded-delete-form");
     const sdUploadButton = document.getElementById("sd-upload-button");
     const sdDeleteButton = document.getElementById("sd-delete-button");
+    const uploadedBundleButton = document.getElementById("uploaded-bundle-button");
     const uploadedDownloadButton = document.getElementById("uploaded-download-button");
     const uploadedDeleteButton = document.getElementById("uploaded-delete-button");
     const selectedPath = document.getElementById("uploaded-selected-path");
@@ -2120,6 +2215,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
       if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
       if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
+      if (uploadedBundleButton) uploadedBundleButton.disabled = !hasUid;
       if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && hasUploaded);
       if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
     }}
@@ -2412,6 +2508,41 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         if (!ok) {{
           ev.preventDefault();
         }}
+      }});
+    }}
+    if (bundleForm) {{
+      bundleForm.addEventListener("submit", (ev) => {{
+        const dateInput = window.prompt("Enter date for bundle (YYYY-MM-DD). Leave blank for yesterday.");
+        if (dateInput === null) {{
+          ev.preventDefault();
+          return;
+        }}
+        const selected = window.prompt("Choose file set: TR files | RF files | TR+RF | DL files | ALL", "TR+RF");
+        if (selected === null) {{
+          ev.preventDefault();
+          return;
+        }}
+        const norm = selected.trim().toUpperCase();
+        let kind = "";
+        if (norm === "TR FILES" || norm === "TR") kind = "TR";
+        else if (norm === "RF FILES" || norm === "RF") kind = "RF";
+        else if (norm === "TR+RF" || norm === "TRRF") kind = "TRRF";
+        else if (norm === "DL FILES" || norm === "DL") kind = "DL";
+        else if (norm === "ALL") kind = "ALL";
+        else {{
+          window.alert("Invalid choice. Use: TR files, RF files, TR+RF, DL files, or ALL.");
+          ev.preventDefault();
+          return;
+        }}
+        if (kind === "DL" || kind === "ALL") {{
+          const warn = window.confirm("DL files are very large. Are you sure you want to do this?");
+          if (!warn) {{
+            ev.preventDefault();
+            return;
+          }}
+        }}
+        if (bundleKind) bundleKind.value = kind;
+        if (bundleDate) bundleDate.value = (dateInput || "").trim();
       }});
     }}
     async function refreshPythonLog() {{
@@ -3023,6 +3154,47 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self._safe_write(chunk)
             append_action_log("file-transfers-download-uploaded", f"Downloaded '{target.name}' ({file_size} bytes).")
+            return True
+        if route == "/file-transfers-download-bundle":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            kind = (query.get("kind") or ["TRRF"])[0].strip().upper()
+            date_raw = (query.get("date") or [""])[0].strip()
+            target_date, date_err = _parse_bundle_date(date_raw)
+            if target_date is None:
+                msg = f"Bundle download failed: {date_err}"
+                append_action_log("file-transfers-download-bundle", msg)
+                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                return True
+            files, err = _iter_bundle_source_files(selected_uid=selected_uid, kind=kind, target_date=target_date)
+            if err:
+                msg = f"Bundle download failed: {err}"
+                append_action_log("file-transfers-download-bundle", msg)
+                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                return True
+            if not files:
+                msg = f"No files found for {target_date.isoformat()} filter={kind}."
+                append_action_log("file-transfers-download-bundle", msg)
+                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+                return True
+            scope_tag = "selected" if selected_uid else "all"
+            zip_name = f"gateway_files_{target_date.isoformat()}_{kind}_{scope_tag}.zip"
+            with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, mode="w+b") as tmp:
+                with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p, arcname in files:
+                        zf.write(p, arcname)
+                tmp.seek(0)
+                raw = tmp.read()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self._safe_write(raw)
+            append_action_log(
+                "file-transfers-download-bundle",
+                f"Downloaded bundle '{zip_name}' files={len(files)} filter={kind} date={target_date.isoformat()}",
+            )
             return True
         if route == "/file-transfers":
             selected_uid = (query.get("uid") or [""])[0].strip()
