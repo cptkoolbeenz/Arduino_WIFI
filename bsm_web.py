@@ -1499,6 +1499,190 @@ def _iter_bundle_source_files(selected_uid: str, kind: str, target_date: dt.date
     return files, ""
 
 
+def _list_batch_download_folders() -> list[str]:
+    """List Arduino upload folders under data/files."""
+    out: list[str] = []
+    root = WEB_FILE_OUTPUT_ROOT
+    if not root.exists() or not root.is_dir():
+        return out
+    for p in sorted(root.iterdir(), key=lambda x: x.name.upper()):
+        if p.is_dir():
+            out.append(p.name)
+    return out
+
+
+def _collect_available_batch_dates(max_items: int = 60) -> list[str]:
+    """Collect distinct YYYY-MM-DD dates present in Gateway upload files."""
+    dates: set[str] = set()
+    for folder in _list_batch_download_folders():
+        d = WEB_FILE_OUTPUT_ROOT / folder
+        try:
+            for p in d.iterdir():
+                if not p.is_file():
+                    continue
+                name_u = p.name.upper()
+                m = re.search(r"(TR|RF|DL)(\d{6})", name_u)
+                file_date: dt.date | None = None
+                if m:
+                    try:
+                        file_date = dt.datetime.strptime(m.group(2), "%y%m%d").date()
+                    except ValueError:
+                        file_date = None
+                if file_date is None:
+                    try:
+                        file_date = dt.date.fromtimestamp(p.stat().st_mtime)
+                    except Exception:
+                        continue
+                dates.add(file_date.isoformat())
+        except Exception:
+            continue
+    return sorted(dates, reverse=True)[:max_items]
+
+
+def render_batch_downloads_page(message: str = "") -> bytes:
+    """Render batch downloads page."""
+    running, pid = MANAGER.status()
+    state = f"RUNNING (PID {pid})" if running else "STOPPED"
+    ctx = PageContext(page_title=f"{WEB_APP_NAME} - Batch Downloads", state=state, message=message, subtitle="Batch Downloads")
+
+    folders = _list_batch_download_folders()
+    dates = _collect_available_batch_dates()
+    yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+
+    date_options = ['<option value="">Choose a date...</option>']
+    for d in [yesterday] + [x for x in dates if x != yesterday]:
+        label = f"{d} (yesterday)" if d == yesterday else d
+        date_options.append(f'<option value="{html.escape(d)}">{html.escape(label)}</option>')
+    date_options_html = "\n".join(date_options)
+
+    type_options_html = "\n".join(
+        [
+            '<option value="">Choose file type...</option>',
+            '<option value="TR">TR files</option>',
+            '<option value="RF">RF files</option>',
+            '<option value="TRRF">TR+RF</option>',
+            '<option value="DL">DL files</option>',
+            '<option value="ALL">ALL</option>',
+        ]
+    )
+
+    folders_text = "\n".join(folders) if folders else "(No Arduino folders found under data/files)"
+
+    extra_css = """
+    .batch-controls { margin-top: 0.8rem; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+    .batch-controls select { padding: 0.45rem; border: 1px solid #9cb2c9; border-radius: 4px; background: #fff; color: #1f2937; }
+    .batch-note { margin-top: 0.4rem; color: #4b5563; font-size: 0.88rem; }
+    .folder-box { white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    """
+    body_html = f"""
+      {_render_controls_row([
+          _render_action_form(action="/", label="Dashboard", method="get"),
+          _render_action_form(action="/file-transfers", label="File Transfers", method="get"),
+          _render_action_form(action="/maintenance", label="Maintenance", method="get"),
+      ])}
+
+      <form method="get" action="/batch-downloads-download" id="batch-download-form">
+        <div class="batch-controls">
+          <label for="batch-date">Date:</label>
+          <select id="batch-date" name="date">{date_options_html}</select>
+          <label for="batch-kind">Type:</label>
+          <select id="batch-kind" name="kind">{type_options_html}</select>
+          <button type="submit" id="batch-download-button">Download to laptop</button>
+        </div>
+      </form>
+      <div class="batch-note">Search scope: all Arduino folders under <code>data/files</code>.</div>
+
+      {_render_titled_scroll_panel("Arduino Folders (from data/files)", "batch-folders-box", folders_text, extra_classes="folder-box")}
+    """
+    script_js = """
+  (function() {
+    const form = document.getElementById("batch-download-form");
+    const dateSel = document.getElementById("batch-date");
+    const kindSel = document.getElementById("batch-kind");
+    if (!form || !dateSel || !kindSel) return;
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const date = (dateSel.value || "").trim();
+      const kind = (kindSel.value || "").trim().toUpperCase();
+      if (!date) {
+        window.alert("Choose a date first.");
+        return;
+      }
+      if (!kind) {
+        window.alert("Choose a file type first.");
+        return;
+      }
+      const previewUrl = "/api/batch-downloads/preview?date=" + encodeURIComponent(date) + "&kind=" + encodeURIComponent(kind);
+      let payload = null;
+      try {
+        const resp = await fetch(previewUrl, { cache: "no-store" });
+        payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) {
+          window.alert((payload && payload.message) ? payload.message : "Could not build batch preview.");
+          return;
+        }
+      } catch (_err) {
+        window.alert("Could not build batch preview.");
+        return;
+      }
+      const count = Number(payload.file_count || 0);
+      const totalMb = Number(payload.total_mb || 0);
+      if (count < 1) {
+        window.alert("No matching files found for that date/type.");
+        return;
+      }
+      const msg = "Batch download summary:\\n"
+        + "Date: " + payload.date + "\\n"
+        + "Type: " + payload.kind + "\\n"
+        + "Files: " + count + "\\n"
+        + "Total MB: " + totalMb.toFixed(3) + "\\n\\n"
+        + "Confirm download?";
+      const ok = window.confirm(msg);
+      if (!ok) return;
+      const downloadUrl = "/batch-downloads-download?date=" + encodeURIComponent(payload.date) + "&kind=" + encodeURIComponent(payload.kind);
+      window.location.assign(downloadUrl);
+    });
+  })();
+"""
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+        script_js=script_js,
+    )
+
+
+def get_batch_download_preview_payload(date_raw: str, kind: str) -> dict[str, object]:
+    """Return preview stats for batch download across all Arduino folders."""
+    target_date, date_err = _parse_bundle_date(date_raw)
+    k = (kind or "").strip().upper()
+    if target_date is None:
+        return {"ok": False, "message": date_err}
+    if k not in {"TR", "RF", "TRRF", "DL", "ALL"}:
+        return {"ok": False, "message": "Invalid type. Choose TR, RF, TR+RF, DL, or ALL."}
+    files, err = _iter_bundle_source_files(selected_uid="", kind=k, target_date=target_date)
+    if err:
+        return {"ok": False, "message": err}
+    total_bytes = 0
+    for p, _arc in files:
+        try:
+            total_bytes += p.stat().st_size
+        except Exception:
+            continue
+    return {
+        "ok": True,
+        "date": target_date.isoformat(),
+        "kind": k,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "total_mb": float(total_bytes) / (1024.0 * 1024.0),
+    }
+
+
 def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
     """Build remote rows html."""
     filtered = []
@@ -1838,7 +2022,9 @@ def render_page(message: str = "") -> bytes:
         <form method="get" action="/maintenance">
           <button type="submit" class="placeholder-btn">Maintenance</button>
         </form>
-        <button type="button" class="placeholder-btn">Other</button>
+        <form method="get" action="/batch-downloads">
+          <button type="submit" class="placeholder-btn">Batch Downloads</button>
+        </form>
       </div>
 
       {_render_titled_scroll_panel("Health", "healthbox", "Loading health status...")}
@@ -2124,12 +2310,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         <div>
           <div class="section-title" id="files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
           <div class="list-actions">
-            <form method="get" action="/file-transfers-download-bundle" id="uploaded-bundle-form">
-              <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-              <input type="hidden" name="kind" value="TRRF" id="bundle-kind" />
-              <input type="hidden" name="date" value="" id="bundle-date" />
-              <button type="submit" id="uploaded-bundle-button">Download Date Bundle</button>
-            </form>
             <form method="get" action="/file-transfers-download-uploaded" id="uploaded-download-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
               <input type="hidden" name="saved_path" value="" id="uploaded-download-path" />
@@ -2175,14 +2355,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     const uploadProgressText = document.getElementById("upload-progress-text");
     const deleteOverlay = document.getElementById("delete-progress-overlay");
     const deleteProgressText = document.getElementById("delete-progress-text");
-    const bundleForm = document.getElementById("uploaded-bundle-form");
-    const bundleKind = document.getElementById("bundle-kind");
-    const bundleDate = document.getElementById("bundle-date");
     const downloadForm = document.getElementById("uploaded-download-form");
     const deleteForm = document.getElementById("uploaded-delete-form");
     const sdUploadButton = document.getElementById("sd-upload-button");
     const sdDeleteButton = document.getElementById("sd-delete-button");
-    const uploadedBundleButton = document.getElementById("uploaded-bundle-button");
     const uploadedDownloadButton = document.getElementById("uploaded-download-button");
     const uploadedDeleteButton = document.getElementById("uploaded-delete-button");
     const selectedPath = document.getElementById("uploaded-selected-path");
@@ -2215,7 +2391,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
       if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
       if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
-      if (uploadedBundleButton) uploadedBundleButton.disabled = !hasUid;
       if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && hasUploaded);
       if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
     }}
@@ -2508,41 +2683,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         if (!ok) {{
           ev.preventDefault();
         }}
-      }});
-    }}
-    if (bundleForm) {{
-      bundleForm.addEventListener("submit", (ev) => {{
-        const dateInput = window.prompt("Enter date for bundle (YYYY-MM-DD). Leave blank for yesterday.");
-        if (dateInput === null) {{
-          ev.preventDefault();
-          return;
-        }}
-        const selected = window.prompt("Choose file set: TR files | RF files | TR+RF | DL files | ALL", "TR+RF");
-        if (selected === null) {{
-          ev.preventDefault();
-          return;
-        }}
-        const norm = selected.trim().toUpperCase();
-        let kind = "";
-        if (norm === "TR FILES" || norm === "TR") kind = "TR";
-        else if (norm === "RF FILES" || norm === "RF") kind = "RF";
-        else if (norm === "TR+RF" || norm === "TRRF") kind = "TRRF";
-        else if (norm === "DL FILES" || norm === "DL") kind = "DL";
-        else if (norm === "ALL") kind = "ALL";
-        else {{
-          window.alert("Invalid choice. Use: TR files, RF files, TR+RF, DL files, or ALL.");
-          ev.preventDefault();
-          return;
-        }}
-        if (kind === "DL" || kind === "ALL") {{
-          const warn = window.confirm("DL files are very large. Are you sure you want to do this?");
-          if (!warn) {{
-            ev.preventDefault();
-            return;
-          }}
-        }}
-        if (bundleKind) bundleKind.value = kind;
-        if (bundleDate) bundleDate.value = (dateInput || "").trim();
       }});
     }}
     async function refreshPythonLog() {{
@@ -3103,6 +3243,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         """Serve JSON data endpoints for File Transfers/Maintenance pages."""
+        if route == "/api/batch-downloads/preview":
+            date_raw = (query.get("date") or [""])[0].strip()
+            kind = (query.get("kind") or [""])[0].strip().upper()
+            self._send_json(get_batch_download_preview_payload(date_raw=date_raw, kind=kind))
+            return True
         if route == "/api/file-transfers/remote-files":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_json(get_file_transfers_remote_files_payload(selected_uid))
@@ -3125,6 +3270,49 @@ class Handler(BaseHTTPRequestHandler):
         """Serve full HTML page routes."""
         if route == "/logs":
             self._send_text(read_log_tail(MANAGER._log_path))
+            return True
+        if route == "/batch-downloads":
+            self._send_html(render_batch_downloads_page())
+            return True
+        if route == "/batch-downloads-download":
+            date_raw = (query.get("date") or [""])[0].strip()
+            kind = (query.get("kind") or [""])[0].strip().upper()
+            preview = get_batch_download_preview_payload(date_raw=date_raw, kind=kind)
+            if not bool(preview.get("ok")):
+                msg = f"Batch download failed: {preview.get('message', 'unknown error')}"
+                append_action_log("batch-downloads-download", msg)
+                self._send_html(render_batch_downloads_page(message=msg))
+                return True
+            target_date = str(preview.get("date", "")).strip()
+            files, err = _iter_bundle_source_files(selected_uid="", kind=kind, target_date=dt.datetime.strptime(target_date, "%Y-%m-%d").date())
+            if err:
+                msg = f"Batch download failed: {err}"
+                append_action_log("batch-downloads-download", msg)
+                self._send_html(render_batch_downloads_page(message=msg))
+                return True
+            if not files:
+                msg = f"No files found for {target_date} type={kind}."
+                append_action_log("batch-downloads-download", msg)
+                self._send_html(render_batch_downloads_page(message=msg))
+                return True
+            zip_name = f"gateway_files_{target_date}_{kind}_all.zip"
+            with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, mode="w+b") as tmp:
+                with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for p, arcname in files:
+                        zf.write(p, arcname)
+                tmp.seek(0)
+                raw = tmp.read()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self._safe_write(raw)
+            append_action_log(
+                "batch-downloads-download",
+                f"Downloaded bundle '{zip_name}' files={len(files)} filter={kind} date={target_date}",
+            )
             return True
         if route == "/file-transfers-download-uploaded":
             selected_uid = (query.get("uid") or [""])[0].strip()
@@ -3154,47 +3342,6 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self._safe_write(chunk)
             append_action_log("file-transfers-download-uploaded", f"Downloaded '{target.name}' ({file_size} bytes).")
-            return True
-        if route == "/file-transfers-download-bundle":
-            selected_uid = (query.get("uid") or [""])[0].strip()
-            kind = (query.get("kind") or ["TRRF"])[0].strip().upper()
-            date_raw = (query.get("date") or [""])[0].strip()
-            target_date, date_err = _parse_bundle_date(date_raw)
-            if target_date is None:
-                msg = f"Bundle download failed: {date_err}"
-                append_action_log("file-transfers-download-bundle", msg)
-                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                return True
-            files, err = _iter_bundle_source_files(selected_uid=selected_uid, kind=kind, target_date=target_date)
-            if err:
-                msg = f"Bundle download failed: {err}"
-                append_action_log("file-transfers-download-bundle", msg)
-                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                return True
-            if not files:
-                msg = f"No files found for {target_date.isoformat()} filter={kind}."
-                append_action_log("file-transfers-download-bundle", msg)
-                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                return True
-            scope_tag = "selected" if selected_uid else "all"
-            zip_name = f"gateway_files_{target_date.isoformat()}_{kind}_{scope_tag}.zip"
-            with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, mode="w+b") as tmp:
-                with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for p, arcname in files:
-                        zf.write(p, arcname)
-                tmp.seek(0)
-                raw = tmp.read()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self._safe_write(raw)
-            append_action_log(
-                "file-transfers-download-bundle",
-                f"Downloaded bundle '{zip_name}' files={len(files)} filter={kind} date={target_date.isoformat()}",
-            )
             return True
         if route == "/file-transfers":
             selected_uid = (query.get("uid") or [""])[0].strip()
