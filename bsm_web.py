@@ -1564,8 +1564,43 @@ def render_batch_downloads_page(message: str = "") -> bytes:
     extra_css = """
     .batch-controls { margin-top: 0.8rem; display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
     .batch-controls select { padding: 0.45rem; border: 1px solid #9cb2c9; border-radius: 4px; background: #fff; color: #1f2937; }
+    .batch-controls input[type="date"] { padding: 0.45rem; border: 1px solid #9cb2c9; border-radius: 4px; background: #fff; color: #1f2937; }
     .batch-note { margin-top: 0.4rem; color: #4b5563; font-size: 0.88rem; }
     .folder-box { white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .progress-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(13, 29, 47, 0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+    }
+    .progress-card {
+      background: #ffffff;
+      border: 1px solid #9cb2c9;
+      border-radius: 8px;
+      min-width: 320px;
+      padding: 0.8rem 1rem;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.18);
+      color: #1f2937;
+    }
+    .progress-title { margin: 0 0 0.45rem 0; font-weight: 700; }
+    .progress-meta { margin: 0.45rem 0 0 0; font-size: 0.88rem; color: #475569; }
+    .progress-bar-wrap {
+      width: 100%;
+      height: 10px;
+      border: 1px solid #9cb2c9;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #e5edf6;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #2f75bb 0%, #0b5ea8 100%);
+      transition: width 0.15s linear;
+    }
     """
     body_html = f"""
       {_render_controls_row([
@@ -1586,6 +1621,15 @@ def render_batch_downloads_page(message: str = "") -> bytes:
       <div class="batch-note">Search scope: all Arduino folders under <code>data/files</code>.</div>
 
       {_render_titled_scroll_panel("Arduino Folders (from data/files)", "batch-folders-box", folders_text, extra_classes="folder-box")}
+      {_render_titled_scroll_panel("Batch Activity Log", "batch-activity-box", "Batch Downloads page ready.")}
+
+      <div id="batch-progress-overlay" class="progress-overlay">
+        <div class="progress-card">
+          <div class="progress-title" id="batch-progress-title">Preparing batch download...</div>
+          <div class="progress-bar-wrap"><div id="batch-progress-bar" class="progress-bar"></div></div>
+          <p class="progress-meta" id="batch-progress-meta">0%</p>
+        </div>
+      </div>
     """
     script_js = """
   (function() {
@@ -1593,7 +1637,33 @@ def render_batch_downloads_page(message: str = "") -> bytes:
     const dateSel = document.getElementById("batch-date");
     const kindSel = document.getElementById("batch-kind");
     const dlBtn = document.getElementById("batch-download-button");
-    if (!form || !dateSel || !kindSel || !dlBtn) return;
+    const activityBox = document.getElementById("batch-activity-box");
+    const overlay = document.getElementById("batch-progress-overlay");
+    const progTitle = document.getElementById("batch-progress-title");
+    const progBar = document.getElementById("batch-progress-bar");
+    const progMeta = document.getElementById("batch-progress-meta");
+    if (!form || !dateSel || !kindSel || !dlBtn || !activityBox || !overlay || !progTitle || !progBar || !progMeta) return;
+
+    function appendLog(line) {
+      const ts = new Date().toLocaleTimeString();
+      const cur = activityBox.textContent || "";
+      const next = (cur ? (cur + "\\n") : "") + "[" + ts + "] " + line;
+      activityBox.textContent = next;
+      activityBox.scrollTop = activityBox.scrollHeight;
+    }
+    function setProgress(visible, title, pct, meta) {
+      overlay.style.display = visible ? "flex" : "none";
+      progTitle.textContent = title || "";
+      const safePct = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
+      progBar.style.width = safePct.toFixed(1) + "%";
+      progMeta.textContent = meta || (safePct.toFixed(1) + "%");
+    }
+    function parseFilenameFromDisposition(contentDisposition) {
+      if (!contentDisposition) return "batch_download.zip";
+      const m = /filename=\"([^\"]+)\"/i.exec(contentDisposition);
+      if (m && m[1]) return m[1];
+      return "batch_download.zip";
+    }
 
     function refreshButtonState() {
       const kind = (kindSel.value || "").trim();
@@ -1608,31 +1678,42 @@ def render_batch_downloads_page(message: str = "") -> bytes:
       const kind = (kindSel.value || "").trim().toUpperCase();
       if (!date) {
         window.alert("Choose a date first.");
+        appendLog("Missing date selection.");
         return;
       }
       if (!kind) {
         window.alert("Choose a file type first.");
+        appendLog("Missing file-type selection.");
         return;
       }
       const previewUrl = "/api/batch-downloads/preview?date=" + encodeURIComponent(date) + "&kind=" + encodeURIComponent(kind);
       let payload = null;
+      appendLog("Building preview for date=" + date + " type=" + kind + "...");
+      setProgress(true, "Preparing batch preview...", 5, "Preparing...");
       try {
         const resp = await fetch(previewUrl, { cache: "no-store" });
         payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {
+          setProgress(false, "", 0, "");
+          appendLog("Preview failed: " + ((payload && payload.message) ? payload.message : "unknown error"));
           window.alert((payload && payload.message) ? payload.message : "Could not build batch preview.");
           return;
         }
       } catch (_err) {
+        setProgress(false, "", 0, "");
+        appendLog("Preview failed: request error.");
         window.alert("Could not build batch preview.");
         return;
       }
       const count = Number(payload.file_count || 0);
       const totalMb = Number(payload.total_mb || 0);
       if (count < 1) {
+        setProgress(false, "", 0, "");
+        appendLog("No matching files found.");
         window.alert("No matching files found for that date/type.");
         return;
       }
+      appendLog("Preview ready: files=" + count + " total_mb=" + totalMb.toFixed(3));
       const msg = "Batch download summary:\\n"
         + "Date: " + payload.date + "\\n"
         + "Type: " + payload.kind + "\\n"
@@ -1640,9 +1721,60 @@ def render_batch_downloads_page(message: str = "") -> bytes:
         + "Total MB: " + totalMb.toFixed(3) + "\\n\\n"
         + "Confirm download?";
       const ok = window.confirm(msg);
-      if (!ok) return;
+      if (!ok) {
+        setProgress(false, "", 0, "");
+        appendLog("User canceled batch download.");
+        return;
+      }
       const downloadUrl = "/batch-downloads-download?date=" + encodeURIComponent(payload.date) + "&kind=" + encodeURIComponent(payload.kind);
-      window.location.assign(downloadUrl);
+      appendLog("Starting download...");
+      setProgress(true, "Downloading batch zip...", 8, "Starting transfer...");
+      dlBtn.disabled = true;
+      try {
+        const resp = await fetch(downloadUrl, { cache: "no-store" });
+        if (!resp.ok || !resp.body) {
+          setProgress(false, "", 0, "");
+          appendLog("Download failed: HTTP " + resp.status);
+          window.alert("Download failed (HTTP " + resp.status + ").");
+          return;
+        }
+        const total = Number(resp.headers.get("Content-Length") || "0");
+        const filename = parseFilenameFromDisposition(resp.headers.get("Content-Disposition") || "");
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const r = await reader.read();
+          if (r.done) break;
+          if (r.value) {
+            chunks.push(r.value);
+            received += r.value.length;
+            if (total > 0) {
+              const pct = (received * 100.0) / total;
+              setProgress(true, "Downloading batch zip...", pct, pct.toFixed(1) + "% (" + received + "/" + total + " bytes)");
+            } else {
+              setProgress(true, "Downloading batch zip...", 50, "Received " + received + " bytes...");
+            }
+          }
+        }
+        setProgress(true, "Finalizing download...", 100, "Saving file to browser...");
+        const blob = new Blob(chunks, { type: "application/zip" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        appendLog("Download complete: " + filename + " (" + (received / (1024 * 1024)).toFixed(3) + " MB)");
+      } catch (_err) {
+        appendLog("Download failed: network/stream error.");
+        window.alert("Download failed while transferring data.");
+      } finally {
+        setProgress(false, "", 0, "");
+        refreshButtonState();
+      }
     });
   })();
 """
