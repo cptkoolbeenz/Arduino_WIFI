@@ -91,7 +91,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.05"
+WEB_APP_VERSION = "3.051"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2138,76 +2138,19 @@ def _read_text_preview(path: Path, max_bytes: int = 256 * 1024) -> str:
     return text
 
 
-def _rf_sort_key(row: list[str]) -> tuple[int, int | float | str]:
-    """Sort key for RF rows using first column as time-like key when possible."""
-    if not row:
-        return (2, "")
-    first = (row[0] or "").strip()
-    if first.isdigit():
-        try:
-            return (0, int(first))
-        except ValueError:
-            pass
-    try:
-        return (1, float(first))
-    except ValueError:
-        return (2, first)
-
-
-def _format_rf_preview_text(raw_text: str, order: str = "asc", max_rows: int = 3000) -> str:
-    """Format raw preview text into aligned columns and sorted rows."""
-    rows: list[list[str]] = []
-    for line in (raw_text or "").splitlines():
-        txt = line.strip()
-        if not txt:
-            continue
-        rows.append([part.strip() for part in txt.split(",")])
-    if not rows:
-        return "(No rows found in file)"
-
-    reverse = (order or "asc").strip().lower() == "desc"
-    rows.sort(key=_rf_sort_key, reverse=reverse)
-    if len(rows) > max_rows:
-        rows = rows[:max_rows]
-
-    cols = max(len(r) for r in rows)
-    widths: list[int] = [0] * cols
-    for c in range(cols):
-        header = f"col{c + 1}"
-        w = len(header)
-        for r in rows:
-            if c < len(r):
-                w = max(w, len(r[c]))
-        widths[c] = min(w, 28)
-
-    header_parts = [f"col{c + 1}".ljust(widths[c]) for c in range(cols)]
-    sep_parts = [("-" * widths[c]) for c in range(cols)]
-    out = ["  ".join(header_parts), "  ".join(sep_parts)]
-    for r in rows:
-        parts: list[str] = []
-        for c in range(cols):
-            cell = r[c] if c < len(r) else ""
-            if len(cell) > widths[c]:
-                cell = cell[: max(1, widths[c] - 1)] + "~"
-            parts.append(cell.ljust(widths[c]))
-        out.append("  ".join(parts))
-    return "\n".join(out)
-
-
-def get_rf_data_local_preview_payload(selected_uid: str, saved_path: str, order: str = "asc") -> dict[str, object]:
+def get_rf_data_local_preview_payload(selected_uid: str, saved_path: str) -> dict[str, object]:
     """Preview a Gateway-uploaded file from the selected row."""
     target, err = resolve_local_uploaded_file_for_download(saved_path=saved_path, selected_uid=selected_uid)
     if target is None:
         return {"ok": False, "message": err}
     try:
         text = _read_text_preview(target)
-        formatted = _format_rf_preview_text(text, order=order)
-        return {"ok": True, "source": "gateway", "name": target.name, "text": formatted}
+        return {"ok": True, "source": "gateway", "name": target.name, "text": text}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": f"Could not read local preview: {exc}"}
 
 
-def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str, order: str = "asc") -> dict[str, object]:
+def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str) -> dict[str, object]:
     """Preview an Arduino SD file by transferring it to a temporary local file."""
     uid = (selected_uid or "").strip()
     rfn = (remote_filename or "").strip()
@@ -2245,8 +2188,7 @@ def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str, 
                 mark_partial_received=False,
             )
             text = _read_text_preview(saved_path)
-            formatted = _format_rf_preview_text(text, order=order)
-            return {"ok": True, "source": "arduino", "name": rfn, "text": formatted}
+            return {"ok": True, "source": "arduino", "name": rfn, "text": text}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": f"Could not preview remote file '{rfn}': {exc}"}
     finally:
@@ -2289,8 +2231,8 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
     .upload-row:hover { background: #eef5ff; }
     .upload-row.selected { background: #ffe1ba; font-weight: 700; }
     .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
-    .preview-row { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: minmax(520px, 720px) 1fr; align-items: start; }
-    .preview-box-narrow { max-width: 720px; }
+    .preview-row { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; align-items: start; }
+    .preview-box-narrow { max-width: none; }
     .sort-panel { border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; padding: 0.65rem; }
     .sort-panel label { display: block; margin-bottom: 0.35rem; font-weight: 700; color: #304a64; }
     .sort-panel select { width: 100%; padding: 0.45rem; border: 1px solid #9cb2c9; border-radius: 4px; background: #fff; color: #1f2937; }
@@ -2299,7 +2241,7 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
     .loading-bar-wrap { width: 220px; height: 8px; border: 1px solid #9cb2c9; border-radius: 999px; background: #e5edf6; overflow: hidden; margin-top: 0.3rem; }
     .loading-bar { width: 42%; height: 100%; background: linear-gradient(90deg, #2f75bb, #0b5ea8); animation: rfLoad 1s linear infinite; }
     @keyframes rfLoad { 0% { transform: translateX(-120%);} 100% { transform: translateX(280%);} }
-    @media (max-width: 1200px) { .grid2 { grid-template-columns: 1fr; } .preview-row { grid-template-columns: 1fr; } .preview-box-narrow { max-width: none; } }
+    @media (max-width: 1200px) { .grid2 { grid-template-columns: 1fr; } .preview-row { grid-template-columns: 1fr; } }
     """
     body_html = f"""
       {_render_controls_row([
@@ -2436,6 +2378,87 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
       }
       bindUploadedRows();
     }
+    function sortKey(row) {
+      if (!row || row.length < 1) return [2, ""];
+      const first = (row[0] || "").trim();
+      if (/^[0-9]+$/.test(first)) return [0, Number.parseInt(first, 10)];
+      const asNum = Number.parseFloat(first);
+      if (Number.isFinite(asNum)) return [1, asNum];
+      return [2, first];
+    }
+    function renderRows(rows, order) {
+      if (!previewBox) return;
+      if (!rows || rows.length < 1) {
+        previewBox.textContent = "(No rows found in file)";
+        return;
+      }
+      const data = rows.slice();
+      const desc = (order || "asc") === "desc";
+      data.sort((a, b) => {
+        const ka = sortKey(a);
+        const kb = sortKey(b);
+        if (ka[0] !== kb[0]) return desc ? (kb[0] - ka[0]) : (ka[0] - kb[0]);
+        const va = ka[1];
+        const vb = kb[1];
+        if (typeof va === "number" && typeof vb === "number") {
+          return desc ? (vb - va) : (va - vb);
+        }
+        const cmp = String(va).localeCompare(String(vb));
+        return desc ? -cmp : cmp;
+      });
+      const maxRows = 3000;
+      const clipped = data.slice(0, maxRows);
+      let cols = 0;
+      for (const r of clipped) cols = Math.max(cols, r.length);
+      cols = Math.max(cols, 1);
+      const widths = [];
+      for (let c = 0; c < cols; c++) {
+        let w = ("col" + (c + 1)).length;
+        for (const r of clipped) {
+          const cell = (c < r.length) ? String(r[c] || "") : "";
+          if (cell.length > w) w = cell.length;
+        }
+        widths.push(Math.min(w, 28));
+      }
+      const lines = [];
+      const hdr = [];
+      const sep = [];
+      for (let c = 0; c < cols; c++) {
+        const h = ("col" + (c + 1));
+        hdr.push(h.padEnd(widths[c], " "));
+        sep.push("-".repeat(widths[c]));
+      }
+      lines.push(hdr.join("  "));
+      lines.push(sep.join("  "));
+      for (const r of clipped) {
+        const parts = [];
+        for (let c = 0; c < cols; c++) {
+          let cell = (c < r.length) ? String(r[c] || "") : "";
+          if (cell.length > widths[c]) cell = cell.slice(0, Math.max(1, widths[c] - 1)) + "~";
+          parts.push(cell.padEnd(widths[c], " "));
+        }
+        lines.push(parts.join("  "));
+      }
+      previewBox.textContent = lines.join("\\n");
+    }
+    function parseRows(text) {
+      const rows = [];
+      for (const raw of (text || "").split(/\\r?\\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        rows.push(line.split(",").map((x) => x.trim()));
+      }
+      return rows;
+    }
+    let cachedRows = [];
+    let cachedFileKey = "";
+    function setCache(fileKey, text) {
+      cachedFileKey = fileKey || "";
+      cachedRows = parseRows(text);
+    }
+    function rerenderFromCache() {
+      renderRows(cachedRows, currentOrder());
+    }
     async function loadPreviewLocal(uid, savedPath, name) {
       if (!previewBox) return;
       previewTitle.textContent = "Selected File Contents - " + (name || "");
@@ -2443,15 +2466,15 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
       showLoading(true);
       try {
         const u = "/api/rf-data/preview-local?uid=" + encodeURIComponent(uid)
-          + "&saved_path=" + encodeURIComponent(savedPath)
-          + "&order=" + encodeURIComponent(currentOrder());
+          + "&saved_path=" + encodeURIComponent(savedPath);
         const resp = await fetch(u, { cache: "no-store" });
         const payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {
           previewBox.textContent = payload && payload.message ? payload.message : "(Could not load preview.)";
           return;
         }
-        previewBox.textContent = payload.text || "";
+        setCache("local:" + savedPath, payload.text || "");
+        rerenderFromCache();
       } catch (_err) {
         previewBox.textContent = "(Could not load preview.)";
       } finally {
@@ -2465,15 +2488,15 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
       showLoading(true);
       try {
         const u = "/api/rf-data/preview-remote?uid=" + encodeURIComponent(uid)
-          + "&remote_filename=" + encodeURIComponent(remoteFilename)
-          + "&order=" + encodeURIComponent(currentOrder());
+          + "&remote_filename=" + encodeURIComponent(remoteFilename);
         const resp = await fetch(u, { cache: "no-store" });
         const payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {
           previewBox.textContent = payload && payload.message ? payload.message : "(Could not load preview.)";
           return;
         }
-        previewBox.textContent = payload.text || "";
+        setCache("remote:" + remoteFilename, payload.text || "");
+        rerenderFromCache();
       } catch (_err) {
         previewBox.textContent = "(Could not load preview.)";
       } finally {
@@ -2509,13 +2532,8 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
       sortOrder.addEventListener("change", () => {
         const uid = getSelectedUid();
         if (!uid) return;
-        if (selectedSource === "remote" && selectedRemoteName) {
-          loadPreviewRemote(uid, selectedRemoteName);
-          return;
-        }
-        if (selectedSource === "local" && selectedLocalPath) {
-          loadPreviewLocal(uid, selectedLocalPath, selectedLocalName);
-        }
+        if (!cachedFileKey || cachedRows.length < 1) return;
+        rerenderFromCache();
       });
     }
     async function loadAll(uid) {
@@ -3824,14 +3842,12 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/rf-data/preview-local":
             selected_uid = (query.get("uid") or [""])[0].strip()
             saved_path = (query.get("saved_path") or [""])[0].strip()
-            order = (query.get("order") or ["asc"])[0].strip().lower()
-            self._send_json(get_rf_data_local_preview_payload(selected_uid=selected_uid, saved_path=saved_path, order=order))
+            self._send_json(get_rf_data_local_preview_payload(selected_uid=selected_uid, saved_path=saved_path))
             return True
         if route == "/api/rf-data/preview-remote":
             selected_uid = (query.get("uid") or [""])[0].strip()
             remote_filename = (query.get("remote_filename") or [""])[0].strip()
-            order = (query.get("order") or ["asc"])[0].strip().lower()
-            self._send_json(get_rf_data_remote_preview_payload(selected_uid=selected_uid, remote_filename=remote_filename, order=order))
+            self._send_json(get_rf_data_remote_preview_payload(selected_uid=selected_uid, remote_filename=remote_filename))
             return True
         if route == "/api/batch-downloads/preview":
             date_raw = (query.get("date") or [""])[0].strip()
