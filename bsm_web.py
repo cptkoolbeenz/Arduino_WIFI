@@ -21,6 +21,7 @@ import datetime as dt
 import time
 import tempfile
 import zipfile
+from tempfile import TemporaryDirectory
 from contextlib import redirect_stderr, redirect_stdout
 from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
@@ -90,7 +91,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.04"
+WEB_APP_VERSION = "3.05"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2127,6 +2128,277 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
     return {"ok": True, "short_uid": short_uid, "panels": payload_panels}
 
 
+def _read_text_preview(path: Path, max_bytes: int = 256 * 1024) -> str:
+    """Read capped text preview from a local file path."""
+    raw = path.read_bytes()
+    clipped = raw[:max_bytes]
+    text = clipped.decode("utf-8", errors="replace")
+    if len(raw) > max_bytes:
+        text += f"\n\n[preview truncated at {max_bytes} bytes; file is {len(raw)} bytes]"
+    return text
+
+
+def get_rf_data_local_preview_payload(selected_uid: str, saved_path: str) -> dict[str, object]:
+    """Preview a Gateway-uploaded file from the selected row."""
+    target, err = resolve_local_uploaded_file_for_download(saved_path=saved_path, selected_uid=selected_uid)
+    if target is None:
+        return {"ok": False, "message": err}
+    try:
+        text = _read_text_preview(target)
+        return {"ok": True, "source": "gateway", "name": target.name, "text": text}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Could not read local preview: {exc}"}
+
+
+def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str) -> dict[str, object]:
+    """Preview an Arduino SD file by transferring it to a temporary local file."""
+    uid = (selected_uid or "").strip()
+    rfn = (remote_filename or "").strip()
+    if not uid:
+        return {"ok": False, "message": "missing uid"}
+    if not rfn:
+        return {"ok": False, "message": "missing remote filename"}
+    _device, _short_uid, device_ip = _resolve_device_context_for_uid(uid)
+    if not device_ip:
+        return {"ok": False, "message": "Selected Arduino has no IP address."}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        requested_bind = (DEFAULT_BIND_IP or "").strip() or "0.0.0.0"
+        try:
+            sock.bind((requested_bind, 0))
+        except OSError:
+            if requested_bind != "0.0.0.0":
+                sock.bind(("0.0.0.0", 0))
+            else:
+                raise
+        sock.settimeout(0.2)
+        with TemporaryDirectory(prefix="rf_preview_") as td:
+            out_dir = Path(td)
+            saved_path = transfer_file_protocol(
+                control_sock=sock,
+                device_ip=device_ip,
+                control_port=DISCOVER_CONTROL_PORT,
+                local_bind_ip=requested_bind if requested_bind else "0.0.0.0",
+                requested_filename=rfn,
+                output_dir=out_dir,
+                timeout_s=60.0,
+                tolerant_integrity=True,
+                mark_partial_received=False,
+            )
+            text = _read_text_preview(saved_path)
+            return {"ok": True, "source": "arduino", "name": rfn, "text": text}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"Could not preview remote file '{rfn}': {exc}"}
+    finally:
+        sock.close()
+
+
+def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
+    """Render RF Data page with remote/local lists plus file-content preview panel."""
+    running, pid = MANAGER.status()
+    state = f"RUNNING (PID {pid})" if running else "STOPPED"
+    ctx = PageContext(page_title=f"{WEB_APP_NAME} - RF Data", state=state, message=message, subtitle="RF Data")
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    selected_uid = (selected_uid or "").strip()
+    selected_device = _find_device_by_uid(devices, selected_uid)
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
+
+    selected_short = ""
+    remote_note = "(Select a known Arduino to view SD files)"
+    uploaded_note = "(Select a known Arduino to view upload history)"
+    preview_note = "(Select a file from either list to preview contents)"
+    if selected_device is not None:
+        selected_short = (selected_device.get("short_uid", "") or "").strip()
+        if not selected_short:
+            selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
+        remote_note = "Loading files from Arduino..."
+        uploaded_note = "Loading uploaded-file list..."
+
+    files_title_suffix = selected_short if selected_short else "..."
+    extra_css = """
+    .device-head, .device-sep { white-space: pre; }
+    .device-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .device-row:hover { background: #eef5ff; }
+    .device-row.selected { background: #d7e9ff; font-weight: 700; }
+    .sd-head, .sd-sep { white-space: pre; }
+    .sd-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .sd-row:hover { background: #eef5ff; }
+    .sd-row.selected { background: #c8f7d1; font-weight: 700; }
+    .upload-head, .upload-sep { white-space: pre; }
+    .upload-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .upload-row:hover { background: #eef5ff; }
+    .upload-row.selected { background: #ffe1ba; font-weight: 700; }
+    .grid3 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 1200px) { .grid3 { grid-template-columns: 1fr; } }
+    """
+    body_html = f"""
+      {_render_controls_row([
+          _render_action_form(action="/", label="Dashboard", method="get"),
+          _render_action_form(action="/file-transfers", label="File Transfers", method="get"),
+          _render_action_form(action="/batch-downloads", label="Batch Downloads", method="get"),
+      ])}
+
+      {_render_known_arduinos_selector(
+          action="/rf-data",
+          selected_uid=selected_uid,
+          device_rows_html_block=device_rows_html_block,
+          button_label="Load RF Data",
+          show_button=False,
+      )}
+
+      <div class="grid3">
+        <div>
+          <div class="section-title" id="rf-files-on-title">{html.escape(f"Files on {files_title_suffix}")}</div>
+          {_render_scrollbox("rf-sd-list-box", remote_note)}
+        </div>
+        <div>
+          <div class="section-title" id="rf-files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
+          {_render_scrollbox("rf-uploaded-list-box", uploaded_note)}
+        </div>
+        <div>
+          <div class="section-title" id="rf-preview-title">Selected File Contents</div>
+          {_render_scrollbox("rf-preview-box", preview_note)}
+        </div>
+      </div>
+"""
+    script_js = """
+  (function() {
+    const rows = Array.from(document.querySelectorAll(".device-row"));
+    const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
+    const sdListBox = document.getElementById("rf-sd-list-box");
+    const uploadedListBox = document.getElementById("rf-uploaded-list-box");
+    const previewBox = document.getElementById("rf-preview-box");
+    const previewTitle = document.getElementById("rf-preview-title");
+    const filesOnTitle = document.getElementById("rf-files-on-title");
+    const filesUploadedTitle = document.getElementById("rf-files-uploaded-title");
+    function getSelectedUid() {
+      for (const f of uidFields) {
+        const v = (f.value || "").trim();
+        if (v.length > 0) return v;
+      }
+      return "";
+    }
+    function getSdRows() { return Array.from(document.querySelectorAll("#rf-sd-list-box .sd-row")); }
+    function getUploadRows() { return Array.from(document.querySelectorAll("#rf-uploaded-list-box .upload-row")); }
+    function clearSelections() {
+      getSdRows().forEach((r) => r.classList.remove("selected"));
+      getUploadRows().forEach((r) => r.classList.remove("selected"));
+    }
+    function setSelectedUid(uid, triggerLoad = true) {
+      let selectedShort = "...";
+      uidFields.forEach((f) => { f.value = uid; });
+      rows.forEach((r) => {
+        if (r.dataset.uid === uid) {
+          r.classList.add("selected");
+          selectedShort = (r.dataset.short || "").trim() || "...";
+        } else r.classList.remove("selected");
+      });
+      if (filesOnTitle) filesOnTitle.textContent = "Files on " + selectedShort;
+      if (filesUploadedTitle) filesUploadedTitle.textContent = "Files uploaded from " + selectedShort;
+      if (previewTitle) previewTitle.textContent = "Selected File Contents";
+      if (previewBox) previewBox.textContent = "(Select a file from either list to preview contents)";
+      if (triggerLoad) loadAll(uid);
+    }
+    rows.forEach((r) => { r.addEventListener("click", () => setSelectedUid(r.dataset.uid || "", true)); });
+    async function loadRemoteFiles(uid) {
+      if (!sdListBox) return;
+      if (!uid) { sdListBox.textContent = "(Select a known Arduino to view SD files)"; return; }
+      sdListBox.textContent = "Loading files from Arduino...";
+      try {
+        const resp = await fetch("/api/file-transfers/remote-files?uid=" + encodeURIComponent(uid), { cache: "no-store" });
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) { sdListBox.textContent = payload && payload.message ? payload.message : "(Could not fetch files.)"; return; }
+        if (payload.html && payload.html.length > 0) sdListBox.innerHTML = payload.html;
+        else sdListBox.textContent = payload.note || "(No files reported by Arduino)";
+      } catch (_err) {
+        sdListBox.textContent = "(Could not fetch files.)";
+      }
+      bindSdRows();
+    }
+    async function loadUploadedFiles(uid) {
+      if (!uploadedListBox) return;
+      if (!uid) { uploadedListBox.textContent = "(Select a known Arduino to view upload history)"; return; }
+      uploadedListBox.textContent = "Loading uploaded-file list...";
+      try {
+        const resp = await fetch("/api/file-transfers/uploaded-files?uid=" + encodeURIComponent(uid), { cache: "no-store" });
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) { uploadedListBox.textContent = payload && payload.message ? payload.message : "(Could not load uploaded files.)"; return; }
+        if (payload.html && payload.html.length > 0) uploadedListBox.innerHTML = payload.html;
+        else uploadedListBox.textContent = payload.note || "(No uploaded files logged for this Arduino)";
+      } catch (_err) {
+        uploadedListBox.textContent = "(Could not load uploaded files.)";
+      }
+      bindUploadedRows();
+    }
+    async function loadPreviewLocal(uid, savedPath, name) {
+      if (!previewBox) return;
+      previewTitle.textContent = "Selected File Contents - " + (name || "");
+      previewBox.textContent = "Loading local file preview...";
+      try {
+        const u = "/api/rf-data/preview-local?uid=" + encodeURIComponent(uid) + "&saved_path=" + encodeURIComponent(savedPath);
+        const resp = await fetch(u, { cache: "no-store" });
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) { previewBox.textContent = payload && payload.message ? payload.message : "(Could not load preview.)"; return; }
+        previewBox.textContent = payload.text || "";
+      } catch (_err) {
+        previewBox.textContent = "(Could not load preview.)";
+      }
+    }
+    async function loadPreviewRemote(uid, remoteFilename) {
+      if (!previewBox) return;
+      previewTitle.textContent = "Selected File Contents - " + (remoteFilename || "");
+      previewBox.textContent = "Loading remote file preview from Arduino...";
+      try {
+        const u = "/api/rf-data/preview-remote?uid=" + encodeURIComponent(uid) + "&remote_filename=" + encodeURIComponent(remoteFilename);
+        const resp = await fetch(u, { cache: "no-store" });
+        const payload = await resp.json();
+        if (!resp.ok || !payload || !payload.ok) { previewBox.textContent = payload && payload.message ? payload.message : "(Could not load preview.)"; return; }
+        previewBox.textContent = payload.text || "";
+      } catch (_err) {
+        previewBox.textContent = "(Could not load preview.)";
+      }
+    }
+    function bindSdRows() {
+      getSdRows().forEach((r) => {
+        r.addEventListener("click", () => {
+          const uid = getSelectedUid();
+          clearSelections();
+          r.classList.add("selected");
+          loadPreviewRemote(uid, r.dataset.name || "");
+        });
+      });
+    }
+    function bindUploadedRows() {
+      getUploadRows().forEach((r) => {
+        r.addEventListener("click", () => {
+          const uid = getSelectedUid();
+          clearSelections();
+          r.classList.add("selected");
+          loadPreviewLocal(uid, r.dataset.path || "", r.dataset.name || "");
+        });
+      });
+    }
+    async function loadAll(uid) {
+      await Promise.allSettled([loadRemoteFiles(uid), loadUploadedFiles(uid)]);
+      clearSelections();
+    }
+    const initialUid = getSelectedUid();
+    if (initialUid) loadAll(initialUid);
+  })();
+"""
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+        script_js=script_js,
+    )
+
+
 def render_page(message: str = "") -> bytes:
     """Render page."""
     running, pid = MANAGER.status()
@@ -2162,6 +2434,9 @@ def render_page(message: str = "") -> bytes:
       <div class="nav-buttons">
         <form method="get" action="/file-transfers">
           <button type="submit" class="placeholder-btn">File Transfers</button>
+        </form>
+        <form method="get" action="/rf-data">
+          <button type="submit" class="placeholder-btn">RF Data</button>
         </form>
         <form method="get" action="/maintenance">
           <button type="submit" class="placeholder-btn">Maintenance</button>
@@ -2902,6 +3177,21 @@ def _find_device_by_uid(devices: list[dict[str, str]], selected_uid: str) -> dic
     return None
 
 
+def _format_ip_for_table(ip: str) -> str:
+    """Format IPv4 text so last octet is always width 3 for table alignment."""
+    txt = (ip or "").strip()
+    if not txt:
+        return ""
+    if "." not in txt:
+        return txt
+    head, tail = txt.rsplit(".", 1)
+    if not tail.isdigit():
+        return txt
+    if len(tail) >= 3:
+        return txt
+    return f"{head}.{tail.ljust(3)}"
+
+
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
     """Build device select rows."""
     rows: list[tuple[str, str, str]] = []
@@ -2920,8 +3210,8 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         ap_id = (d.get("ap_id", "") or "").strip()
         net_uid = (d.get("network_uid", "") or "").strip()
         fw_ver = (d.get("firmware_version", "") or "").strip()
-        ip = (d.get("device_ip", "") or d.get("recv_ip", "")).strip()
-        recv_ip = (d.get("recv_ip", "") or "").strip()
+        ip = _format_ip_for_table((d.get("device_ip", "") or d.get("recv_ip", "")).strip())
+        recv_ip = _format_ip_for_table((d.get("recv_ip", "") or "").strip())
         dev_ip_raw = (d.get("device_ip", "") or "").strip()
         if dev_ip_raw and recv_ip and dev_ip_raw != recv_ip:
             mismatches.append(short_uid if short_uid else uid)
@@ -3393,6 +3683,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         """Serve JSON data endpoints for File Transfers/Maintenance pages."""
+        if route == "/api/rf-data/preview-local":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            saved_path = (query.get("saved_path") or [""])[0].strip()
+            self._send_json(get_rf_data_local_preview_payload(selected_uid=selected_uid, saved_path=saved_path))
+            return True
+        if route == "/api/rf-data/preview-remote":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            remote_filename = (query.get("remote_filename") or [""])[0].strip()
+            self._send_json(get_rf_data_remote_preview_payload(selected_uid=selected_uid, remote_filename=remote_filename))
+            return True
         if route == "/api/batch-downloads/preview":
             date_raw = (query.get("date") or [""])[0].strip()
             kind = (query.get("kind") or [""])[0].strip().upper()
@@ -3423,6 +3723,10 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if route == "/batch-downloads":
             self._send_html(render_batch_downloads_page())
+            return True
+        if route == "/rf-data":
+            selected_uid = (query.get("uid") or [""])[0].strip()
+            self._send_html(render_rf_data_page(selected_uid=selected_uid))
             return True
         if route == "/batch-downloads-download":
             date_raw = (query.get("date") or [""])[0].strip()
