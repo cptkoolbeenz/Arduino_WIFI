@@ -2131,6 +2131,26 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
     return {"ok": True, "short_uid": short_uid, "panels": payload_panels}
 
 
+def get_devices_table_payload() -> dict[str, object]:
+    """Return shared Known Arduinos HTML table payload for dashboard."""
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    html_block = _build_device_select_rows(devices, selected_uid="")
+    mismatches: list[str] = []
+    for d in devices:
+        uid = (d.get("unique_id", "") or "").strip()
+        short_uid = (d.get("short_uid", "") or "").strip()
+        if not short_uid:
+            short_uid = uid[-6:] if len(uid) >= 6 else uid
+        dev_ip = (d.get("device_ip", "") or "").strip()
+        recv_ip = (d.get("recv_ip", "") or "").strip()
+        if dev_ip and recv_ip and dev_ip != recv_ip:
+            mismatches.append(short_uid if short_uid else uid)
+    mismatch_message = ""
+    if mismatches:
+        mismatch_message = f"WARNING: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}"
+    return {"ok": True, "html": html_block, "mismatch_message": mismatch_message}
+
+
 def _read_text_preview(path: Path, max_bytes: int = 256 * 1024) -> str:
     """Read capped text preview from a local file path."""
     raw = path.read_bytes()
@@ -2565,6 +2585,9 @@ def render_page(message: str = "") -> bytes:
     ctx = PageContext(page_title=WEB_APP_NAME, state=state, message=message)
     extra_css = """
     .placeholder-btn { background: var(--accent); color: #0b2d4b; border-color: #8db4da; }
+    .device-head, .device-sep { white-space: pre; }
+    .device-row { white-space: pre; cursor: pointer; border-radius: 4px; }
+    .device-row:hover { background: #eef5ff; }
     .warn-banner {
       margin: 0.65rem 0 0.5rem 0;
       padding: 0.55rem 0.7rem;
@@ -2652,15 +2675,22 @@ def render_page(message: str = "") -> bytes:
 
     async function refreshDevices() {{
       try {{
-        const resp = await fetch("/devices", {{ cache: "no-store" }});
+        const resp = await fetch("/api/devices-table", {{ cache: "no-store" }});
         if (!resp.ok) {{
           return;
         }}
-        const txt = await resp.text();
-        devicebox.textContent = txt || "(No device status yet)";
-        const firstLine = (txt || "").split("\\n")[0] || "";
-        if (firstLine.startsWith("WARNING: device_ip != recv_ip")) {{
-          mismatchBanner.textContent = firstLine;
+        const payload = await resp.json();
+        if (!payload || !payload.ok) {{
+          return;
+        }}
+        if (payload.html && payload.html.length > 0) {{
+          devicebox.innerHTML = payload.html;
+        }} else {{
+          devicebox.textContent = "(No device status yet)";
+        }}
+        const msg = (payload.mismatch_message || "").trim();
+        if (msg.length > 0) {{
+          mismatchBanner.textContent = msg;
           mismatchBanner.style.display = "block";
         }} else {{
           mismatchBanner.textContent = "";
@@ -3431,7 +3461,7 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         last_seen_raw = (d.get("last_seen", "") or "").strip()
         line = (
             f"{status:<6}   {burrow:<12}   {short_uid:<8}   {fw_ver:<6}   "
-            f"{ap_id:<9}   {net_uid:<15}   {rtc_time:<8}   {ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}"
+            f"{ap_id:<9}   {net_uid:<15}   {rtc_time:<8}   {ip:<14}   {recv_ip:<14}    {last_seen_raw:<19}   {uid:<36}"
         )
         rows.append((uid, short_uid, line))
     if not rows:
@@ -3444,8 +3474,8 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             + html.escape(f"Warning: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
             + "</div>"
         )
-    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_time   device_ip      recv_ip        last_seen             unique_id</div>')
-    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   --------   -----------   -----------    -------------------   ------------------------------------</div>')
+    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_time   device_ip         recv_ip           last_seen             unique_id</div>')
+    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   --------   --------------    --------------    -------------------   ------------------------------------</div>')
     for uid, short_uid, line in rows:
         selected_cls = " selected" if uid == selected_uid else ""
         out.append(
@@ -3896,6 +3926,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         """Serve JSON data endpoints for File Transfers/Maintenance pages."""
+        if route == "/api/devices-table":
+            self._send_json(get_devices_table_payload())
+            return True
         if route == "/api/rf-data/preview-local":
             selected_uid = (query.get("uid") or [""])[0].strip()
             saved_path = (query.get("saved_path") or [""])[0].strip()
