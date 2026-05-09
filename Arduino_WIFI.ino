@@ -1500,8 +1500,8 @@ void runStartupWiFiCheck() {
     delay(1500);
   }
 
-  // If WiFi has internet time available, refresh RTC immediately on startup.
-  syncRtcFromWifiNtp();
+  // Host/controller SET_TIME is authoritative for RTC sync in this deployment.
+  // Keep WiFi NTP disabled to avoid internet-time dependency.
 
   WiFi.disconnect();
   udp.stop();
@@ -1525,9 +1525,7 @@ void enterWifiMode() {
     return;
   }
   if (startupWifiCheckPending) {
-    // Perform one-time startup RTC sync on this real WiFi session
-    // so we avoid an extra pre-trim connect/disconnect cycle.
-    syncRtcFromWifiNtp();
+    // NTP sync intentionally disabled; controller-driven SET_TIME remains active.
     startupWifiCheckPending = false;
   }
   udp.begin(UDP_LOCAL_PORT);

@@ -536,21 +536,6 @@ def _transfer_latest_file_for_device(
 
     control_sock = _open_device_control_socket(bind_ip)
     try:
-        if args.sync_time:
-            sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
-            synced = send_time_sync(
-                control_sock=control_sock,
-                device_ip=device_ip,
-                control_port=args.discover_port,
-                epoch=sync_epoch,
-                timeout_s=3.0,
-            )
-            if synced:
-                print(f"{uid}: RTC sync OK")
-            else:
-                print(f"{uid}: RTC sync failed/timeout")
-                rtc_sync_note = " RTC sync failed (upload proceeded)."
-
         remote_files = request_remote_file_list(
             control_sock=control_sock,
             device_ip=device_ip,
@@ -659,6 +644,20 @@ def _transfer_latest_file_for_device(
 
         base_result["saved_path"] = str(saved_path)
         base_result["status"] = "saved"
+        # Post-upload host-time sync: do not block file selection/transfer startup.
+        sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
+        synced = send_time_sync(
+            control_sock=control_sock,
+            device_ip=device_ip,
+            control_port=args.discover_port,
+            epoch=sync_epoch,
+            timeout_s=3.0,
+        )
+        if synced:
+            print(f"{uid}: RTC post-upload sync OK")
+        else:
+            print(f"{uid}: RTC post-upload sync failed/timeout")
+            rtc_sync_note = " RTC post-upload sync failed."
         base_result["message"] = f"Saved file for {display_id}: {saved_path}{rtc_sync_note}"
         return base_result
     except Exception as exc:
@@ -988,11 +987,6 @@ def run_discovery(args: argparse.Namespace) -> int:
         time.sleep(args.post_poll_wait)
 
     if args.sync_time_only:
-        if not args.sync_time:
-            print("Sync-only mode requested but --no-sync-time is set; nothing to do.")
-            sock.close()
-            return 2
-
         ok_count = 0
         fail_count = 0
         for row in rows:
@@ -1190,30 +1184,30 @@ def run_discovery(args: argparse.Namespace) -> int:
         for row in rows:
             uid = str(row["unique_id"])
             device_ip = str(row["device_ip"] or row["recv_ip"])
-            if args.sync_time:
-                sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
-                synced = send_time_sync(
-                    control_sock=sock,
-                    device_ip=device_ip,
-                    control_port=args.discover_port,
-                    epoch=sync_epoch,
-                    timeout_s=3.0,
-                )
-                if synced:
-                    print(f"{uid}: RTC sync OK")
-                else:
-                    print(f"{uid}: RTC sync failed/timeout")
             device_rows = collect_device_lines(sock, row, args)
             if not device_rows:
                 print(f"No data received from {uid}.")
-                continue
+            else:
+                timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                short_uid = str(row.get("short_uid", "")).strip().upper()
+                suffix = short_uid if short_uid else (uid[-6:] if len(uid) >= 6 else uid)
+                out_path = download_root / f"{suffix}_{timestamp}.csv"
+                save_device_data_csv(out_path, device_rows)
+                print(f"Saved {len(device_rows)} line(s) for {uid} -> {out_path}")
 
-            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            short_uid = str(row.get("short_uid", "")).strip().upper()
-            suffix = short_uid if short_uid else (uid[-6:] if len(uid) >= 6 else uid)
-            out_path = download_root / f"{suffix}_{timestamp}.csv"
-            save_device_data_csv(out_path, device_rows)
-            print(f"Saved {len(device_rows)} line(s) for {uid} -> {out_path}")
+            # End-of-device-cycle host-time sync (after line collection/save attempt).
+            sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
+            synced = send_time_sync(
+                control_sock=sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                epoch=sync_epoch,
+                timeout_s=3.0,
+            )
+            if synced:
+                print(f"{uid}: RTC end-cycle sync OK")
+            else:
+                print(f"{uid}: RTC end-cycle sync failed/timeout")
 
     sock.close()
     return 0
