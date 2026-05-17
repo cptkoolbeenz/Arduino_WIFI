@@ -26,7 +26,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <WiFiS3.h>
+#include <WiFiNINA.h>  // AirLift Shield port (was WiFiS3 for onboard ESP32-S3)
 #include <WiFiUdp.h>
 #include <limits.h>
 #include "Time.h"
@@ -39,8 +39,17 @@ String myFilename;
 
 // PCB variable defined by Tacuna code
 #define SRAM_CS 1 //Use A0 for Uno R3.  Use 1 for Uno R4
-#define SD_CS 10
+#define SD_CS 4  // Hitlego SD shield CS = 4. Original was 10, but that collides with AirLift CS.
 #define AD7193_CS 0 //Use A1 for Uno R3. Use 0 for Uno R4
+
+// AirLift Shield (#4285) pin map for WiFiNINA.
+// Shares SPI bus (D11/D12/D13 + ICSP) with SD card and AD7193; different CS pins keep them separable.
+// IMPORTANT: AIRLIFT_RESET moved from D5 (collides with LCD data line 4 on the mauck shield) to A0/D14.
+//            Requires the physical mod: cut RST_JMP D5 trace on AirLift, jumper A0 -> ESP32 EN pad.
+#define AIRLIFT_CS    10
+#define AIRLIFT_BUSY   7
+#define AIRLIFT_RESET 14
+#define AIRLIFT_GPIO0 -1   // G0 jumper open; ESP32 boots from flash via on-shield pull-up
 
 // Handle the ADC PCB unit
 // PRDC_AD7193 AD7193;
@@ -1831,6 +1840,9 @@ void sendFileOverTcp(
 void serviceWifiCommands() {
   wifiCommandHandled = false;
   if (!wifiInitialized) return;
+  // WiFiNINA quirk: parsePacket() drops packets if called too rapidly on AirLift.
+  // 10ms idle gap fixes the missed-packet behavior.
+  delay(10);
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
 
@@ -2326,12 +2338,19 @@ void setup() {
   pinMode(SD_CS, OUTPUT); 
   digitalWrite(SD_CS, HIGH);
 
-  pinMode(AD7193_CS, OUTPUT); 
+  pinMode(AD7193_CS, OUTPUT);
   digitalWrite(AD7193_CS, HIGH);
+
+  pinMode(AIRLIFT_CS, OUTPUT);
+  digitalWrite(AIRLIFT_CS, HIGH);
 
   // Communication settings
   Serial.begin(115200);
   delay(500); // give time for serial to start up
+
+  // AirLift Shield pin configuration. Must be set before any WiFi.* call.
+  WiFi.setPins(AIRLIFT_CS, AIRLIFT_BUSY, AIRLIFT_RESET, AIRLIFT_GPIO0);
+
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
   deviceID_6 = shortUidFromHash(deviceId, 6);
