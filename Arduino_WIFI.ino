@@ -39,14 +39,15 @@ String myFilename;
 
 // PCB variable defined by Tacuna code
 #define SRAM_CS 1 //Use A0 for Uno R3.  Use 1 for Uno R4
-#define SD_CS 4  // Hitlego SD shield CS = 4. Original was 10, but that collides with AirLift CS.
+#define SD_CS 10  // Bob's original wiring (HiLetgo SD module wired CS -> D10)
 #define AD7193_CS 0 //Use A1 for Uno R3. Use 0 for Uno R4
 
 // AirLift Shield (#4285) pin map for WiFiNINA.
 // Shares SPI bus (D11/D12/D13 + ICSP) with SD card and AD7193; different CS pins keep them separable.
-// IMPORTANT: AIRLIFT_RESET moved from D5 (collides with LCD data line 4 on the mauck shield) to A0/D14.
-//            Requires the physical mod: cut RST_JMP D5 trace on AirLift, jumper A0 -> ESP32 EN pad.
-#define AIRLIFT_CS    10
+// HARDWARE MODS REQUIRED on AirLift Shield (D5 and D10 conflict with the mauck stack):
+//   1. RESET: cut RST_JMP D5 trace, jumper A0 (D14) -> ESP32 EN  -- D5 conflicts with LCD data 4
+//   2. CS:    cut CS_JMP D10 trace, jumper A1 (D15) -> ESP32 GPIO5 (SPI CS) -- D10 conflicts with SD CS
+#define AIRLIFT_CS    15
 #define AIRLIFT_BUSY   7
 #define AIRLIFT_RESET 14
 #define AIRLIFT_GPIO0 -1   // G0 jumper open; ESP32 boots from flash via on-shield pull-up
