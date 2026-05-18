@@ -47,9 +47,10 @@ String myFilename;
 // HARDWARE MODS REQUIRED on AirLift Shield (D5 and D10 conflict with the mauck stack):
 //   1. RESET: cut RST_JMP D5 trace, jumper A0 (D14) -> ESP32 EN  -- D5 conflicts with LCD data 4
 //   2. CS:    cut CS_JMP D10 trace, jumper A1 (D15) -> ESP32 GPIO5 (SPI CS) -- D10 conflicts with SD CS
-#define AIRLIFT_CS    15
+// NOTE: A4/A5 are NOT safe — they are taken over by Wire.begin() (I2C SDA/SCL) for the RTC.
+#define AIRLIFT_CS    15   // A1
 #define AIRLIFT_BUSY   7
-#define AIRLIFT_RESET 14
+#define AIRLIFT_RESET 14   // A0
 #define AIRLIFT_GPIO0 -1   // G0 jumper open; ESP32 boots from flash via on-shield pull-up
 
 // Handle the ADC PCB unit
