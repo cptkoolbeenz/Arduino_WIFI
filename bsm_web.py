@@ -110,7 +110,7 @@ WEB_POLL_NOW_DOWNLOAD_TIMEOUT_S = "0"
 ENDPOINT_CACHE_LOCK = threading.Lock()
 ENDPOINT_CACHE: dict[str, tuple[float, str]] = {}
 DEVICE_RTC_CACHE_LOCK = threading.Lock()
-DEVICE_RTC_CACHE: dict[str, tuple[float, str]] = {}
+DEVICE_RTC_CACHE: dict[str, tuple[float, str, str]] = {}
 DEVICE_RTC_CACHE_TTL_S = 20.0
 
 
@@ -3381,55 +3381,57 @@ def _format_ip_for_table(ip: str) -> str:
     return f"{head}.{tail.ljust(3)}"
 
 
-def _query_device_rtc_display(device_ip: str, timeout_s: float = 0.35) -> str:
-    """Fetch short RTC display string for device table (HH:MM:SS or status)."""
+def _query_device_rtc_display(device_ip: str, timeout_s: float = 0.35) -> tuple[str, str]:
+    """Fetch short RTC display strings for device table (date,time or status)."""
     ip = (device_ip or "").strip()
     if not ip:
-        return "-"
+        return "-", "-"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout_s)
         sock.sendto(b"GET_TIME", (ip, DISCOVER_CONTROL_PORT))
         data, (src_ip, _src_port) = sock.recvfrom(2048)
         if src_ip != ip:
-            return "src_mismatch"
+            return "src_mismatch", "src_mismatch"
         line = data.decode("utf-8", errors="replace").strip()
         if line.startswith("TIME,"):
             parts = line.split(",", 2)
             ts = parts[2].strip() if len(parts) > 2 else ""
             if ts and "T" in ts and len(ts) >= 19:
-                # Example: 2026-05-02T10:44:12 -> 10:44:12
-                return ts[11:19]
-            return ts if ts else "time_ok"
-        return "time_err"
+                # Example: 2026-05-12T10:44:12 -> (2026-05-12, 10:44:12)
+                return ts[:10], ts[11:19]
+            if ts:
+                return ts[:10] if len(ts) >= 10 else "date_ok", "time_ok"
+            return "date_ok", "time_ok"
+        return "time_err", "time_err"
     except socket.timeout:
-        return "timeout"
+        return "timeout", "timeout"
     except Exception:
-        return "query_err"
+        return "query_err", "query_err"
     finally:
         sock.close()
 
 
-def _get_cached_device_rtc_display(unique_id: str, device_ip: str, status: str) -> str:
-    """Return cached RTC table value with short TTL to avoid hammering devices."""
+def _get_cached_device_rtc_display(unique_id: str, device_ip: str, status: str) -> tuple[str, str]:
+    """Return cached RTC table values with short TTL to avoid hammering devices."""
     uid = (unique_id or "").strip()
     ip = (device_ip or "").strip()
     if not ip:
-        return "-"
+        return "-", "-"
     # Only query if device appears online/upload-active.
     st = (status or "").strip().lower()
     if st not in {"online", "upload"}:
-        return "-"
+        return "-", "-"
     key = f"{uid}|{ip}"
     now = time.monotonic()
     with DEVICE_RTC_CACHE_LOCK:
         cached = DEVICE_RTC_CACHE.get(key)
         if cached and (now - cached[0]) <= DEVICE_RTC_CACHE_TTL_S:
-            return cached[1]
-    value = _query_device_rtc_display(ip)
+            return cached[1], cached[2]
+    rtc_date, rtc_time = _query_device_rtc_display(ip)
     with DEVICE_RTC_CACHE_LOCK:
-        DEVICE_RTC_CACHE[key] = (now, value)
-    return value
+        DEVICE_RTC_CACHE[key] = (now, rtc_date, rtc_time)
+    return rtc_date, rtc_time
 
 
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
@@ -3454,14 +3456,15 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         raw_device_ip = (d.get("device_ip", "") or "").strip()
         ip = _format_ip_for_table((raw_device_ip or raw_recv_ip).strip())
         recv_ip = _format_ip_for_table(raw_recv_ip)
-        rtc_time = _get_cached_device_rtc_display(uid, (raw_device_ip or raw_recv_ip), status)
+        rtc_date, rtc_time = _get_cached_device_rtc_display(uid, (raw_device_ip or raw_recv_ip), status)
         dev_ip_raw = (d.get("device_ip", "") or "").strip()
         if dev_ip_raw and raw_recv_ip and dev_ip_raw != raw_recv_ip:
             mismatches.append(short_uid if short_uid else uid)
         last_seen_raw = (d.get("last_seen", "") or "").strip()
         line = (
             f"{status:<6}   {burrow:<12}   {short_uid:<8}   {fw_ver:<6}   "
-            f"{ap_id:<9}   {net_uid:<15}   {rtc_time:<8}   {ip:<14}   {recv_ip:<14}    {last_seen_raw:<19}   {uid:<36}"
+            f"{ap_id:<9}   {net_uid:<15}   {rtc_date:<10}   {rtc_time:<8}   "
+            f"{ip:<14}   {recv_ip:<14}    {last_seen_raw:<19}   {uid:<36}"
         )
         rows.append((uid, short_uid, line))
     if not rows:
@@ -3474,8 +3477,8 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             + html.escape(f"Warning: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
             + "</div>"
         )
-    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_time   device_ip         recv_ip           last_seen             unique_id</div>')
-    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   --------   --------------    --------------    -------------------   ------------------------------------</div>')
+    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_date     rtc_time   device_ip         recv_ip           last_seen             unique_id</div>')
+    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   ----------   --------   --------------    --------------    -------------------   ------------------------------------</div>')
     for uid, short_uid, line in rows:
         selected_cls = " selected" if uid == selected_uid else ""
         out.append(
