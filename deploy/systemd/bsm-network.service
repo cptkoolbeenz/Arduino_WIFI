@@ -1,0 +1,19 @@
+[Unit]
+Description=BSM Network Process
+After=network.target
+
+[Service]
+Type=simple
+User=recomputer
+WorkingDirectory=/home/recomputer/Arduino_WIFI
+ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_network.py
+
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+TasksMax=100
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
