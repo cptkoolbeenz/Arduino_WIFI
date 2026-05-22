@@ -7,7 +7,8 @@
 ```ini
 [Unit]
 Description=BSM Network Process
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -16,7 +17,7 @@ WorkingDirectory=/home/recomputer/Arduino_WIFI
 ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_network.py
 
 Restart=always
-RestartSec=5
+RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -34,7 +35,8 @@ WantedBy=multi-user.target
 ```ini
 [Unit]
 Description=BSM Web Process
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -43,7 +45,7 @@ WorkingDirectory=/home/recomputer/Arduino_WIFI
 ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_web.py
 
 Restart=always
-RestartSec=5
+RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -56,15 +58,49 @@ MemoryMax=200M
 WantedBy=multi-user.target
 ```
 
+### /etc/systemd/system/bsm-healthcheck.service
+
+```ini
+[Unit]
+Description=BSM health check and auto-recovery
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/recomputer/Arduino_WIFI/scripts/bsm_healthcheck.sh
+```
+
+### /etc/systemd/system/bsm-healthcheck.timer
+
+```ini
+[Unit]
+Description=Run BSM health check every minute
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=bsm-healthcheck.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
 ## Install / apply
 
 ```bash
 sudo cp bsm-network.service /etc/systemd/system/
 sudo cp bsm-web.service /etc/systemd/system/
+sudo cp bsm-healthcheck.service /etc/systemd/system/
+sudo cp bsm-healthcheck.timer /etc/systemd/system/
+sudo chmod +x /home/recomputer/Arduino_WIFI/scripts/bsm_healthcheck.sh
 
 sudo systemctl daemon-reload
-sudo systemctl enable bsm-network.service bsm-web.service
+sudo systemctl enable bsm-network.service bsm-web.service bsm-healthcheck.timer
 sudo systemctl restart bsm-network.service bsm-web.service
+sudo systemctl restart bsm-healthcheck.timer
 ```
 
 ## Check status
@@ -72,12 +108,14 @@ sudo systemctl restart bsm-network.service bsm-web.service
 ```bash
 systemctl status bsm-network.service bsm-web.service
 journalctl -b -u bsm-network.service -u bsm-web.service
+systemctl status bsm-healthcheck.timer bsm-healthcheck.service
 ```
 
 ## Follow logs live
 
 ```bash
 journalctl -f -u bsm-network.service -u bsm-web.service
+journalctl -f -t bsm-healthcheck -u bsm-healthcheck.service
 ```
 
 ## Quick recovery
@@ -100,6 +138,7 @@ Restart cleanly:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart bsm-network.service bsm-web.service
+sudo systemctl restart bsm-healthcheck.timer
 ```
 
 Reboot if system is unstable:
@@ -118,3 +157,5 @@ Restart=always
 ```
 
 Do not use `Type=oneshot` for these services.
+
+The health check service is intentionally `Type=oneshot` and is scheduled by the timer.

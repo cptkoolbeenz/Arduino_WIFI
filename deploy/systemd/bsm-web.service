@@ -1,6 +1,7 @@
 [Unit]
 Description=BSM Web Process
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -9,7 +10,7 @@ WorkingDirectory=/home/recomputer/Arduino_WIFI
 ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_web.py
 
 Restart=always
-RestartSec=5
+RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 
 TasksMax=100

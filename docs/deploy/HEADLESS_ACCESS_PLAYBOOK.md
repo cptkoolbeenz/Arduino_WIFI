@@ -88,7 +88,9 @@ Goal: maintain local operations and add WAN/cloud + remote support.
 ## Quick Verification Commands (SSH)
 ```bash
 systemctl is-active bsm-network.service bsm-web.service
+systemctl is-active bsm-healthcheck.timer
 systemctl status --no-pager bsm-network.service bsm-web.service | sed -n '1,40p'
+systemctl status --no-pager bsm-healthcheck.timer bsm-healthcheck.service | sed -n '1,40p'
 ss -ltnp | rg ':5001'
 curl -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:5001
 ip a
@@ -118,6 +120,8 @@ Current verified example (2026-05-22):
    - `journalctl -u bsm-web.service -u bsm-network.service -n 100 --no-pager`
 4. Restart services if needed:
    - `sudo systemctl restart bsm-web.service bsm-network.service`
+5. Check automatic recovery activity:
+   - `journalctl -t bsm-healthcheck -n 50 --no-pager`
 
 ## Notes
 - Keep local static management path (`192.168.10.1`) as your primary recovery method.

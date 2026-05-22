@@ -1,0 +1,9 @@
+[Unit]
+Description=BSM health check and auto-recovery
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/recomputer/Arduino_WIFI/scripts/bsm_healthcheck.sh
+
