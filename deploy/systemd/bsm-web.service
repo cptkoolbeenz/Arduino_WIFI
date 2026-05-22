@@ -2,6 +2,8 @@
 Description=BSM Web Process
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -15,8 +17,6 @@ Environment=PYTHONUNBUFFERED=1
 
 TasksMax=100
 MemoryMax=200M
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target

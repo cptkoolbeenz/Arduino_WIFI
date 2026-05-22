@@ -9,6 +9,8 @@
 Description=BSM Network Process
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -18,8 +20,6 @@ ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_network.py
 
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 Environment=PYTHONUNBUFFERED=1
 
@@ -37,6 +37,8 @@ WantedBy=multi-user.target
 Description=BSM Web Process
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -46,8 +48,6 @@ ExecStart=/usr/bin/python3 -u /home/recomputer/Arduino_WIFI/bsm_web.py
 
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 Environment=PYTHONUNBUFFERED=1
 
