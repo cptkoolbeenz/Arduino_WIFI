@@ -43,14 +43,18 @@ from bsm_network.config import (
     parse_args,
 )
 from bsm_network.db import (
+    clear_transfer_active,
     get_db_schema_info,
+    get_daily_ops_state,
     init_db,
+    is_daily_ops_complete,
     is_transfer_active,
     list_active_transfers,
     log_web_event,
     log_transfer_event,
     read_devices_snapshot,
     self_test_db_writes,
+    set_transfer_active,
     set_burrow_id_by_short_uid,
     set_burrow_id_by_unique_id,
 )
@@ -91,7 +95,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "3.06"
+WEB_APP_VERSION = "4.0"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -268,7 +272,6 @@ class ProcessManager:
     def __init__(self) -> None:
         """Initialize manager state and runtime paths."""
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen[str] | None = None
         self._log_path = Path("data/web_normal_ops.log")
         self._force_thread: threading.Thread | None = None
         self._force_task_id: int = 0
@@ -276,14 +279,24 @@ class ProcessManager:
         self._force_log_path = Path("data/web_force_upload.log")
 
     def status(self) -> tuple[bool, int | None]:
-        """Return whether Normal Ops is running and its PID."""
-        with self._lock:
-            if self._proc is None:
-                return False, None
-            if self._proc.poll() is not None:
-                self._proc = None
-                return False, None
-            return True, self._proc.pid
+        """Return whether the sibling bsm_network process appears to be running."""
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", r"python.*bsm_network\.py|bsm_network\.py"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return False, None
+        for line in out.splitlines():
+            token = line.strip()
+            if not token:
+                continue
+            try:
+                return True, int(token)
+            except ValueError:
+                continue
+        return False, None
 
     def force_status(self) -> tuple[bool, int | None]:
         """Return whether a manual force-upload task is running."""
@@ -297,48 +310,22 @@ class ProcessManager:
             return True, self._force_active_id
 
     def start(self) -> str:
-        """Start the Normal Ops background process."""
-        with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return f"Normal Ops already running (PID {self._proc.pid})."
-
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            logf = self._log_path.open("a", encoding="utf-8")
-            self._proc = subprocess.Popen(
-                NORMAL_OPS_CMD,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            return f"Normal Ops started (PID {self._proc.pid})."
+        """Report sibling-service ownership for Normal Ops."""
+        running, pid = self.status()
+        if running:
+            return f"Normal Ops already running as sibling bsm_network process (PID {pid})."
+        return "Normal Ops is managed outside bsm_web. Start bsm_network.service from systemd or run bsm_network.py directly."
 
     def stop(self) -> str:
-        """Stop the Normal Ops background process."""
-        with self._lock:
-            if self._proc is None or self._proc.poll() is not None:
-                self._proc = None
-                return "Normal Ops is not running."
-
-            proc = self._proc
-            proc.terminate()
-
-        try:
-            proc.wait(timeout=5)
-            msg = f"Normal Ops stopped (PID {proc.pid})."
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=3)
-            msg = f"Normal Ops force-stopped (PID {proc.pid})."
-
-        with self._lock:
-            self._proc = None
-        return msg
+        """Report sibling-service ownership for Normal Ops stop requests."""
+        running, pid = self.status()
+        if running:
+            return f"Normal Ops is managed outside bsm_web (PID {pid}). Stop bsm_network.service from systemd if needed."
+        return "Normal Ops is not running."
 
     def start_force_upload(self, uid: str, device_ip: str) -> str:
         """Start a background force-upload task for one Arduino."""
         with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return "Stop Normal Ops before force upload (port/bind conflict)."
             if self._force_thread is not None and self._force_thread.is_alive():
                 active_id = self._force_active_id if self._force_active_id is not None else 0
                 return f"Force upload already running (task {active_id})."
@@ -374,37 +361,15 @@ class ProcessManager:
         return f"Force upload started for {uid} ({device_ip}) (task {task_id})."
 
     def poll_now(self) -> str:
-        """Run one manual discovery cycle immediately."""
+        """Refresh monitor state without polling Arduino clients."""
         with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return "Stop Normal Ops before manual poll (port/bind conflict)."
             if self._force_thread is not None and self._force_thread.is_alive():
                 return "Wait for force upload to finish before manual poll (port/bind conflict)."
-            log_path = self._log_path
-
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().isoformat(timespec="seconds")
-        with log_path.open("a", encoding="utf-8") as logf:
-            logf.write(f"\n=== Manual Poll start {stamp} ===\n")
-            logf.flush()
-            try:
-                dynamic_args, note = build_dynamic_poll_now_args()
-                logf.write(note + "\n")
-                args = parse_args(dynamic_args)
-                with redirect_stdout(logf), redirect_stderr(logf):
-                    rc = run_discovery(args)
-            except Exception as exc:  # noqa: BLE001
-                logf.write(f"Manual poll failed to run: {exc}\n")
-                return f"Manual poll failed: {exc}"
-            end_stamp = dt.datetime.now().isoformat(timespec="seconds")
-            logf.write(f"=== Manual Poll end {end_stamp} rc={rc} ===\n")
-        if rc == 0:
-            return "Manual poll completed. Device list refreshed."
-        return f"Manual poll finished with non-zero status (rc={rc}). Check log output."
+        invalidate_endpoint_cache()
+        return "Monitor refreshed from Gateway state. No Arduino poll was sent."
 
     def shutdown(self) -> None:
         """Stop managed background processes before server shutdown."""
-        self.stop()
         return
 
 
@@ -1030,16 +995,32 @@ def enter_data_mode(device_ip: str, timeout_s: float = 3.0) -> str:
 
 def can_enter_data_mode(uid: str) -> tuple[bool, str]:
     """Return whether enter data mode."""
+    return can_web_contact_arduino(uid, "ENTER_DATA_MODE")
+
+
+def can_web_contact_arduino(uid: str, action_label: str) -> tuple[bool, str]:
+    """Return whether web UI may send a direct command to an Arduino."""
+    token = (uid or "").strip()
+    label = (action_label or "Web command").strip() or "Web command"
+    if not token:
+        return False, f"{label} blocked: missing Arduino UID."
     db_path = Path(DEFAULT_DB_PATH)
     try:
-        active = is_transfer_active(db_path, uid)
+        if is_transfer_active(db_path, token):
+            return False, f"{label} blocked for {token}: bsm_network transfer is active."
+        if not is_daily_ops_complete(db_path, token):
+            state = get_daily_ops_state(db_path, token)
+            current = state.get("state", "none") if state else "none"
+            updated = state.get("updated_at", "") if state else ""
+            suffix = f" Last daily ops state={current}"
+            if updated:
+                suffix += f" updated_at={updated}"
+            return False, (
+                f"{label} blocked for {token}: daily Normal Ops are not complete for today."
+                f"{suffix}."
+            )
     except Exception as exc:  # noqa: BLE001
-        return False, f"Cannot verify transfer state for {uid}: {exc}"
-    if active:
-        return False, (
-            f"ENTER_DATA_MODE blocked for {uid}: file transfer is in progress. "
-            "Wait until transfer completes, then try again."
-        )
+        return False, f"{label} blocked for {token}: cannot verify Gateway state ({exc})."
     return True, ""
 
 
@@ -1916,7 +1897,21 @@ def upload_selected_remote_file(
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     start_ts = time.monotonic()
+    run_id = f"WEB_MANUAL_{int(time.time() * 1000)}"
+    active_marked = False
     try:
+        try:
+            set_transfer_active(
+                db_path=Path(DEFAULT_DB_PATH),
+                unique_id=uid,
+                run_id=run_id,
+                ap_id=ap,
+                device_ip=ip,
+                source_filename=rfn,
+            )
+            active_marked = True
+        except Exception:
+            active_marked = False
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         requested_bind = (DEFAULT_BIND_IP or "").strip() or "0.0.0.0"
         try:
@@ -1982,6 +1977,11 @@ def upload_selected_remote_file(
         }
         return False, msg, result
     finally:
+        if active_marked:
+            try:
+                clear_transfer_active(db_path=Path(DEFAULT_DB_PATH), unique_id=uid)
+            except Exception:
+                pass
         sock.close()
 
 
@@ -2081,6 +2081,9 @@ def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, obje
     _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
     if not device_ip:
         return {"ok": False, "message": "Selected Arduino has no IP address."}
+    ok, reason = can_web_contact_arduino(uid, "LIST_FILES")
+    if not ok:
+        return {"ok": False, "message": reason}
     remote_items, remote_err = _request_remote_file_list_with_sizes(device_ip, timeout_s=8.0)
     if remote_err:
         return {"ok": True, "short_uid": short_uid, "html": "", "note": f"(Could not fetch files: {remote_err})"}
@@ -2123,6 +2126,9 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
     _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
     if not device_ip:
         return {"ok": False, "message": "Selected Arduino has no IP address."}
+    ok, reason = can_web_contact_arduino(uid, "Maintenance panel refresh")
+    if not ok:
+        return {"ok": False, "message": reason}
     raw_panels = _maintenance_panel_data(device_ip=device_ip)
     payload_panels: dict[str, str] = {}
     for key in ["RTC Time", "Status", "Config", "Diagnostics"]:
@@ -2184,6 +2190,9 @@ def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str) 
     _device, _short_uid, device_ip = _resolve_device_context_for_uid(uid)
     if not device_ip:
         return {"ok": False, "message": "Selected Arduino has no IP address."}
+    ok, reason = can_web_contact_arduino(uid, "RF Data remote preview")
+    if not ok:
+        return {"ok": False, "message": reason}
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -4113,14 +4122,11 @@ class Handler(BaseHTTPRequestHandler):
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
                 return True
-            try:
-                if is_transfer_active(Path(DEFAULT_DB_PATH), selected_uid):
-                    msg = "Delete on SD blocked: transfer is active for this Arduino."
-                    append_action_log("file-transfers-delete-sd", msg)
-                    self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
-                    return True
-            except Exception:
-                pass
+            ok_gate, reason = can_web_contact_arduino(selected_uid, "Delete on SD")
+            if not ok_gate:
+                append_action_log("file-transfers-delete-sd", reason)
+                self._send_html(render_file_transfers_page(message=reason, selected_uid=selected_uid))
+                return True
             ok, detail = delete_remote_file(device_ip=device_ip, remote_filename=remote_filename, timeout_s=8.0)
             if ok:
                 msg = detail
@@ -4149,10 +4155,9 @@ class Handler(BaseHTTPRequestHandler):
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
                 return True
-            running, _pid = MANAGER.status()
-            if running:
-                msg = "Stop Normal Ops before uploading a selected SD file (port/bind conflict)."
-                self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
+            ok_gate, reason = can_web_contact_arduino(selected_uid, "Upload selected SD file")
+            if not ok_gate:
+                self._send_html(render_file_transfers_page(message=reason, selected_uid=selected_uid))
                 return True
             set_upload_progress(upload_op_id, 0, "upload starting", done=False, error=False)
 
@@ -4210,6 +4215,11 @@ class Handler(BaseHTTPRequestHandler):
             device_ip = (selected_device.get("device_ip", "") or selected_device.get("recv_ip", "")).strip()
             if not device_ip:
                 self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
+                return True
+            ok_gate, reason = can_web_contact_arduino(selected_uid, f"Maintenance {action}")
+            if not ok_gate:
+                append_action_log("maintenance-blocked", reason)
+                self._send_html(render_maintenance_page(message=reason, selected_uid=selected_uid))
                 return True
             if action == "get-time":
                 msg = run_maintenance_action_with_retry(

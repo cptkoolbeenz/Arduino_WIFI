@@ -17,9 +17,12 @@ from .db import (
     clear_transfer_active,
     find_unique_ids_by_short_uid,
     init_db,
+    is_transfer_active,
     log_discovery_event,
     log_slot_event,
     log_transfer_event,
+    mark_daily_ops_ready,
+    mark_daily_ops_result,
     read_completed_uploads_for_day,
     read_devices_snapshot,
     set_transfer_active,
@@ -536,6 +539,15 @@ def _transfer_latest_file_for_device(
 
     control_sock = _open_device_control_socket(bind_ip)
     try:
+        if db_enabled and db_path is not None:
+            try:
+                if is_transfer_active(db_path=db_path, unique_id=uid):
+                    base_result["status"] = "skip"
+                    base_result["message"] = f"Skip {display_id}: another transfer is active for this Arduino."
+                    return base_result
+            except Exception as exc:
+                print(f"Warning: DB read failed (active transfer check): {exc}")
+
         remote_files = request_remote_file_list(
             control_sock=control_sock,
             device_ip=device_ip,
@@ -674,6 +686,21 @@ def _transfer_latest_file_for_device(
         control_sock.close()
 
 
+def _daily_ops_state_for_transfer_result(result: dict[str, str | float]) -> str:
+    status = str(result.get("status", "") or "").strip().lower()
+    msg = str(result.get("message", "") or "").strip().lower()
+    source = str(result.get("source_filename", "") or "").strip()
+    if status == "saved":
+        return "completed_uploaded"
+    if status == "skip":
+        if "another transfer is active" in msg:
+            return "failed"
+        if source or "already uploaded today" in msg or "already saved" in msg:
+            return "completed_uploaded"
+        return "completed_no_data"
+    return "failed"
+
+
 def run_discovery(args: argparse.Namespace) -> int:
     run_id = f"DISC_{int(time.time() * 1000)}"
     db_enabled = bool(getattr(args, "db_log", True))
@@ -771,6 +798,18 @@ def run_discovery(args: argparse.Namespace) -> int:
             # ACK_READY,<uid>,<filename>
             ack = f"ACK_READY,{uid},{ready['filename']}".encode("utf-8")
             sock.sendto(ack, (src_ip, args.discover_port))
+            if db_enabled:
+                try:
+                    mark_daily_ops_ready(
+                        db_path=db_path,
+                        unique_id=uid,
+                        run_id=run_id,
+                        ready_filename=str(ready["filename"]),
+                        ready_size=str(ready["size"]),
+                        ready_unix_ts=str(ready["unix_ts"]),
+                    )
+                except Exception as exc:
+                    print(f"Warning: DB write failed (daily ops ready): {exc}")
             if uid not in discovered:
                 discovered[uid] = {
                     "unique_id": uid,
@@ -1154,6 +1193,18 @@ def run_discovery(args: argparse.Namespace) -> int:
                         log_transfer_event(db_path=db_path, run_id=run_id, result=result)
                     except Exception as exc:
                         print(f"Warning: DB write failed (transfer event): {exc}")
+                    try:
+                        mark_daily_ops_result(
+                            db_path=db_path,
+                            unique_id=str(result.get("unique_id", "")),
+                            run_id=run_id,
+                            state=_daily_ops_state_for_transfer_result(result),
+                            source_filename=str(result.get("source_filename", "")),
+                            saved_path=str(result.get("saved_path", "")),
+                            message=str(result.get("message", "")),
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed (daily ops result): {exc}")
 
         for result in transfer_results:
             if str(result.get("status", "")) != "skip":
@@ -1166,6 +1217,18 @@ def run_discovery(args: argparse.Namespace) -> int:
                         log_transfer_event(db_path=db_path, run_id=run_id, result=result)
                     except Exception as exc:
                         print(f"Warning: DB write failed (transfer skip event): {exc}")
+                    try:
+                        mark_daily_ops_result(
+                            db_path=db_path,
+                            unique_id=str(result.get("unique_id", "")),
+                            run_id=run_id,
+                            state=_daily_ops_state_for_transfer_result(result),
+                            source_filename=str(result.get("source_filename", "")),
+                            saved_path=str(result.get("saved_path", "")),
+                            message=str(result.get("message", "")),
+                        )
+                    except Exception as exc:
+                        print(f"Warning: DB write failed (daily ops skip result): {exc}")
 
         status_counts = Counter(str(r.get("status", "")) for r in transfer_results)
         ap_saved_counts = Counter(str(r.get("ap_id", default_ap)) for r in transfer_results if str(r.get("status", "")) == "saved")

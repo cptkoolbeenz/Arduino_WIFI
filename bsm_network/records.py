@@ -45,6 +45,9 @@ def write_discovery_csv(path: Path, rows: list[dict[str, str | int]]) -> None:
                 "burrow_id",
                 "short_uid_collision",
                 "short_uid_collision_note",
+                "ready_filename",
+                "ready_size",
+                "ready_unix_ts",
                 "last_seen",
             ],
         )

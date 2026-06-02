@@ -6,7 +6,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-DB_SCHEMA_VERSION = "2"
+DB_SCHEMA_VERSION = "3"
 
 UPSERT_DEVICE_SQL = """
 INSERT INTO devices (
@@ -135,6 +135,24 @@ def init_db(db_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_active_transfers_started_at ON active_transfers(started_at);
 
+            CREATE TABLE IF NOT EXISTS daily_ops (
+              unique_id TEXT NOT NULL,
+              ops_date TEXT NOT NULL,
+              run_id TEXT,
+              state TEXT NOT NULL,
+              ready_filename TEXT,
+              ready_size TEXT,
+              ready_unix_ts TEXT,
+              ready_received_at TEXT,
+              source_filename TEXT,
+              saved_path TEXT,
+              message TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (unique_id, ops_date)
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_ops_state_date ON daily_ops(state, ops_date);
+            CREATE INDEX IF NOT EXISTS idx_daily_ops_updated_at ON daily_ops(updated_at);
+
             CREATE TABLE IF NOT EXISTS web_events (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               event_ts TEXT NOT NULL,
@@ -184,6 +202,10 @@ def init_db(db_path: Path) -> None:
 
 def _now_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _ops_date_iso() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d")
 
 
 def upsert_device(db_path: Path, row: dict[str, str | int]) -> None:
@@ -354,6 +376,148 @@ def read_completed_uploads_for_day(
         if uid not in out:
             out[uid] = (src, ts)
     return out
+
+
+def mark_daily_ops_ready(
+    db_path: Path,
+    *,
+    unique_id: str,
+    run_id: str,
+    ready_filename: str = "",
+    ready_size: str = "",
+    ready_unix_ts: str = "",
+    ops_date: str | None = None,
+) -> None:
+    uid = (unique_id or "").strip()
+    if not uid:
+        return
+    day = (ops_date or _ops_date_iso()).strip()
+    now = _now_iso()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_ops (
+              unique_id, ops_date, run_id, state, ready_filename, ready_size,
+              ready_unix_ts, ready_received_at, source_filename, saved_path,
+              message, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?)
+            ON CONFLICT(unique_id, ops_date) DO UPDATE SET
+              run_id=excluded.run_id,
+              state=excluded.state,
+              ready_filename=excluded.ready_filename,
+              ready_size=excluded.ready_size,
+              ready_unix_ts=excluded.ready_unix_ts,
+              ready_received_at=excluded.ready_received_at,
+              message=excluded.message,
+              updated_at=excluded.updated_at
+            """,
+            (
+                uid,
+                day,
+                str(run_id or ""),
+                "ready_seen",
+                str(ready_filename or ""),
+                str(ready_size or ""),
+                str(ready_unix_ts or ""),
+                now,
+                "READY_TO_UPLOAD received.",
+                now,
+            ),
+        )
+
+
+def mark_daily_ops_result(
+    db_path: Path,
+    *,
+    unique_id: str,
+    run_id: str,
+    state: str,
+    source_filename: str = "",
+    saved_path: str = "",
+    message: str = "",
+    ops_date: str | None = None,
+) -> None:
+    uid = (unique_id or "").strip()
+    if not uid:
+        return
+    day = (ops_date or _ops_date_iso()).strip()
+    now = _now_iso()
+    state_clean = (state or "").strip() or "failed"
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO daily_ops (
+              unique_id, ops_date, run_id, state, ready_filename, ready_size,
+              ready_unix_ts, ready_received_at, source_filename, saved_path,
+              message, updated_at
+            ) VALUES (?, ?, ?, ?, '', '', '', '', ?, ?, ?, ?)
+            ON CONFLICT(unique_id, ops_date) DO UPDATE SET
+              run_id=excluded.run_id,
+              state=excluded.state,
+              source_filename=excluded.source_filename,
+              saved_path=excluded.saved_path,
+              message=excluded.message,
+              updated_at=excluded.updated_at
+            """,
+            (
+                uid,
+                day,
+                str(run_id or ""),
+                state_clean,
+                str(source_filename or ""),
+                str(saved_path or ""),
+                str(message or ""),
+                now,
+            ),
+        )
+
+
+def get_daily_ops_state(db_path: Path, unique_id: str, ops_date: str | None = None) -> dict[str, str]:
+    uid = (unique_id or "").strip()
+    if not uid or not db_path.exists():
+        return {}
+    day = (ops_date or _ops_date_iso()).strip()
+    try:
+        with _connect(db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT
+                  unique_id, ops_date, run_id, state, ready_filename, ready_size,
+                  ready_unix_ts, ready_received_at, source_filename, saved_path,
+                  message, updated_at
+                FROM daily_ops
+                WHERE unique_id = ? AND ops_date = ?
+                LIMIT 1
+                """,
+                (uid, day),
+            )
+            row = cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise
+    if row is None:
+        return {}
+    keys = [
+        "unique_id",
+        "ops_date",
+        "run_id",
+        "state",
+        "ready_filename",
+        "ready_size",
+        "ready_unix_ts",
+        "ready_received_at",
+        "source_filename",
+        "saved_path",
+        "message",
+        "updated_at",
+    ]
+    return {key: str(value or "") for key, value in zip(keys, row)}
+
+
+def is_daily_ops_complete(db_path: Path, unique_id: str, ops_date: str | None = None) -> bool:
+    state = get_daily_ops_state(db_path, unique_id, ops_date).get("state", "")
+    return state in {"completed_uploaded", "completed_no_data"}
 
 
 def log_slot_event(
