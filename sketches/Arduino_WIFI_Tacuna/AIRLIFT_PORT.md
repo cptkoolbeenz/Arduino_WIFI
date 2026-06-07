@@ -86,7 +86,39 @@ arduino-cli compile --fqbn arduino:renesas_uno:unor4wifi .
 arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port COMxx .
 ```
 
-`WiFiNINA` must be the **Adafruit fork** (the upstream Arduino fork lacks `setPins()` and doesn't compile on the Renesas `sam` arch).
+`WiFiNINA` must be the **Adafruit fork**. The Arduino Library Manager package named `WiFiNINA` by Arduino, including v2.0.1, is not sufficient for this sketch because its `WiFiClass` does not provide:
+
+```cpp
+WiFi.setPins(...)
+```
+
+If compile fails with:
+
+```text
+error: 'class WiFiClass' has no member named 'setPins'
+```
+
+then Arduino IDE is using the upstream Arduino `WiFiNINA` library instead of the Adafruit-compatible fork required by the AirLift Shield.
+
+Install/use the Adafruit fork and make sure the Arduino library copy is not taking precedence. On macOS, the Arduino copy may be in:
+
+```text
+~/Documents/Arduino/libraries/WiFiNINA
+```
+
+If needed, rename that folder to something like:
+
+```text
+WiFiNINA_Arduino_DISABLED
+```
+
+Then install the Adafruit-compatible WiFiNINA library and verify `setPins()` is present:
+
+```bash
+grep -R "setPins" ~/Documents/Arduino/libraries/*WiFiNINA*/src
+```
+
+The grep command should find a `setPins` declaration/definition before this sketch will compile.
 
 ## secrets.h
 

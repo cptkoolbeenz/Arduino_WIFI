@@ -138,8 +138,8 @@ const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
-uint8_t START_HOUR = 7;
-uint8_t END_HOUR = 19;
+uint8_t START_HOUR = 1;
+uint8_t END_HOUR = 23;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
@@ -212,7 +212,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "3.0";
+const char VERSION[] = "3.0t"; //t for Tacuna
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
