@@ -212,7 +212,7 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "3.0t"; //t for Tacuna
+const char VERSION[] = "3.0ct"; //c for combined sketch, t for Tacuna board build
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
