@@ -26,7 +26,25 @@
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <WiFiNINA.h>  // AirLift Shield port (was WiFiS3 for onboard ESP32-S3)
+
+// Select exactly one WiFi hardware profile before compiling.
+// Default is the current Uno R4 WiFi onboard ESP32-S3 radio.
+
+#define WIFI_PROFILE_R4_WIFI 1. //this is the R4 WIFI setup - change version string below. This worked on S74C with tacuna board
+// #define WIFI_PROFILE_AIRLIFT 1
+
+#if defined(WIFI_PROFILE_R4_WIFI) && defined(WIFI_PROFILE_AIRLIFT)
+#error "Select only one WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
+#elif defined(WIFI_PROFILE_AIRLIFT)
+#include <WiFiNINA.h>
+#elif defined(WIFI_PROFILE_R4_WIFI)
+#include <WiFiS3.h>
+#else
+#error "Select a WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
+#endif
+
+#define BSM_SENSOR_HOOK_ENABLED 1
+
 #include <WiFiUdp.h>
 #include <limits.h>
 #include "Time.h"
@@ -39,19 +57,17 @@ String myFilename;
 
 // PCB variable defined by Tacuna code
 #define SRAM_CS 1 //Use A0 for Uno R3.  Use 1 for Uno R4
-#define SD_CS 10  // Bob's original wiring (HiLetgo SD module wired CS -> D10)
+#define SD_CS 10
 #define AD7193_CS 0 //Use A1 for Uno R3. Use 0 for Uno R4
 
-// AirLift Shield (#4285) pin map for WiFiNINA.
-// Shares SPI bus (D11/D12/D13 + ICSP) with SD card and AD7193; different CS pins keep them separable.
-// HARDWARE MODS REQUIRED on AirLift Shield (D5 and D10 conflict with the mauck stack):
-//   1. RESET: cut RST_JMP D5 trace, jumper A0 (D14) -> ESP32 EN  -- D5 conflicts with LCD data 4
-//   2. CS:    cut CS_JMP D10 trace, jumper A1 (D15) -> ESP32 GPIO5 (SPI CS) -- D10 conflicts with SD CS
-// NOTE: A4/A5 are NOT safe — they are taken over by Wire.begin() (I2C SDA/SCL) for the RTC.
+#if defined(WIFI_PROFILE_AIRLIFT)
+// Adafruit AirLift Shield (#4285) pin map for WiFiNINA.
+// Requires shield hardware mods documented in README.md.
 #define AIRLIFT_CS    15   // A1
 #define AIRLIFT_BUSY   7
 #define AIRLIFT_RESET 14   // A0
-#define AIRLIFT_GPIO0 -1   // G0 jumper open; ESP32 boots from flash via on-shield pull-up
+#define AIRLIFT_GPIO0 -1   // G0 jumper open
+#endif
 
 // Handle the ADC PCB unit
 // PRDC_AD7193 AD7193;
@@ -138,8 +154,8 @@ const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
-uint8_t START_HOUR = 1;
-uint8_t END_HOUR = 23;
+uint8_t START_HOUR = 7;
+uint8_t END_HOUR = 19;
 // TCP chunk size used for file transfer to controller.
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
@@ -212,7 +228,17 @@ const bool debug = false;
 
 // flag for countdown
 const bool countdown = true;
-const char VERSION[] = "3.0t"; //for Tacuna board build only
+// show which build we are making
+#if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
+const char VERSION[] = "4.0ctd";
+#elif defined(WIFI_PROFILE_AIRLIFT)
+const char VERSION[] = "4.0ctp";
+#elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
+const char VERSION[] = "4.0cwd";
+#else
+const char VERSION[] = "4.0cwp";
+#endif
+
 
 // Interval of file timestamps to retain in trimmed output.
 struct TrimInterval {
@@ -1842,9 +1868,10 @@ void sendFileOverTcp(
 void serviceWifiCommands() {
   wifiCommandHandled = false;
   if (!wifiInitialized) return;
-  // WiFiNINA quirk: parsePacket() drops packets if called too rapidly on AirLift.
-  // 10ms idle gap fixes the missed-packet behavior.
+#if defined(WIFI_PROFILE_AIRLIFT)
+  // WiFiNINA on AirLift can miss packets if parsePacket() is called too rapidly.
   delay(10);
+#endif
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
 
@@ -2340,18 +2367,22 @@ void setup() {
   pinMode(SD_CS, OUTPUT); 
   digitalWrite(SD_CS, HIGH);
 
-  pinMode(AD7193_CS, OUTPUT);
+  pinMode(AD7193_CS, OUTPUT); 
   digitalWrite(AD7193_CS, HIGH);
 
+#if defined(WIFI_PROFILE_AIRLIFT)
   pinMode(AIRLIFT_CS, OUTPUT);
   digitalWrite(AIRLIFT_CS, HIGH);
+#endif
 
   // Communication settings
   Serial.begin(115200);
   delay(500); // give time for serial to start up
 
+#if defined(WIFI_PROFILE_AIRLIFT)
   // AirLift Shield pin configuration. Must be set before any WiFi.* call.
   WiFi.setPins(AIRLIFT_CS, AIRLIFT_BUSY, AIRLIFT_RESET, AIRLIFT_GPIO0);
+#endif
 
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
@@ -2613,6 +2644,9 @@ void setup() {
     lcd.setCursor(6, 0);
     lcd.print(Get_Data());  // do this while we are messing with closing the datafile
   }
+
+  Serial.print(F("Setup complete. Version: "));
+  Serial.println(VERSION);
 }
 
 
