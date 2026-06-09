@@ -1024,6 +1024,32 @@ def can_web_contact_arduino(uid: str, action_label: str) -> tuple[bool, str]:
     return True, ""
 
 
+def can_web_access_file_transfers(uid: str, action_label: str) -> tuple[bool, str]:
+    """Return whether web UI may access Arduino SD file-transfer commands."""
+    token = (uid or "").strip()
+    label = (action_label or "File transfer").strip() or "File transfer"
+    if not token:
+        return False, f"{label} blocked: missing Arduino UID."
+    db_path = Path(DEFAULT_DB_PATH)
+    try:
+        if is_transfer_active(db_path, token):
+            return False, f"{label} blocked for {token}: bsm_network transfer is active."
+        state = get_daily_ops_state(db_path, token)
+        current = state.get("state", "none") if state else "none"
+        if current in {"completed_uploaded", "completed_no_data", "failed"}:
+            return True, ""
+        updated = state.get("updated_at", "") if state else ""
+        suffix = f" Last daily ops state={current}"
+        if updated:
+            suffix += f" updated_at={updated}"
+        return False, (
+            f"{label} blocked for {token}: daily Normal Ops have not reached a terminal state today."
+            f"{suffix}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{label} blocked for {token}: cannot verify Gateway state ({exc})."
+
+
 def assign_burrow_id(short_uid: str, burrow_id: str) -> str:
     """Assign burrow id."""
     db_path = Path(DEFAULT_DB_PATH)
@@ -2081,7 +2107,7 @@ def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, obje
     _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
     if not device_ip:
         return {"ok": False, "message": "Selected Arduino has no IP address."}
-    ok, reason = can_web_contact_arduino(uid, "LIST_FILES")
+    ok, reason = can_web_access_file_transfers(uid, "LIST_FILES")
     if not ok:
         return {"ok": False, "message": reason}
     remote_items, remote_err = _request_remote_file_list_with_sizes(device_ip, timeout_s=8.0)
@@ -4122,7 +4148,7 @@ class Handler(BaseHTTPRequestHandler):
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
                 return True
-            ok_gate, reason = can_web_contact_arduino(selected_uid, "Delete on SD")
+            ok_gate, reason = can_web_access_file_transfers(selected_uid, "Delete on SD")
             if not ok_gate:
                 append_action_log("file-transfers-delete-sd", reason)
                 self._send_html(render_file_transfers_page(message=reason, selected_uid=selected_uid))
@@ -4155,7 +4181,7 @@ class Handler(BaseHTTPRequestHandler):
             if not remote_filename:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
                 return True
-            ok_gate, reason = can_web_contact_arduino(selected_uid, "Upload selected SD file")
+            ok_gate, reason = can_web_access_file_transfers(selected_uid, "Upload selected SD file")
             if not ok_gate:
                 self._send_html(render_file_transfers_page(message=reason, selected_uid=selected_uid))
                 return True
