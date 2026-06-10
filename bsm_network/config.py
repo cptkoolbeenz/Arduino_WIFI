@@ -176,8 +176,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(
         discover=True,
+        ready_driven=True,
         transfer_latest_file=True,
-        sync_time=False,
+        skip_if_uploaded_today=True,
+        sync_time=True,
         cloud_enabled=False,
         scheduled=True,
         db_log=True,

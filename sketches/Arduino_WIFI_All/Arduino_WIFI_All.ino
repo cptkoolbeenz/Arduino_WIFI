@@ -43,7 +43,7 @@
 #error "Select a WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
 #endif
 
-#define BSM_SENSOR_HOOK_ENABLED 1
+#define BSM_SENSOR_HOOK_ENABLED 1 // version 4.0 only has data collection true
 
 #include <WiFiUdp.h>
 #include <limits.h>
@@ -160,9 +160,9 @@ uint8_t END_HOUR = 19;
 const size_t FILE_CHUNK_SIZE = 4096;
 // Mandatory raw-capture period immediately after reboot.
 // Set to 300s for normal time to reach WiFi mode quickly after reboot. 10 for testing
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 60UL; // 300UL;
-// Duration from file start treated as calibration section for trim logic.
-const uint32_t TRIM_CALIBRATION_SECONDS = 300UL;
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 300UL; // 60UL; // for testing, set to 60s to speed up trim logic testing. Set to 300s for normal use to capture more calibration data and reach WiFi mode faster after reboot.
+// Duration from file start treated same as calibration section for trim logic.
+const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
 // Optional guard from file start before event detection can begin.
 const uint32_t TRIM_START_GUARD_SECONDS = TRIM_CALIBRATION_SECONDS;
 // Seconds of context retained before event trigger time.
