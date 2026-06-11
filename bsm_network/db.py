@@ -337,7 +337,7 @@ def read_completed_uploads_for_day(
     local_day_iso: str | None = None,
 ) -> dict[str, tuple[str, str]]:
     """
-    Return latest successful source filename per unique_id for today's local date
+    Return latest terminal source filename per unique_id for today's local date
     when filename matches <PREFIX><YYMMDD>.TXT and prefix is in `prefixes`.
     """
     if not db_path.exists():
@@ -356,7 +356,7 @@ def read_completed_uploads_for_day(
             """
             SELECT unique_id, source_filename, event_ts
             FROM transfer_events
-            WHERE status = 'saved'
+            WHERE status IN ('saved', 'unverified')
               AND substr(event_ts, 1, 10) = ?
             ORDER BY event_ts DESC
             """,
@@ -517,7 +517,7 @@ def get_daily_ops_state(db_path: Path, unique_id: str, ops_date: str | None = No
 
 def is_daily_ops_complete(db_path: Path, unique_id: str, ops_date: str | None = None) -> bool:
     state = get_daily_ops_state(db_path, unique_id, ops_date).get("state", "")
-    return state in {"completed_uploaded", "completed_no_data"}
+    return state in {"completed_uploaded", "completed_no_data", "completed_unverified"}
 
 
 def log_slot_event(

@@ -1036,7 +1036,7 @@ def can_web_access_file_transfers(uid: str, action_label: str) -> tuple[bool, st
             return False, f"{label} blocked for {token}: bsm_network transfer is active."
         state = get_daily_ops_state(db_path, token)
         current = state.get("state", "none") if state else "none"
-        if current in {"completed_uploaded", "completed_no_data", "failed"}:
+        if current in {"completed_uploaded", "completed_no_data", "completed_unverified", "failed"}:
             return True, ""
         updated = state.get("updated_at", "") if state else ""
         suffix = f" Last daily ops state={current}"

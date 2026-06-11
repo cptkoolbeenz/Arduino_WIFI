@@ -471,6 +471,7 @@ def transfer_file_protocol(
     tolerant_integrity: bool = False,
     mark_partial_received: bool = False,
     progress_callback: Callable[[int, int, int, str], None] | None = None,
+    integrity_result: dict[str, str | int] | None = None,
 ) -> Path:
     if not str(requested_filename or "").lower().endswith(".txt"):
         raise ValueError(f"Refusing non-.txt transfer request: {requested_filename}")
@@ -678,6 +679,18 @@ def transfer_file_protocol(
     print(f"[{device_ip}] DONE sent. Saved ({integrity_status}) -> {out_path}")
     transfer_seconds = time.monotonic() - transfer_start
     print(f"[{device_ip}] Transfer time: {transfer_seconds:.2f}s")
+    if integrity_result is not None:
+        integrity_result.clear()
+        integrity_result.update(
+            {
+                "status": integrity_status,
+                "source_filename": filename,
+                "saved_path": str(out_path),
+                "bytes_written": bytes_written,
+                "file_size": int(file_size or 0),
+                "checksum_crc32": f"{(stream_crc32 & 0xFFFFFFFF):08x}",
+            }
+        )
 
     should_mark_received = integrity_status == "verified" or (
         integrity_status != "verified" and mark_partial_received

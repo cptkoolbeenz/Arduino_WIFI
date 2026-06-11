@@ -631,6 +631,7 @@ def _transfer_latest_file_for_device(
             except Exception as exc:
                 print(f"Warning: DB write failed (set active transfer): {exc}")
 
+        integrity_result: dict[str, str | int] = {}
         try:
             saved_path = transfer_file_protocol(
                 control_sock=control_sock,
@@ -646,6 +647,7 @@ def _transfer_latest_file_for_device(
                 timeout_s=max(args.download_timeout, 30.0),
                 tolerant_integrity=args.transfer_tolerant,
                 mark_partial_received=args.mark_partial_received,
+                integrity_result=integrity_result,
             )
         finally:
             if active_marked and db_path is not None:
@@ -655,7 +657,11 @@ def _transfer_latest_file_for_device(
                     print(f"Warning: DB write failed (clear active transfer): {exc}")
 
         base_result["saved_path"] = str(saved_path)
-        base_result["status"] = "saved"
+        integrity_status = str(integrity_result.get("status", "verified"))
+        if integrity_status == "verified":
+            base_result["status"] = "saved"
+        else:
+            base_result["status"] = "unverified"
         # Post-upload host-time sync: do not block file selection/transfer startup.
         sync_epoch = int(time.time() + (args.time_offset_hours * 3600.0))
         synced = send_time_sync(
@@ -670,7 +676,13 @@ def _transfer_latest_file_for_device(
         else:
             print(f"{uid}: RTC post-upload sync failed/timeout")
             rtc_sync_note = " RTC post-upload sync failed."
-        base_result["message"] = f"Saved file for {display_id}: {saved_path}{rtc_sync_note}"
+        if base_result["status"] == "unverified":
+            base_result["message"] = (
+                f"Saved unverified file for {display_id}: {saved_path} "
+                f"(integrity={integrity_status}){rtc_sync_note}"
+            )
+        else:
+            base_result["message"] = f"Saved file for {display_id}: {saved_path}{rtc_sync_note}"
         return base_result
     except Exception as exc:
         source = str(base_result.get("source_filename", "")).strip()
@@ -692,6 +704,8 @@ def _daily_ops_state_for_transfer_result(result: dict[str, str | float]) -> str:
     source = str(result.get("source_filename", "") or "").strip()
     if status == "saved":
         return "completed_uploaded"
+    if status == "unverified":
+        return "completed_unverified"
     if status == "skip":
         if "another transfer is active" in msg:
             return "failed"
