@@ -30,8 +30,8 @@
 // Select exactly one WiFi hardware profile before compiling.
 // Default is the current Uno R4 WiFi onboard ESP32-S3 radio.
 
-#define WIFI_PROFILE_R4_WIFI 1. //this is the R4 WIFI setup - change version string below. This worked on S74C with tacuna board
-// #define WIFI_PROFILE_AIRLIFT 1
+// #define WIFI_PROFILE_R4_WIFI 1 // this is the R4 WIFI setup - change version string below. This worked on S74C with tacuna board
+#define WIFI_PROFILE_AIRLIFT 1
 
 #if defined(WIFI_PROFILE_R4_WIFI) && defined(WIFI_PROFILE_AIRLIFT)
 #error "Select only one WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
@@ -157,7 +157,12 @@ const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller
 uint8_t START_HOUR = 7;
 uint8_t END_HOUR = 19;
 // TCP chunk size used for file transfer to controller.
+// WiFiNINA/AirLift is more reliable with smaller chunks; R4 WiFi can use larger chunks.
+#if defined(WIFI_PROFILE_AIRLIFT)
+const size_t FILE_CHUNK_SIZE = 1024;
+#elif defined(WIFI_PROFILE_R4_WIFI)
 const size_t FILE_CHUNK_SIZE = 4096;
+#endif
 // Mandatory raw-capture period immediately after reboot.
 // Set to 300s for normal time to reach WiFi mode quickly after reboot. 10 for testing
 const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 300UL; // 60UL; // for testing, set to 60s to speed up trim logic testing. Set to 300s for normal use to capture more calibration data and reach WiFi mode faster after reboot.
