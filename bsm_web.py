@@ -95,7 +95,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.0"
+WEB_APP_VERSION = "4.1"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -277,6 +277,10 @@ class ProcessManager:
         self._force_task_id: int = 0
         self._force_active_id: int | None = None
         self._force_log_path = Path("data/web_force_upload.log")
+        self._poll_thread: threading.Thread | None = None
+        self._poll_task_id: int = 0
+        self._poll_active_id: int | None = None
+        self._poll_log_path = Path("data/web_poll_now.log")
 
     def status(self) -> tuple[bool, int | None]:
         """Return whether the sibling bsm_network process appears to be running."""
@@ -361,12 +365,61 @@ class ProcessManager:
         return f"Force upload started for {uid} ({device_ip}) (task {task_id})."
 
     def poll_now(self) -> str:
-        """Refresh monitor state without polling Arduino clients."""
+        """Start a guarded, discovery-only poll of Arduino clients."""
         with self._lock:
             if self._force_thread is not None and self._force_thread.is_alive():
                 return "Wait for force upload to finish before manual poll (port/bind conflict)."
-        invalidate_endpoint_cache()
-        return "Monitor refreshed from Gateway state. No Arduino poll was sent."
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                active_id = self._poll_active_id if self._poll_active_id is not None else 0
+                return f"Poll Now already running (task {active_id})."
+
+        try:
+            active_rows = list_active_transfers(Path(DEFAULT_DB_PATH))
+        except Exception as exc:  # noqa: BLE001
+            return f"Poll Now skipped: active-transfer check failed ({exc})."
+        if active_rows:
+            labels = []
+            for row in active_rows[:3]:
+                short_uid = str(row.get("short_uid", "") or "").strip()
+                uid = str(row.get("unique_id", "") or "").strip()
+                source = str(row.get("source_filename", "") or "").strip()
+                labels.append(short_uid or uid or source or "unknown")
+            more = "" if len(active_rows) <= 3 else f", +{len(active_rows) - 3} more"
+            return f"Poll Now skipped: {len(active_rows)} file transfer(s) active ({', '.join(labels)}{more})."
+
+        args_list, note = build_dynamic_poll_now_args()
+        with self._lock:
+            self._poll_task_id += 1
+            task_id = self._poll_task_id
+            self._poll_active_id = task_id
+
+        def _run_poll_now() -> None:
+            """Execute discovery-only poll in a worker thread."""
+            self._poll_log_path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now().isoformat(timespec="seconds")
+            with self._poll_log_path.open("a", encoding="utf-8") as logf:
+                logf.write(f"\n=== Poll Now start {stamp} task={task_id} ===\n")
+                logf.write(f"{note}\n")
+                logf.flush()
+                rc = 1
+                try:
+                    args = parse_args(args_list)
+                    with redirect_stdout(logf), redirect_stderr(logf):
+                        rc = run_discovery(args)
+                    invalidate_endpoint_cache()
+                except Exception as exc:  # noqa: BLE001
+                    logf.write(f"Poll Now failed: {exc}\n")
+                end_stamp = dt.datetime.now().isoformat(timespec="seconds")
+                logf.write(f"=== Poll Now end {end_stamp} task={task_id} rc={rc} ===\n")
+            with self._lock:
+                if self._poll_active_id == task_id:
+                    self._poll_active_id = None
+
+        thread = threading.Thread(target=_run_poll_now, name=f"poll-now-{task_id}", daemon=True)
+        with self._lock:
+            self._poll_thread = thread
+        thread.start()
+        return f"Poll Now started (task {task_id}). Discovery only; no transfers or time sync. Refresh in a few seconds."
 
     def shutdown(self) -> None:
         """Stop managed background processes before server shutdown."""
