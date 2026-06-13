@@ -95,7 +95,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.1"
+WEB_APP_VERSION = "4.2"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2693,7 +2693,6 @@ def render_page(message: str = "") -> bytes:
     body_html = f"""
       {_render_controls_row([
           _render_action_form(action="/start", label="Normal Ops", method="post"),
-          _render_action_form(action="/stop", label="Stop Normal Ops", method="post"),
           _render_action_form(action="/poll-now", label="Poll Now", method="post"),
       ])}
       <div class="warn-banner" style="display:block;">
@@ -2972,14 +2971,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
               hidden_input_class="selected-uid-field",
               hidden_class_names={"uid"},
           ),
-          _render_action_form(
-              action="/file-transfers-stop-safe",
-              label="Stop Normal Ops Safely",
-              method="post",
-              hidden_fields=[("uid", selected_uid)],
-              hidden_input_class="selected-uid-field",
-              hidden_class_names={"uid"},
-          ),
       ])}
       {busy_note_html}
 
@@ -3084,17 +3075,58 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     function getUploadRows() {{
       return Array.from(document.querySelectorAll("#uploaded-list-box .upload-row"));
     }}
+    function getSelectedSdRows() {{
+      return getSdRows().filter((r) => r.classList.contains("selected"));
+    }}
+    function getSelectedUploadRows() {{
+      return getUploadRows().filter((r) => r.classList.contains("selected"));
+    }}
+    function appendGeneratedInputs(form, className, fieldName, values) {{
+      if (!form) return;
+      Array.from(form.querySelectorAll("." + className)).forEach((el) => el.remove());
+      values.slice(1).forEach((value) => {{
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = fieldName;
+        input.value = value;
+        input.className = className;
+        form.appendChild(input);
+      }});
+    }}
+    function syncSdDeleteFields() {{
+      const names = getSelectedSdRows().map((r) => r.dataset.name || "").filter((v) => v.trim().length > 0);
+      if (sdSelectedName) sdSelectedName.value = names.length === 1 ? names[0] : "";
+      if (sdDeleteSelectedName) sdDeleteSelectedName.value = names[0] || "";
+      appendGeneratedInputs(sdDeleteForm, "generated-sd-delete-field", "remote_filename", names);
+      return names;
+    }}
+    function syncUploadedDeleteFields() {{
+      const selectedRows = getSelectedUploadRows();
+      const paths = selectedRows.map((r) => r.dataset.path || "").filter((v) => v.trim().length > 0);
+      const names = selectedRows.map((r) => r.dataset.name || "").filter((v) => v.trim().length > 0);
+      if (selectedPath) selectedPath.value = paths[0] || "";
+      if (selectedName) selectedName.value = names[0] || "";
+      appendGeneratedInputs(deleteForm, "generated-uploaded-delete-path-field", "saved_path", paths);
+      appendGeneratedInputs(deleteForm, "generated-uploaded-delete-name-field", "source_filename", names);
+      return {{ paths, names }};
+    }}
     function updateActionButtons() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
       needsDeviceControls.forEach((el) => {{
         el.disabled = !hasUid;
       }});
-      const hasSd = !!((sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "");
-      const hasUploaded = !!((selectedPath && selectedPath.value) ? selectedPath.value.trim() : "");
-      if (sdUploadButton) sdUploadButton.disabled = !(hasUid && hasSd);
-      if (sdDeleteButton) sdDeleteButton.disabled = !(hasUid && hasSd);
-      if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && hasUploaded);
-      if (uploadedDeleteButton) uploadedDeleteButton.disabled = !(hasUid && hasUploaded);
+      const sdSelectedCount = getSelectedSdRows().length;
+      const uploadedSelectedCount = getSelectedUploadRows().length;
+      if (sdUploadButton) sdUploadButton.disabled = !(hasUid && sdSelectedCount === 1);
+      if (sdDeleteButton) {{
+        sdDeleteButton.disabled = !(hasUid && sdSelectedCount > 0);
+        sdDeleteButton.textContent = sdSelectedCount > 1 ? "Delete on SD (" + sdSelectedCount + ")" : "Delete on SD";
+      }}
+      if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && uploadedSelectedCount === 1);
+      if (uploadedDeleteButton) {{
+        uploadedDeleteButton.disabled = !(hasUid && uploadedSelectedCount > 0);
+        uploadedDeleteButton.textContent = uploadedSelectedCount > 1 ? "Delete (" + uploadedSelectedCount + ")" : "Delete";
+      }}
     }}
     function setSelectedUid(uid, triggerLoad = true) {{
       let selectedShort = "...";
@@ -3111,6 +3143,11 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
       if (selectedPath) selectedPath.value = "";
       if (selectedName) selectedName.value = "";
+      if (downloadPath) downloadPath.value = "";
+      if (downloadName) downloadName.value = "";
+      appendGeneratedInputs(sdDeleteForm, "generated-sd-delete-field", "remote_filename", []);
+      appendGeneratedInputs(deleteForm, "generated-uploaded-delete-path-field", "saved_path", []);
+      appendGeneratedInputs(deleteForm, "generated-uploaded-delete-name-field", "source_filename", []);
       updateActionButtons();
       if (triggerLoad) {{
         loadAllFilePanels(uid);
@@ -3121,16 +3158,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     }});
 
     function setSelectedSdRow(row) {{
-      getSdRows().forEach((r) => r.classList.remove("selected"));
       if (!row) {{
+        getSdRows().forEach((r) => r.classList.remove("selected"));
         if (sdSelectedName) sdSelectedName.value = "";
         if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
+        appendGeneratedInputs(sdDeleteForm, "generated-sd-delete-field", "remote_filename", []);
         updateActionButtons();
         return;
       }}
-      row.classList.add("selected");
-      if (sdSelectedName) sdSelectedName.value = row.dataset.name || "";
-      if (sdDeleteSelectedName) sdDeleteSelectedName.value = row.dataset.name || "";
+      row.classList.toggle("selected");
+      syncSdDeleteFields();
       updateActionButtons();
     }}
     function bindSdRows() {{
@@ -3139,20 +3176,23 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       }});
     }}
     function setSelectedUploadRow(row) {{
-      getUploadRows().forEach((r) => r.classList.remove("selected"));
       if (!row) {{
+        getUploadRows().forEach((r) => r.classList.remove("selected"));
         if (selectedPath) selectedPath.value = "";
         if (selectedName) selectedName.value = "";
         if (downloadPath) downloadPath.value = "";
         if (downloadName) downloadName.value = "";
+        appendGeneratedInputs(deleteForm, "generated-uploaded-delete-path-field", "saved_path", []);
+        appendGeneratedInputs(deleteForm, "generated-uploaded-delete-name-field", "source_filename", []);
         updateActionButtons();
         return;
       }}
-      row.classList.add("selected");
-      if (selectedPath) selectedPath.value = row.dataset.path || "";
-      if (selectedName) selectedName.value = row.dataset.name || "";
-      if (downloadPath) downloadPath.value = row.dataset.path || "";
-      if (downloadName) downloadName.value = row.dataset.name || "";
+      row.classList.toggle("selected");
+      const selectedRows = getSelectedUploadRows();
+      const firstRow = selectedRows.length === 1 ? selectedRows[0] : null;
+      syncUploadedDeleteFields();
+      if (downloadPath) downloadPath.value = firstRow ? (firstRow.dataset.path || "") : "";
+      if (downloadName) downloadName.value = firstRow ? (firstRow.dataset.name || "") : "";
       updateActionButtons();
     }}
     function bindUploadedRows() {{
@@ -3310,8 +3350,13 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     if (sdDeleteForm) {{
       sdDeleteForm.addEventListener("submit", (ev) => {{
         ev.preventDefault();
-        const name = (sdDeleteSelectedName && sdDeleteSelectedName.value) ? sdDeleteSelectedName.value : "selected file";
-        const ok1 = window.confirm("Delete selected SD file '" + name + "' now?");
+        const names = syncSdDeleteFields();
+        if (names.length < 1) {{
+          window.alert("Select at least one SD file to delete.");
+          return;
+        }}
+        const label = names.length === 1 ? "'" + names[0] + "'" : names.length + " selected SD files";
+        const ok1 = window.confirm("Delete " + label + " now?");
         if (!ok1) {{
           return;
         }}
@@ -3320,15 +3365,17 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
             .map((r) => (r.dataset.name || "").trim().toUpperCase())
             .filter((v) => v.length > 0)
         );
-        if (!uploadedNames.has(name.trim().toUpperCase())) {{
-          const ok2 = window.confirm("chosen file has not been uploaded. Proceed anyway?");
+        const missingUploads = names.filter((name) => !uploadedNames.has(name.trim().toUpperCase()));
+        if (missingUploads.length > 0) {{
+          const missingLabel = missingUploads.length === 1 ? "'" + missingUploads[0] + "'" : missingUploads.length + " selected files";
+          const ok2 = window.confirm(missingLabel + " not uploaded. Proceed anyway?");
           if (!ok2) {{
             return;
           }}
         }}
         if (deleteOverlay) deleteOverlay.style.display = "flex";
         if (deleteProgressText) {{
-          deleteProgressText.textContent = "Deleting " + name + ". Please wait.";
+          deleteProgressText.textContent = names.length === 1 ? "Deleting " + names[0] + ". Please wait." : "Deleting " + names.length + " files. Please wait.";
         }}
         const params = new URLSearchParams(new FormData(sdDeleteForm));
         fetch(sdDeleteForm.action, {{
@@ -3352,12 +3399,17 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     if (deleteForm) {{
       deleteForm.addEventListener("submit", (ev) => {{
         ev.preventDefault();
-        const name = (selectedName && selectedName.value) ? selectedName.value : "this file";
-        const ok = window.confirm("Delete local uploaded file '" + name + "'?");
+        const selected = syncUploadedDeleteFields();
+        if (selected.paths.length < 1) {{
+          window.alert("Select at least one uploaded file to delete.");
+          return;
+        }}
+        const label = selected.names.length === 1 ? "'" + selected.names[0] + "'" : selected.paths.length + " selected uploaded files";
+        const ok = window.confirm("Delete local uploaded file " + label + "?");
         if (!ok) return;
         if (deleteOverlay) deleteOverlay.style.display = "flex";
         if (deleteProgressText) {{
-          deleteProgressText.textContent = "Deleting " + name + ". Please wait.";
+          deleteProgressText.textContent = selected.paths.length === 1 ? "Deleting " + (selected.names[0] || "selected file") + ". Please wait." : "Deleting " + selected.paths.length + " files. Please wait.";
         }}
         const params = new URLSearchParams(new FormData(deleteForm));
         fetch(deleteForm.action, {{
@@ -4176,19 +4228,45 @@ class Handler(BaseHTTPRequestHandler):
         """Process POST actions for upload/delete file operations."""
         if self.path == "/file-transfers-delete-uploaded":
             selected_uid = (form.get("uid") or [""])[0].strip()
-            saved_path = (form.get("saved_path") or [""])[0].strip()
-            source_filename = (form.get("source_filename") or [""])[0].strip()
-            ok, detail = delete_local_uploaded_file(saved_path)
-            if ok:
-                msg = f"Deleted uploaded file '{source_filename}'. {detail}"
+            saved_paths = [v.strip() for v in form.get("saved_path", []) if v.strip()]
+            source_filenames = [v.strip() for v in form.get("source_filename", []) if v.strip()]
+            if not saved_paths:
+                self._send_html(render_file_transfers_page(message="Select an uploaded file first.", selected_uid=selected_uid))
+                return True
+
+            results: list[tuple[bool, str, str]] = []
+            for idx, saved_path in enumerate(saved_paths):
+                source_filename = source_filenames[idx] if idx < len(source_filenames) else Path(saved_path).name
+                ok, detail = delete_local_uploaded_file(saved_path)
+                results.append((ok, source_filename, detail))
+
+            ok_count = sum(1 for ok, _name, _detail in results if ok)
+            fail_rows = [(name, detail) for ok, name, detail in results if not ok]
+            if len(results) == 1:
+                ok, source_filename, detail = results[0]
+                if ok:
+                    msg = f"Deleted uploaded file '{source_filename}'. {detail}"
+                else:
+                    msg = f"Delete failed for '{source_filename}': {detail}"
+            elif not fail_rows:
+                msg = f"Deleted {ok_count} uploaded file(s)."
             else:
-                msg = f"Delete failed for '{source_filename}': {detail}"
+                sample = "; ".join(f"{name}: {detail}" for name, detail in fail_rows[:3])
+                more = "" if len(fail_rows) <= 3 else f"; +{len(fail_rows) - 3} more"
+                msg = f"Deleted {ok_count} uploaded file(s); failed {len(fail_rows)}. {sample}{more}"
             append_action_log("file-transfers-delete-uploaded", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
             return True
         if self.path == "/file-transfers-delete-sd":
             selected_uid = (form.get("uid") or [""])[0].strip()
-            remote_filename = (form.get("remote_filename") or [""])[0].strip()
+            remote_filenames = []
+            seen_remote_filenames = set()
+            for value in form.get("remote_filename", []):
+                remote_filename = value.strip()
+                if not remote_filename or remote_filename in seen_remote_filenames:
+                    continue
+                seen_remote_filenames.add(remote_filename)
+                remote_filenames.append(remote_filename)
             devices = read_devices_rows(Path("data/discovered_devices.csv"))
             selected_device = _find_device_by_uid(devices, selected_uid)
             if selected_device is None:
@@ -4198,7 +4276,7 @@ class Handler(BaseHTTPRequestHandler):
             if not device_ip:
                 self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
                 return True
-            if not remote_filename:
+            if not remote_filenames:
                 self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
                 return True
             ok_gate, reason = can_web_access_file_transfers(selected_uid, "Delete on SD")
@@ -4206,11 +4284,26 @@ class Handler(BaseHTTPRequestHandler):
                 append_action_log("file-transfers-delete-sd", reason)
                 self._send_html(render_file_transfers_page(message=reason, selected_uid=selected_uid))
                 return True
-            ok, detail = delete_remote_file(device_ip=device_ip, remote_filename=remote_filename, timeout_s=8.0)
-            if ok:
-                msg = detail
+
+            results: list[tuple[bool, str, str]] = []
+            for remote_filename in remote_filenames:
+                ok, detail = delete_remote_file(device_ip=device_ip, remote_filename=remote_filename, timeout_s=8.0)
+                results.append((ok, remote_filename, detail))
+
+            ok_count = sum(1 for ok, _name, _detail in results if ok)
+            fail_rows = [(name, detail) for ok, name, detail in results if not ok]
+            if len(results) == 1:
+                ok, remote_filename, detail = results[0]
+                if ok:
+                    msg = detail
+                else:
+                    msg = f"Delete on SD failed for '{remote_filename}': {detail}"
+            elif not fail_rows:
+                msg = f"Deleted {ok_count} SD file(s) on {device_ip}."
             else:
-                msg = f"Delete on SD failed for '{remote_filename}': {detail}"
+                sample = "; ".join(f"{name}: {detail}" for name, detail in fail_rows[:3])
+                more = "" if len(fail_rows) <= 3 else f"; +{len(fail_rows) - 3} more"
+                msg = f"Deleted {ok_count} SD file(s) on {device_ip}; failed {len(fail_rows)}. {sample}{more}"
             append_action_log("file-transfers-delete-sd", msg)
             self._send_html(render_file_transfers_page(message=msg, selected_uid=selected_uid))
             return True
