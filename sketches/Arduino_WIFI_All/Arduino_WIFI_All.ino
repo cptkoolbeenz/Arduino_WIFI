@@ -2691,13 +2691,6 @@ void loop() {
   }
 
   if (!startupCalWindowComplete) {
-    String nextFilename = rtnFilename();
-    if (nextFilename.length() > 0 && nextFilename != myFilename) {
-      closeAcqDataFile();
-      myFilename = nextFilename;
-      Serial.print(F("Saving to: "));
-      Serial.println(myFilename);
-    }
     runAcquisitionCycle(unixTs, true);
     if (unixTs >= startupCalWindowEndTs) {
       startupCalWindowComplete = true;
@@ -2863,13 +2856,6 @@ void loop() {
   wifiIdleAnnounced = false;
   wifiLowPowerStandby = false;
   wifiNextStandbyProbeTs = 0;
-  String nextFilename = rtnFilename();
-  if (nextFilename.length() > 0 && nextFilename != myFilename) {
-    closeAcqDataFile();
-    myFilename = nextFilename;
-    Serial.print(F("Saving to: "));
-    Serial.println(myFilename);
-  }
   runAcquisitionCycle(unixTs, false);
 }
 
