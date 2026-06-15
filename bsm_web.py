@@ -2922,7 +2922,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     .upload-row.selected { background: #ffe1ba; font-weight: 700; }
     .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
     .list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }
-    .panel-note { margin: -0.15rem 0 0.4rem 0; color: #475569; font-size: 0.86rem; line-height: 1.25; }
     .delete-btn { background: #c53030; border-color: #9b2c2c; }
     .progress-overlay {
       position: fixed;
@@ -2986,7 +2985,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       <div class="grid2">
         <div>
           <div class="section-title" id="files-on-title">{html.escape(f"Arduino SD files on {files_title_suffix}")}</div>
-          <div class="panel-note">Requires the Arduino to be online.</div>
           <div class="list-actions">
             <form method="post" action="/file-transfers-upload-selected" id="sd-upload-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -3004,7 +3002,6 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         </div>
         <div>
           <div class="section-title" id="files-uploaded-title">{html.escape(f"Gateway files saved for {files_title_suffix}")}</div>
-          <div class="panel-note">Available even when the Arduino is offline. Select one file, then download it to this computer.</div>
           <div class="list-actions">
             <form method="get" action="/file-transfers-download-uploaded" id="uploaded-download-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
