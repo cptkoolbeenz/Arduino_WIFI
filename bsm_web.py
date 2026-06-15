@@ -1418,7 +1418,7 @@ def _read_uploaded_files_for_device(short_uid: str) -> tuple[list[tuple[str, str
 def _build_uploaded_rows_html(rows: list[tuple[str, str, str, float]]) -> str:
     """Build uploaded rows html."""
     if not rows:
-        return '<div style="font-style:italic;">(No uploaded files logged for this Arduino)</div>'
+        return '<div style="font-style:italic;">(No Gateway-saved files found for this Arduino)</div>'
     out = []
     out.append('<div class="upload-head">filename                          size_mb   uploaded_at</div>')
     out.append('<div class="upload-sep">--------------------------------  -------   -------------------</div>')
@@ -2183,7 +2183,7 @@ def get_file_transfers_uploaded_files_payload(selected_uid: str) -> dict[str, ob
     if uploaded_err:
         return {"ok": True, "short_uid": short_uid, "html": "", "note": uploaded_err}
     if not uploaded_rows:
-        return {"ok": True, "short_uid": short_uid, "html": "", "note": "(No uploaded files logged for this Arduino)"}
+        return {"ok": True, "short_uid": short_uid, "html": "", "note": "(No Gateway-saved files found for this Arduino)"}
     return {"ok": True, "short_uid": short_uid, "html": _build_uploaded_rows_html(uploaded_rows), "note": ""}
 
 
@@ -2864,7 +2864,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 
     selected_short = ""
     remote_note = "(Select a known Arduino to view SD files)"
-    uploaded_note = "(Select a known Arduino to view upload history)"
+    uploaded_note = "(Select a known Arduino to view Gateway-saved files)"
     history_text = "(Select a known Arduino to view complete DB history)"
     active_rows: list[dict[str, str]] = []
     active_error = ""
@@ -2903,7 +2903,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         if not selected_short:
             selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
         remote_note = "Loading files from Arduino..."
-        uploaded_note = "Loading uploaded-file list..."
+        uploaded_note = "Loading Gateway-saved file list..."
         history_text = "Loading SQLite history..."
 
     files_title_suffix = selected_short if selected_short else "..."
@@ -2922,6 +2922,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     .upload-row.selected { background: #ffe1ba; font-weight: 700; }
     .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
     .list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }
+    .panel-note { margin: -0.15rem 0 0.4rem 0; color: #475569; font-size: 0.86rem; line-height: 1.25; }
     .delete-btn { background: #c53030; border-color: #9b2c2c; }
     .progress-overlay {
       position: fixed;
@@ -2984,7 +2985,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
 
       <div class="grid2">
         <div>
-          <div class="section-title" id="files-on-title">{html.escape(f"Files on {files_title_suffix}")}</div>
+          <div class="section-title" id="files-on-title">{html.escape(f"Arduino SD files on {files_title_suffix}")}</div>
+          <div class="panel-note">Requires the Arduino to be online.</div>
           <div class="list-actions">
             <form method="post" action="/file-transfers-upload-selected" id="sd-upload-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -3001,13 +3003,14 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           {_render_scrollbox("sd-list-box", remote_note)}
         </div>
         <div>
-          <div class="section-title" id="files-uploaded-title">{html.escape(f"Files uploaded from {files_title_suffix}")}</div>
+          <div class="section-title" id="files-uploaded-title">{html.escape(f"Gateway files saved for {files_title_suffix}")}</div>
+          <div class="panel-note">Available even when the Arduino is offline. Select one file, then download it to this computer.</div>
           <div class="list-actions">
             <form method="get" action="/file-transfers-download-uploaded" id="uploaded-download-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
               <input type="hidden" name="saved_path" value="" id="uploaded-download-path" />
               <input type="hidden" name="source_filename" value="" id="uploaded-download-name" />
-              <button type="submit" id="uploaded-download-button">Download</button>
+              <button type="submit" id="uploaded-download-button">Download to Laptop</button>
             </form>
             <form method="post" action="/file-transfers-delete-uploaded" id="uploaded-delete-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
@@ -3137,8 +3140,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           selectedShort = (r.dataset.short || "").trim() || "...";
         }} else r.classList.remove("selected");
       }});
-      if (filesOnTitle) filesOnTitle.textContent = "Files on " + selectedShort;
-      if (filesUploadedTitle) filesUploadedTitle.textContent = "Files uploaded from " + selectedShort;
+      if (filesOnTitle) filesOnTitle.textContent = "Arduino SD files on " + selectedShort;
+      if (filesUploadedTitle) filesUploadedTitle.textContent = "Gateway files saved for " + selectedShort;
       if (sdSelectedName) sdSelectedName.value = "";
       if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
       if (selectedPath) selectedPath.value = "";
@@ -3212,7 +3215,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         const resp = await fetch("/api/file-transfers/remote-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
         const payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {{
-          sdListBox.textContent = payload && payload.message ? payload.message : "(Could not fetch files.)";
+          sdListBox.textContent = payload && payload.message ? payload.message : "(Could not fetch Arduino SD files. Gateway-saved files may still be available.)";
           setSelectedSdRow(null);
           return;
         }}
@@ -3222,7 +3225,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           sdListBox.textContent = payload.note || "(No files reported by Arduino)";
         }}
       }} catch (_err) {{
-        sdListBox.textContent = "(Could not fetch files.)";
+        sdListBox.textContent = "(Could not fetch Arduino SD files. Gateway-saved files may still be available.)";
       }}
       setSelectedSdRow(null);
       bindSdRows();
@@ -3231,26 +3234,26 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     async function loadUploadedFiles(uid) {{
       if (!uploadedListBox) return;
       if (!uid) {{
-        uploadedListBox.textContent = "(Select a known Arduino to view upload history)";
+        uploadedListBox.textContent = "(Select a known Arduino to view Gateway-saved files)";
         setSelectedUploadRow(null);
         return;
       }}
-      uploadedListBox.textContent = "Loading uploaded-file list...";
+      uploadedListBox.textContent = "Loading Gateway-saved file list...";
       try {{
         const resp = await fetch("/api/file-transfers/uploaded-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
         const payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {{
-          uploadedListBox.textContent = payload && payload.message ? payload.message : "(Could not load uploaded files.)";
+          uploadedListBox.textContent = payload && payload.message ? payload.message : "(Could not load Gateway-saved files.)";
           setSelectedUploadRow(null);
           return;
         }}
         if (payload.html && payload.html.length > 0) {{
           uploadedListBox.innerHTML = payload.html;
         }} else {{
-          uploadedListBox.textContent = payload.note || "(No uploaded files logged for this Arduino)";
+          uploadedListBox.textContent = payload.note || "(No Gateway-saved files found for this Arduino)";
         }}
       }} catch (_err) {{
-        uploadedListBox.textContent = "(Could not load uploaded files.)";
+        uploadedListBox.textContent = "(Could not load Gateway-saved files.)";
       }}
       setSelectedUploadRow(null);
       bindUploadedRows();
@@ -3277,9 +3280,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     }}
     async function loadAllFilePanels(uid) {{
       const selectedUid = (uid || "").trim();
+      const localFilesPromise = loadUploadedFiles(selectedUid);
       await Promise.allSettled([
+        localFilesPromise,
         loadRemoteFiles(selectedUid),
-        loadUploadedFiles(selectedUid),
         loadHistory(selectedUid),
       ]);
     }}
