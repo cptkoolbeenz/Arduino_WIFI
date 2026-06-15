@@ -95,7 +95,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.2"
+WEB_APP_VERSION = "4.3"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2920,7 +2920,8 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
     .upload-row { white-space: pre; cursor: pointer; border-radius: 4px; }
     .upload-row:hover { background: #eef5ff; }
     .upload-row.selected { background: #ffe1ba; font-weight: 700; }
-    .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: 1fr 1fr; }
+    .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .grid2 > div { min-width: 0; }
     .list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }
     .delete-btn { background: #c53030; border-color: #9b2c2c; }
     .progress-overlay {
@@ -3069,6 +3070,19 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
       }}
       return "";
     }}
+    function getSelectedShortLabel(uid) {{
+      const selectedUid = (uid || "").trim();
+      for (const r of rows) {{
+        if (r.dataset.uid === selectedUid) {{
+          const shortLabel = (r.dataset.short || "").trim();
+          return shortLabel || selectedUid;
+        }}
+      }}
+      return selectedUid || "Arduino";
+    }}
+    function offlineSdMessage(uid) {{
+      return getSelectedShortLabel(uid) + " is offline";
+    }}
     function getSdRows() {{
       return Array.from(document.querySelectorAll("#sd-list-box .sd-row"));
     }}
@@ -3212,7 +3226,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
         const resp = await fetch("/api/file-transfers/remote-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
         const payload = await resp.json();
         if (!resp.ok || !payload || !payload.ok) {{
-          sdListBox.textContent = payload && payload.message ? payload.message : "(Could not fetch Arduino SD files. Gateway-saved files may still be available.)";
+          sdListBox.textContent = offlineSdMessage(uid);
           setSelectedSdRow(null);
           return;
         }}
@@ -3222,7 +3236,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           sdListBox.textContent = payload.note || "(No files reported by Arduino)";
         }}
       }} catch (_err) {{
-        sdListBox.textContent = "(Could not fetch Arduino SD files. Gateway-saved files may still be available.)";
+        sdListBox.textContent = offlineSdMessage(uid);
       }}
       setSelectedSdRow(null);
       bindSdRows();
