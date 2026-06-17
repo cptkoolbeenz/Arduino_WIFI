@@ -1472,13 +1472,16 @@ void checkAndMaybeFlashWiFi() {
   Serial.print(F("/"));
   Serial.println(NINA_RECOVERY_MAX_ATTEMPTS);
   if (printLCD) {
-    lcd.setCursor(0, 0); lcd.print("Flashing WiFi   ");
-    lcd.setCursor(0, 1);
-    lcd.print("Try ");
+    // Line 1: "Flash try N/M   " (always <= 16 chars for single-digit N, M).
+    // Line 2: "Do NOT power off" (16 chars exactly).
+    lcd.setCursor(0, 0);
+    lcd.print("Flash try ");
     lcd.print((int)(prior + 1));
     lcd.print("/");
     lcd.print(NINA_RECOVERY_MAX_ATTEMPTS);
-    lcd.print(" no-pwr-off");
+    lcd.print("   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Do NOT power off");
   }
   Serial.println(F("[wifi] starting flash from SD..."));
   ESPFlasherInit(true, &Serial);
