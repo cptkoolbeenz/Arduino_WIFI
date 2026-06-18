@@ -95,7 +95,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.3"
+WEB_APP_VERSION = "4.4"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2701,6 +2701,9 @@ def render_page(message: str = "") -> bytes:
       </div>
 
       <div class="nav-buttons">
+        <form method="get" action="/iphone">
+          <button type="submit" class="placeholder-btn">iPhone</button>
+        </form>
         <form method="get" action="/file-transfers">
           <button type="submit" class="placeholder-btn">File Transfers</button>
         </form>
@@ -3642,6 +3645,200 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
     return "".join(out)
 
 
+def _format_hhmm_today(raw_ts: str) -> str:
+    """Return HH:MM only when timestamp is today."""
+    d = _iso_to_dt(raw_ts)
+    if d is None or d.date() != dt.date.today():
+        return ""
+    return d.strftime("%H:%M")
+
+
+def _format_gateway_uptime() -> str:
+    """Return compact Gateway uptime text."""
+    try:
+        raw = Path("/proc/uptime").read_text(encoding="utf-8").split()[0]
+        seconds = int(float(raw))
+    except Exception:
+        return "unknown"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _read_iphone_files_today(db_path: Path) -> list[dict[str, str]]:
+    """Return successful Gateway file receipts for today, newest first."""
+    if not db_path.exists():
+        return []
+    today = dt.date.today().isoformat()
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.execute(
+                """
+                SELECT
+                  COALESCE(d.short_uid, ''),
+                  COALESCE(t.network_uid, ''),
+                  COALESCE(t.source_filename, ''),
+                  COALESCE(t.saved_path, ''),
+                  COALESCE(t.event_ts, '')
+                FROM transfer_events t
+                LEFT JOIN devices d
+                  ON d.unique_id = t.unique_id
+                WHERE date(substr(t.event_ts, 1, 10)) = ?
+                  AND lower(COALESCE(t.status, '')) = 'saved'
+                ORDER BY t.event_ts DESC
+                """,
+                (today,),
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return []
+
+    out: list[dict[str, str]] = []
+    for short_uid, network_uid, filename, saved_path, event_ts in rows:
+        uid = str(short_uid or "").strip()
+        if not uid:
+            net = str(network_uid or "").strip()
+            uid = net[-6:] if len(net) >= 6 else net
+        size_mb = ""
+        try:
+            p = Path(str(saved_path or "")).expanduser()
+            if p.exists() and p.is_file():
+                size_mb = f"{(p.stat().st_size / (1024.0 * 1024.0)):.2f}"
+        except Exception:
+            size_mb = ""
+        out.append(
+            {
+                "uid": uid,
+                "time": _format_hhmm_today(str(event_ts)),
+                "size_mb": size_mb,
+                "filename": str(filename or ""),
+            }
+        )
+    return out
+
+
+def _iphone_device_status(row: dict[str, str]) -> tuple[str, str, str]:
+    """Return status key, visible dot, and short label for iPhone device rows."""
+    last_seen = _iso_to_dt(row.get("last_seen", ""))
+    status = (row.get("status", "") or "").strip().lower()
+    if status in {"online", "upload"}:
+        return "online", "●", "online"
+    if last_seen is not None and last_seen.date() == dt.date.today():
+        return "today", "●", "seen today"
+    return "missing", "●", "not seen today"
+
+
+def _render_iphone_page(message: str = "") -> bytes:
+    """Render compact field/iPhone status page."""
+    running, pid = MANAGER.status()
+    state = f"RUNNING (PID {pid})" if running else "STOPPED"
+    ctx = PageContext(page_title=f"{WEB_APP_NAME} - iPhone", state=state, message=message, subtitle="iPhone Field Status")
+    devices = read_devices_rows(Path("data/discovered_devices.csv"))
+    files_today = _read_iphone_files_today(Path(DEFAULT_DB_PATH))
+    online_count = sum(1 for d in devices if (d.get("status", "") or "").strip().lower() in {"online", "upload"})
+    total_count = len(devices)
+    last_upload = files_today[0]["time"] if files_today else "--"
+    uptime = _format_gateway_uptime()
+
+    device_rows = []
+    for d in sorted(devices, key=lambda r: ((r.get("burrow_id", "") or "zzzz"), (r.get("short_uid", "") or r.get("unique_id", "")))):
+        uid = (d.get("short_uid", "") or "").strip()
+        if not uid:
+            unique_id = (d.get("unique_id", "") or "").strip()
+            uid = unique_id[-6:] if len(unique_id) >= 6 else unique_id
+        burrow = (d.get("burrow_id", "") or "-").strip()
+        seen = _format_hhmm_today(d.get("last_seen", ""))
+        status_key, dot, label = _iphone_device_status(d)
+        device_rows.append(
+            "<tr>"
+            f"<td>{html.escape(burrow)}</td>"
+            f"<td>{html.escape(uid)}</td>"
+            f"<td>{html.escape(seen)}</td>"
+            f'<td class="status-dot {status_key}" title="{html.escape(label)}">{dot}</td>'
+            "</tr>"
+        )
+    if not device_rows:
+        device_rows.append('<tr><td colspan="4" class="empty-row">No known Arduinos</td></tr>')
+
+    file_rows = []
+    for f in files_today:
+        file_rows.append(
+            "<tr>"
+            f"<td>{html.escape(f['uid'])}</td>"
+            f"<td>{html.escape(f['time'])}</td>"
+            f"<td class=\"num\">{html.escape(f['size_mb'])}</td>"
+            f"<td class=\"filename\">{html.escape(f['filename'])}</td>"
+            "</tr>"
+        )
+    if not file_rows:
+        file_rows.append('<tr><td colspan="4" class="empty-row">No files received today</td></tr>')
+
+    extra_css = """
+    body { background: #f8fafc; }
+    .shell { max-width: 760px; margin: 0 auto; padding: 0.6rem; }
+    .panel { padding: 0.75rem; box-shadow: none; border-radius: 6px; }
+    .title { font-size: 1.15rem; }
+    .subtitle, .status { font-size: 0.82rem; margin-bottom: 0.45rem; }
+    .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; margin: 0.6rem 0; }
+    .summary-cell { border: 1px solid var(--line); border-radius: 6px; background: #fbfdff; padding: 0.45rem; }
+    .summary-label { color: #475569; font-size: 0.75rem; font-weight: 700; }
+    .summary-value { color: #0b2d4b; font-size: 1.1rem; font-weight: 800; margin-top: 0.1rem; }
+    .iphone-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; margin: 0.6rem 0; }
+    .iphone-actions button { width: 100%; padding: 0.7rem 0.4rem; font-weight: 700; }
+    .section-title { margin: 0.9rem 0 0.35rem 0; }
+    .iphone-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; table-layout: fixed; }
+    .iphone-table th, .iphone-table td { border-bottom: 1px solid #d8e1ea; padding: 0.42rem 0.25rem; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .iphone-table th { color: #304a64; font-size: 0.74rem; text-transform: uppercase; }
+    .iphone-table .num { text-align: right; }
+    .iphone-table .filename { width: 44%; }
+    .status-dot { text-align: center; font-size: 1.15rem; line-height: 1; }
+    .status-dot.online { color: #15803d; }
+    .status-dot.today { color: #ca8a04; }
+    .status-dot.missing { color: #dc2626; }
+    .empty-row { color: #64748b; font-style: italic; text-align: center; }
+    """
+    body_html = f"""
+      <div class="summary-grid">
+        <div class="summary-cell"><div class="summary-label">Arduinos Online</div><div class="summary-value">{online_count} / {total_count}</div></div>
+        <div class="summary-cell"><div class="summary-label">Files Today</div><div class="summary-value">{len(files_today)}</div></div>
+        <div class="summary-cell"><div class="summary-label">Last Upload</div><div class="summary-value">{html.escape(last_upload)}</div></div>
+        <div class="summary-cell"><div class="summary-label">Gateway Uptime</div><div class="summary-value">{html.escape(uptime)}</div></div>
+      </div>
+      <div class="iphone-actions">
+        <form method="get" action="/"><button type="submit">Dashboard</button></form>
+        <form method="post" action="/iphone-poll"><button type="submit">Poll</button></form>
+      </div>
+
+      {_render_section_title("Known Arduinos")}
+      <table class="iphone-table">
+        <thead><tr><th>Burr</th><th>UID</th><th>Seen</th><th>Status</th></tr></thead>
+        <tbody>{"".join(device_rows)}</tbody>
+      </table>
+
+      {_render_section_title("Files Received Today")}
+      <table class="iphone-table">
+        <thead><tr><th>UID</th><th>Time</th><th>MB</th><th class="filename">Filename</th></tr></thead>
+        <tbody>{"".join(file_rows)}</tbody>
+      </table>
+"""
+    return _render_shared_page(
+        ctx=ctx,
+        body_html=body_html,
+        web_app_header=WEB_APP_HEADER,
+        active_network_profile=ACTIVE_NETWORK_PROFILE,
+        active_network_profile_source=ACTIVE_NETWORK_PROFILE_SOURCE,
+        extra_css=extra_css,
+    )
+
+
 def _maintenance_info_lines(device_ip: str) -> list[str]:
     """Collect maintenance command output lines for one device IP."""
     status = query_device_status(device_ip=device_ip)
@@ -4128,6 +4325,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/batch-downloads":
             self._send_html(render_batch_downloads_page())
             return True
+        if route == "/iphone":
+            self._send_html(_render_iphone_page())
+            return True
         if route == "/rf-data":
             selected_uid = (query.get("uid") or [""])[0].strip()
             self._send_html(render_rf_data_page(selected_uid=selected_uid))
@@ -4230,6 +4430,11 @@ class Handler(BaseHTTPRequestHandler):
             msg = MANAGER.poll_now()
             append_action_log("poll-now", msg)
             self._send_html(render_page(msg))
+            return True
+        if self.path == "/iphone-poll":
+            msg = MANAGER.poll_now()
+            append_action_log("iphone-poll", msg)
+            self._send_html(_render_iphone_page(msg))
             return True
         if self.path == "/file-transfers-stop-safe":
             selected_uid = (form.get("uid") or [""])[0].strip()

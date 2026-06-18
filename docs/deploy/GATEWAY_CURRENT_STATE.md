@@ -70,7 +70,7 @@ Systemd unit files tracked in this repo:
 ## Web/App State
 
 - Web app name: `NORTH_END_IOT`
-- Web app version: `4.3`
+- Web app version: `4.4`
 - Web bind host: `0.0.0.0`
 - Web port: `5001`
 - Config file: `config/network_profile.json`
@@ -86,6 +86,13 @@ Known-good File Transfers behavior:
 - Gateway-saved files can be downloaded even when the Arduino is offline.
 - Offline Arduino SD listing shows a short `<short_uid> is offline` message.
 - The SD-file and Gateway-file panels remain side by side and the same size.
+
+Known-good iPhone field page behavior:
+
+- `/iphone` shows a compact static field status page.
+- The page answers whether Arduinos are alive and whether files are being received.
+- The page does not auto-refresh.
+- The `Poll` button runs discovery-only polling and returns to the iPhone page.
 
 ## Arduino Sketch State
 
