@@ -15,7 +15,7 @@ The backups stored in this directory contain:
 * Upload directories
 * Local databases and configuration files
 
-Backups:
+Backups: (these are found in Dropbox/Big Science/NORTH_END_WIFI)
 
 * Arduino_WIFI_Backup_2026_06_18.tar.gz
 * unifi_Backup_2026_06_18.tar.gz
