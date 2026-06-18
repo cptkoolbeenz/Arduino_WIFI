@@ -37,6 +37,7 @@
 #error "Select only one WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
 #elif defined(WIFI_PROFILE_AIRLIFT)
 #include <WiFiNINA.h>
+#include "ESPSerialFlasher.h"   // self-heal: reflash nina-fw from SD if AirLift is dead
 #elif defined(WIFI_PROFILE_R4_WIFI)
 #include <WiFiS3.h>
 #else
@@ -67,6 +68,19 @@ String myFilename;
 #define AIRLIFT_BUSY   7
 #define AIRLIFT_RESET 14   // A0
 #define AIRLIFT_GPIO0 -1   // G0 jumper open
+
+// AirLift auto-recovery: on boot, probe nina-fw via WiFi.firmwareVersion().
+// If the AirLift is unresponsive, reflash from SD root file NINA_FW_FILENAME
+// (8.3 filename — the SD library on Renesas doesn't do long names) and
+// hardware-reset. Set WIFI_AUTO_RECOVERY to 0 to disable.
+// A SD-backed counter in NINA_RECOVERY_COUNTER_FILE caps consecutive failed
+// recoveries at NINA_RECOVERY_MAX_ATTEMPTS so a unit with an unrecoverable
+// AirLift doesn't bounce forever burning SD write endurance. Counter clears
+// on any healthy boot.
+#define WIFI_AUTO_RECOVERY 1
+#define NINA_FW_FILENAME            "NINAFW.BIN"
+#define NINA_RECOVERY_COUNTER_FILE  "RECOVCNT.TXT"
+#define NINA_RECOVERY_MAX_ATTEMPTS  3
 #endif
 
 // Handle the ADC PCB unit
@@ -1385,6 +1399,159 @@ bool ensureTrimmedFileReadyForWifi() {
   return true;
 }
 
+#if defined(WIFI_PROFILE_AIRLIFT)
+// ----- AirLift auto-recovery (AirLift-only) ----------------------------------
+// Counter persistence is a small ASCII file on the SD root. SD is already a
+// hard prerequisite for the recovery path, so the counter introduces no new
+// dependencies. The R4 has no easy NVS, so file-on-SD beats EEPROM emulation.
+static uint8_t readRecoveryAttempts() {
+  if (!SD.exists(NINA_RECOVERY_COUNTER_FILE)) return 0;
+  File f = SD.open(NINA_RECOVERY_COUNTER_FILE, FILE_READ);
+  if (!f) return 0;
+  uint8_t n = 0;
+  while (f.available()) {
+    int c = f.read();
+    if (c >= '0' && c <= '9') n = (n * 10) + (c - '0');
+    else break;
+  }
+  f.close();
+  return n;
+}
+static void writeRecoveryAttempts(uint8_t n) {
+  SD.remove(NINA_RECOVERY_COUNTER_FILE);
+  File f = SD.open(NINA_RECOVERY_COUNTER_FILE, FILE_WRITE);
+  if (!f) return;
+  f.print((int)n);
+  f.close();
+}
+static void clearRecoveryAttempts() {
+  if (SD.exists(NINA_RECOVERY_COUNTER_FILE)) SD.remove(NINA_RECOVERY_COUNTER_FILE);
+}
+
+/***********************
+ * Probes the AirLift WiFi module. If WiFi.firmwareVersion() doesn't return a
+ * sane string, attempts to reflash nina-fw from the SD card (NINAFW.BIN in the
+ * root) and hardware-resets the R4 so the new firmware boots cleanly.
+ *
+ * Preconditions: WiFi.setPins() called; SD already initialised (sdReady set).
+ * Behaviour when WiFi is dead:
+ *   - SD not ready / NINAFW.BIN missing -> warns and returns (app will fail
+ *     to connect; user must intervene).
+ *   - Reached the attempt cap (3) -> warns and returns; does not retry.
+ *   - Otherwise: flashes (MD5-verified internally) and resets. Does not return.
+ ***********************/
+void checkAndMaybeFlashWiFi() {
+#if WIFI_AUTO_RECOVERY
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("WiFi check...   ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+  }
+  Serial.println(F("[wifi] checking AirLift firmware..."));
+  String fw = WiFi.firmwareVersion();
+  bool fwOk = (fw.length() >= 5) && (fw[0] != (char)0xFF) && (fw[0] != 0);
+  if (fwOk) {
+    Serial.print(F("[wifi] firmware OK: "));
+    Serial.println(fw);
+    if (printLCD) {
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi fw: ");
+      lcd.print(fw.substring(0, 7));
+    }
+    if (sdReady) clearRecoveryAttempts();
+    delay(800);
+    return;
+  }
+  Serial.println(F("[wifi] firmware unreadable - reflash needed"));
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("WiFi DEAD       ");
+  }
+  delay(800);
+  if (!sdReady) {
+    Serial.println(F("[wifi] sdReady=false; trying SD.begin for recovery"));
+    sdReady = SD.begin(SD_CS);
+  }
+  if (!sdReady) {
+    Serial.println(F("[wifi] no SD - cannot auto-flash"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("No SD - manual  "); }
+    delay(3000);
+    return;
+  }
+  if (!SD.exists(NINA_FW_FILENAME)) {
+    Serial.print(F("[wifi] "));
+    Serial.print(NINA_FW_FILENAME);
+    Serial.println(F(" not found on SD"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("NINAFW.BIN n/f  "); }
+    delay(3000);
+    return;
+  }
+  uint8_t prior = readRecoveryAttempts();
+  if (prior >= NINA_RECOVERY_MAX_ATTEMPTS) {
+    Serial.print(F("[wifi] recovery attempt limit reached ("));
+    Serial.print((int)prior);
+    Serial.print(F("/"));
+    Serial.print(NINA_RECOVERY_MAX_ATTEMPTS);
+    Serial.println(F("); giving up to avoid loop"));
+    if (printLCD) {
+      lcd.setCursor(0, 0); lcd.print("Recovery limit  ");
+      lcd.setCursor(0, 1); lcd.print("hit - manual fix");
+    }
+    delay(3000);
+    return;
+  }
+  // Bump counter BEFORE the attempt so a mid-flash crash still counts.
+  writeRecoveryAttempts(prior + 1);
+  Serial.print(F("[wifi] recovery attempt "));
+  Serial.print((int)(prior + 1));
+  Serial.print(F("/"));
+  Serial.println(NINA_RECOVERY_MAX_ATTEMPTS);
+  if (printLCD) {
+    // Line 1: "Flash try N/M   " (always <= 16 chars for single-digit N, M).
+    // Line 2: "Do NOT power off" (16 chars exactly).
+    lcd.setCursor(0, 0);
+    lcd.print("Flash try ");
+    lcd.print((int)(prior + 1));
+    lcd.print("/");
+    lcd.print(NINA_RECOVERY_MAX_ATTEMPTS);
+    lcd.print("   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Do NOT power off");
+  }
+  Serial.println(F("[wifi] starting flash from SD..."));
+  ESPFlasherInit(true, &Serial);
+  esp_loader_error_t cerr = ESPFlasherConnect();
+  if (cerr != ESP_LOADER_SUCCESS) {
+    Serial.print(F("[wifi] ESPFlasherConnect failed: "));
+    Serial.println(cerr);
+    if (printLCD) {
+      lcd.setCursor(0, 0); lcd.print("Flash connect   ");
+      lcd.setCursor(0, 1); lcd.print("FAIL e="); lcd.print(cerr); lcd.print("        ");
+    }
+    delay(3000);
+    return;
+  }
+  esp_loader_error_t ferr = ESPFlashBin(NINA_FW_FILENAME);
+  if (ferr != ESP_LOADER_SUCCESS) {
+    Serial.print(F("[wifi] ESPFlashBin failed: "));
+    Serial.println(ferr);
+    if (printLCD) {
+      lcd.setCursor(0, 0); lcd.print("Flash FAIL      ");
+      lcd.setCursor(0, 1); lcd.print("err="); lcd.print(ferr); lcd.print("           ");
+    }
+    delay(3000);
+    return;
+  }
+  // Full success (including MD5 verify).
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Reflashed       ");
+    lcd.setCursor(0, 1); lcd.print("Rebooting...    ");
+  }
+  Serial.println(F("[wifi] reflash done; rebooting in 2s"));
+  delay(2000);
+  NVIC_SystemReset();
+#endif
+}
+#endif // WIFI_PROFILE_AIRLIFT
+
 /***********************
  * Connects STA WiFi with retries.
  * @return True when connected and local IP assigned.
@@ -2567,6 +2734,14 @@ void setup() {
   } else {
     Serial.println("card initialized.");  // confirm that it is good to go
   }
+
+#if defined(WIFI_PROFILE_AIRLIFT)
+  // AirLift self-heal: if nina-fw is dead and the SD card has NINAFW.BIN,
+  // reflash and reset. Capped at NINA_RECOVERY_MAX_ATTEMPTS to avoid loops.
+  // AirLift-only; the R4 onboard WiFi (WIFI_PROFILE_R4_WIFI) has its own
+  // firmware update path via the Arduino IDE / fwuploader.
+  checkAndMaybeFlashWiFi();
+#endif
 
 
 
