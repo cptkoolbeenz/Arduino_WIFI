@@ -83,12 +83,16 @@ String myFilename;
 #define NINA_RECOVERY_COUNTER_FILE  "RECOVCNT.TXT"
 #define NINA_RECOVERY_MAX_ATTEMPTS  3
 
-// Fleet provisioning: if EFUSE.OK is present on the SD root and EFUSE.DONE is
-// absent, the recovery flow burns XPD_SDIO_{REG,FORCE,TIEH} on the ESP32 to
-// force VDD_SDIO=3.3V regardless of IO12 strap (what Espressif factory-burns).
-// On success the sketch writes EFUSE.DONE so the burn never repeats. Without
-// the sentinel file the burn code never runs — protects against a stuck SPI
-// probe triggering an irreversible hardware mutation. Set to 0 to disable.
+// Fleet provisioning: if EFUSE.OK is present on the SD root, the recovery
+// flow reads the ESP32 efuse state live every boot. If XPD_SDIO_{REG,FORCE,
+// TIEH} are not all set, it burns them to force VDD_SDIO=3.3V regardless of
+// the IO12 strap (what Espressif factory-burns). After every read the sketch
+// writes EFUSE.DN as a forensic marker recording the state observed; it is
+// NOT a gate on whether the next burn fires. That lets one SD card provision
+// many boards in sequence — each board's efuse state is read independently.
+// Without the EFUSE.OK sentinel file the burn code never runs, protecting
+// against a stuck SPI probe triggering an irreversible hardware mutation.
+// Set WIFI_AUTO_EFUSE_BURN to 0 to disable the burn path entirely.
 #define WIFI_AUTO_EFUSE_BURN      1
 #define EFUSE_BURN_SENTINEL_FILE  "EFUSE.OK"
 #define EFUSE_BURN_DONE_FILE      "EFUSE.DN"
@@ -1471,14 +1475,18 @@ static bool waitEfuseCmdClear(uint32_t cmdBit, uint32_t timeoutMs) {
 
 // Returns true only when bits were actually burned this call (caller should
 // reset to re-latch the flash voltage strap). Returns false on:
-//   * sentinel absent or DONE marker present (normal: nothing to do)
-//   * chip already has all 3 bits set (writes DONE then returns false)
-//   * connect / read / verify failure (no DONE written; safe to retry)
+//   * sentinel absent (normal: operator has not opted in to burning)
+//   * chip already has all 3 bits set (rewrites EFUSE.DN marker, returns false)
+//   * connect / read / verify failure (no DONE marker written; safe to retry)
+//
+// Note: source of truth is the chip's actual efuse state read live every boot,
+// NOT the EFUSE.DN file on the SD. That's deliberate so one SD card can
+// provision many boards in sequence (each board's read is independent of
+// what a previous board left on the card).
 static bool maybeBurnEfuseIfRequested() {
   if (!SD.exists(EFUSE_BURN_SENTINEL_FILE)) return false;
-  if (SD.exists(EFUSE_BURN_DONE_FILE)) return false;
 
-  Serial.println(F("[efuse] EFUSE.OK present, EFUSE.DONE absent"));
+  Serial.println(F("[efuse] EFUSE.OK sentinel present"));
   if (printLCD) {
     lcd.setCursor(0, 0); lcd.print("Efuse check...  ");
     lcd.setCursor(0, 1); lcd.print("                ");

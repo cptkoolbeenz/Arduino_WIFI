@@ -53,43 +53,47 @@ Set `WIFI_AUTO_RECOVERY` to `0` near the top of the sketch to disable.
 
 ### Fleet provisioning workflow
 
-For a fleet of ~40 AirLift units the recommended provisioning workflow is:
+For a fleet of ~40 AirLift units, one provisioning SD card can be used
+to bring up the whole fleet sequentially:
 
-1. **SD prep (once, scriptable for all 40 cards):** copy these two files to
-   each SD root:
+1. **Prep one SD card:** copy two files to the SD root:
    - `NINA_ADAFRUIT-esp32-X.Y.Z.bin` renamed to `NINAFW.BIN` (~1.33 MB)
    - `EFUSE.OK` (empty file is fine — the sketch only checks for its existence)
-2. **First boot per unit:** insert SD, power on. The auto-recovery flow:
+2. **For each unit:** insert SD, power on. The auto-recovery flow:
    - probes nina-fw → fails (factory-blank AirLift)
-   - detects `EFUSE.OK` sentinel and absent `EFUSE.DN` marker
-   - connects to ESP32 in flasher mode, reads efuse state
-   - if XPD_SDIO bits unset → burns them (forces VDD_SDIO=3.3V regardless of
-     IO12 strap, equivalent to Espressif's factory burn) → writes `EFUSE.DN`
-     marker → resets to re-latch the strap
-   - if already burned (e.g. Adafruit factory boards) → just writes `EFUSE.DN`
-     and continues
+   - sees `EFUSE.OK` → connects to ESP32 in flasher mode, **reads efuse state
+     live from the chip**
+   - if `XPD_SDIO_{REG,FORCE,TIEH}` not all set → burns them (forces
+     VDD_SDIO=3.3V regardless of IO12 strap, equivalent to Espressif's
+     factory burn) → resets to re-latch the strap → second boot reads the
+     now-burned state and continues
+   - if already burned (Adafruit factory boards or a previously-burned chip)
+     → no-op on the burn → continues immediately
    - flashes `NINAFW.BIN`, MD5-verifies, resets
-   - second boot: nina-fw runs correctly, sketch enters normal operation
-3. **Field recovery (automatic):** once deployed, if the AirLift firmware
+   - third boot (or second if burn was a no-op): nina-fw runs correctly,
+     sketch enters normal operation
+3. **Move SD to the next unit** and repeat. The sentinel-gated burn re-runs
+   on each unit because **the source of truth is the chip's actual efuse
+   state read live every boot**, not a marker file on the SD. After
+   provisioning each unit it gets its own operational SD card.
+4. **Field recovery (automatic):** once deployed, if the AirLift firmware
    corrupts itself (brownout during flash, lightning event, flash wear),
-   the next power cycle auto-recovers from the same `NINAFW.BIN` on the SD.
-   The sentinel-gated efuse code never runs again because `EFUSE.DN` is
-   present from provisioning. No site visit needed. The 3-attempt cap
-   (`NINA_RECOVERY_MAX_ATTEMPTS`) prevents a wedged unit from chewing SD
-   write endurance forever.
+   the next power cycle auto-recovers from `NINAFW.BIN` on the SD. The
+   3-attempt cap (`NINA_RECOVERY_MAX_ATTEMPTS`) prevents a wedged unit
+   from chewing SD write endurance forever.
 
-The sketch creates two state files on the SD root:
+The sketch maintains two state files on the SD root:
 - `RECOVCNT.TXT` — recovery attempt counter (cleared on every healthy boot)
-- `EFUSE.DN` — efuse-burn-done marker (written once at provisioning;
-  presence makes the burn check a no-op on every subsequent boot)
+- `EFUSE.DN` — most-recent efuse read result, written purely as a forensic
+  log line. Does NOT gate burn behavior; the chip's live efuse state does.
 
 Why sentinel-gated and not unconditional auto-burn: efuse writes are
 **permanent and irreversible**. Without the `EFUSE.OK` sentinel the burn
 code never runs, so a transient SPI failure or genuinely-flaky AirLift
 can never trigger an accidental hardware mutation in the field. The
-sentinel is removed once `EFUSE.DN` exists — there is no path to a
-second burn on a deployed unit. Set `WIFI_AUTO_EFUSE_BURN` to `0` near
-the top of the sketch to disable the burn path entirely.
+sentinel is a deliberate operator action at provisioning time. Set
+`WIFI_AUTO_EFUSE_BURN` to `0` near the top of the sketch to disable the
+burn path entirely.
 
 ## Notes
 
