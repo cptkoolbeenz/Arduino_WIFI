@@ -83,19 +83,23 @@ String myFilename;
 #define NINA_RECOVERY_COUNTER_FILE  "RECOVCNT.TXT"
 #define NINA_RECOVERY_MAX_ATTEMPTS  3
 
-// Fleet provisioning: if EFUSE.OK is present on the SD root, the recovery
-// flow reads the ESP32 efuse state live every boot. If XPD_SDIO_{REG,FORCE,
-// TIEH} are not all set, it burns them to force VDD_SDIO=3.3V regardless of
-// the IO12 strap (what Espressif factory-burns). After every read the sketch
-// writes EFUSE.DN as a forensic marker recording the state observed; it is
-// NOT a gate on whether the next burn fires. That lets one SD card provision
-// many boards in sequence — each board's efuse state is read independently.
-// Without the EFUSE.OK sentinel file the burn code never runs, protecting
-// against a stuck SPI probe triggering an irreversible hardware mutation.
-// Set WIFI_AUTO_EFUSE_BURN to 0 to disable the burn path entirely.
-#define WIFI_AUTO_EFUSE_BURN      1
-#define EFUSE_BURN_SENTINEL_FILE  "EFUSE.OK"
-#define EFUSE_BURN_DONE_FILE      "EFUSE.DN"
+// Fleet provisioning: during recovery (i.e. when WiFi.firmwareVersion() fails)
+// the sketch reads the ESP32 efuse state live and, if XPD_SDIO_{REG,FORCE,
+// TIEH} are not all set, burns them to force VDD_SDIO=3.3V regardless of the
+// IO12 strap. That's what Espressif factory-burns on production WROOM modules
+// and what Adafruit ships on the AirLift; raw modules don't have it set.
+// After each check the sketch writes EFUSE.DN as a forensic log of what was
+// observed; it does NOT gate the next check. The burn only fires when ALL of
+//   * recovery is engaged (fw probe failed)
+//   * SD ready + NINAFW.BIN present (operator is intentionally provisioning)
+//   * ESPFlasher syncs to the chip
+//   * chip's live efuse read shows bits unset
+// are true together — burning under those conditions is unambiguously
+// correct (a chip that just failed fw probe and reads as unburned will fail
+// again next boot for the same reason). Set WIFI_AUTO_EFUSE_BURN to 0 to
+// disable the burn path entirely.
+#define WIFI_AUTO_EFUSE_BURN  1
+#define EFUSE_BURN_DONE_FILE  "EFUSE.DN"
 #endif
 
 // Handle the ADC PCB unit
@@ -1475,18 +1479,16 @@ static bool waitEfuseCmdClear(uint32_t cmdBit, uint32_t timeoutMs) {
 
 // Returns true only when bits were actually burned this call (caller should
 // reset to re-latch the flash voltage strap). Returns false on:
-//   * sentinel absent (normal: operator has not opted in to burning)
 //   * chip already has all 3 bits set (rewrites EFUSE.DN marker, returns false)
 //   * connect / read / verify failure (no DONE marker written; safe to retry)
 //
-// Note: source of truth is the chip's actual efuse state read live every boot,
-// NOT the EFUSE.DN file on the SD. That's deliberate so one SD card can
-// provision many boards in sequence (each board's read is independent of
-// what a previous board left on the card).
+// No SD-side gate on whether to run — caller (checkAndMaybeFlashWiFi) only
+// invokes us during recovery, when the operator clearly wants the AirLift
+// fixed. Source of truth for "is the burn needed" is the chip's actual efuse
+// state read live, which makes the same SD card usable across many boards
+// without operator intervention.
 static bool maybeBurnEfuseIfRequested() {
-  if (!SD.exists(EFUSE_BURN_SENTINEL_FILE)) return false;
-
-  Serial.println(F("[efuse] EFUSE.OK sentinel present"));
+  Serial.println(F("[efuse] checking chip state before flash"));
   if (printLCD) {
     lcd.setCursor(0, 0); lcd.print("Efuse check...  ");
     lcd.setCursor(0, 1); lcd.print("                ");
