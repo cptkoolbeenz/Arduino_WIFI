@@ -55,27 +55,41 @@ Set `WIFI_AUTO_RECOVERY` to `0` near the top of the sketch to disable.
 
 For a fleet of ~40 AirLift units the recommended provisioning workflow is:
 
-1. **One-time per board: burn the ESP32 VDD_SDIO efuses to 3.3V.** Use
-   `tools/efuse_burn/` from
-   [TacunaSystems/Arduino_WIFI_AirLift](https://github.com/TacunaSystems/Arduino_WIFI_AirLift).
-   Without this, WROOM-32 modules that don't ship factory-efused can latch
-   the wrong flash voltage at boot, eventually corrupting the AirLift. The
-   burn is permanent; ~10 s per unit. **Do this once before deploying.**
-2. **First-flash provisioning per unit:** copy the latest
-   `NINA_ADAFRUIT-esp32-X.Y.Z.bin` to the SD root as `NINAFW.BIN`, insert
-   the SD, power on. On first boot the AirLift comes up factory-blank,
-   the auto-recovery flow detects it and flashes from the card. The same
-   path can be used to upgrade nina-fw in the field — just put a newer
-   `NINAFW.BIN` on the SD and bump the chip into a bad state (or use
-   `tools/brick_airlift/` for a controlled test).
-3. **Field recovery (automatic):** once deployed, if the AirLift's
-   firmware corrupts itself (brownout during flash, lightning event,
-   flash wear), the next power cycle auto-recovers from the same
-   `NINAFW.BIN` on the SD. No site visit needed. The 3-attempt cap
-   prevents a wedged unit from chewing SD write endurance forever.
+1. **SD prep (once, scriptable for all 40 cards):** copy these two files to
+   each SD root:
+   - `NINA_ADAFRUIT-esp32-X.Y.Z.bin` renamed to `NINAFW.BIN` (~1.33 MB)
+   - `EFUSE.OK` (empty file is fine — the sketch only checks for its existence)
+2. **First boot per unit:** insert SD, power on. The auto-recovery flow:
+   - probes nina-fw → fails (factory-blank AirLift)
+   - detects `EFUSE.OK` sentinel and absent `EFUSE.DN` marker
+   - connects to ESP32 in flasher mode, reads efuse state
+   - if XPD_SDIO bits unset → burns them (forces VDD_SDIO=3.3V regardless of
+     IO12 strap, equivalent to Espressif's factory burn) → writes `EFUSE.DN`
+     marker → resets to re-latch the strap
+   - if already burned (e.g. Adafruit factory boards) → just writes `EFUSE.DN`
+     and continues
+   - flashes `NINAFW.BIN`, MD5-verifies, resets
+   - second boot: nina-fw runs correctly, sketch enters normal operation
+3. **Field recovery (automatic):** once deployed, if the AirLift firmware
+   corrupts itself (brownout during flash, lightning event, flash wear),
+   the next power cycle auto-recovers from the same `NINAFW.BIN` on the SD.
+   The sentinel-gated efuse code never runs again because `EFUSE.DN` is
+   present from provisioning. No site visit needed. The 3-attempt cap
+   (`NINA_RECOVERY_MAX_ATTEMPTS`) prevents a wedged unit from chewing SD
+   write endurance forever.
 
-The `RECOVCNT.TXT` counter file is the only operational state added on
-the SD card. The rest of the recovery is self-contained in the sketch.
+The sketch creates two state files on the SD root:
+- `RECOVCNT.TXT` — recovery attempt counter (cleared on every healthy boot)
+- `EFUSE.DN` — efuse-burn-done marker (written once at provisioning;
+  presence makes the burn check a no-op on every subsequent boot)
+
+Why sentinel-gated and not unconditional auto-burn: efuse writes are
+**permanent and irreversible**. Without the `EFUSE.OK` sentinel the burn
+code never runs, so a transient SPI failure or genuinely-flaky AirLift
+can never trigger an accidental hardware mutation in the field. The
+sentinel is removed once `EFUSE.DN` exists — there is no path to a
+second burn on a deployed unit. Set `WIFI_AUTO_EFUSE_BURN` to `0` near
+the top of the sketch to disable the burn path entirely.
 
 ## Notes
 

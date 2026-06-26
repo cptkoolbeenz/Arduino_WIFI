@@ -38,6 +38,7 @@
 #elif defined(WIFI_PROFILE_AIRLIFT)
 #include <WiFiNINA.h>
 #include "ESPSerialFlasher.h"   // self-heal: reflash nina-fw from SD if AirLift is dead
+#include "esp_loader.h"         // register-level access for sentinel-gated efuse burn
 #elif defined(WIFI_PROFILE_R4_WIFI)
 #include <WiFiS3.h>
 #else
@@ -81,6 +82,16 @@ String myFilename;
 #define NINA_FW_FILENAME            "NINAFW.BIN"
 #define NINA_RECOVERY_COUNTER_FILE  "RECOVCNT.TXT"
 #define NINA_RECOVERY_MAX_ATTEMPTS  3
+
+// Fleet provisioning: if EFUSE.OK is present on the SD root and EFUSE.DONE is
+// absent, the recovery flow burns XPD_SDIO_{REG,FORCE,TIEH} on the ESP32 to
+// force VDD_SDIO=3.3V regardless of IO12 strap (what Espressif factory-burns).
+// On success the sketch writes EFUSE.DONE so the burn never repeats. Without
+// the sentinel file the burn code never runs — protects against a stuck SPI
+// probe triggering an irreversible hardware mutation. Set to 0 to disable.
+#define WIFI_AUTO_EFUSE_BURN      1
+#define EFUSE_BURN_SENTINEL_FILE  "EFUSE.OK"
+#define EFUSE_BURN_DONE_FILE      "EFUSE.DN"
 #endif
 
 // Handle the ADC PCB unit
@@ -1428,6 +1439,127 @@ static void clearRecoveryAttempts() {
   if (SD.exists(NINA_RECOVERY_COUNTER_FILE)) SD.remove(NINA_RECOVERY_COUNTER_FILE);
 }
 
+#if WIFI_AUTO_EFUSE_BURN
+// ESP32 EFUSE_BLK0 registers and the three VDD_SDIO bits we burn.
+// Espressif factory-burns these on production WROOM modules; raw modules
+// don't have them set, so flash voltage gets decided by the IO12 strap.
+// Adafruit AirLifts don't pull IO12, so unburned chips boot ROM but the app
+// won't run. Burning these three bits permanently overrides the strap to 3.3V.
+#define EFUSE_BASE          0x3FF5A000
+#define EFUSE_BLK0_RDATA4   (EFUSE_BASE + 0x10)
+#define EFUSE_BLK0_WDATA4   (EFUSE_BASE + 0x2C)
+#define EFUSE_CONF_REG      (EFUSE_BASE + 0xFC)
+#define EFUSE_CMD_REG       (EFUSE_BASE + 0x104)
+#define EFUSE_CONF_WRITE    0x5A5A
+#define EFUSE_CONF_READ     0x5AA5
+#define EFUSE_CMD_PGM       0x02
+#define EFUSE_CMD_READ      0x01
+#define BIT_XPD_SDIO_REG     14
+#define BIT_XPD_SDIO_TIEH    15
+#define BIT_XPD_SDIO_FORCE   16
+
+static bool waitEfuseCmdClear(uint32_t cmdBit, uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    uint32_t v = 0;
+    if (esp_loader_read_register(EFUSE_CMD_REG, &v) != ESP_LOADER_SUCCESS) return false;
+    if ((v & cmdBit) == 0) return true;
+    delay(5);
+  }
+  return false;
+}
+
+// Returns true only when bits were actually burned this call (caller should
+// reset to re-latch the flash voltage strap). Returns false on:
+//   * sentinel absent or DONE marker present (normal: nothing to do)
+//   * chip already has all 3 bits set (writes DONE then returns false)
+//   * connect / read / verify failure (no DONE written; safe to retry)
+static bool maybeBurnEfuseIfRequested() {
+  if (!SD.exists(EFUSE_BURN_SENTINEL_FILE)) return false;
+  if (SD.exists(EFUSE_BURN_DONE_FILE)) return false;
+
+  Serial.println(F("[efuse] EFUSE.OK present, EFUSE.DONE absent"));
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse check...  ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+  }
+
+  ESPFlasherInit(true, &Serial);
+  if (ESPFlasherConnect() != ESP_LOADER_SUCCESS) {
+    Serial.println(F("[efuse] flasher connect failed - skip burn"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Connect FAIL    "); }
+    delay(2000);
+    return false;
+  }
+
+  uint32_t rdata4 = 0;
+  if (esp_loader_read_register(EFUSE_BLK0_RDATA4, &rdata4) != ESP_LOADER_SUCCESS) {
+    Serial.println(F("[efuse] RDATA4 read failed - skip burn"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Read FAIL       "); }
+    delay(2000);
+    return false;
+  }
+
+  const uint32_t wantMask = (1U << BIT_XPD_SDIO_REG)
+                          | (1U << BIT_XPD_SDIO_FORCE)
+                          | (1U << BIT_XPD_SDIO_TIEH);
+  uint32_t toBurn = wantMask & ~rdata4;
+
+  Serial.print(F("[efuse] RDATA4=0x")); Serial.print(rdata4, HEX);
+  Serial.print(F(" toBurn=0x")); Serial.println(toBurn, HEX);
+
+  if (toBurn == 0) {
+    Serial.println(F("[efuse] already burned - writing DONE marker"));
+    File df = SD.open(EFUSE_BURN_DONE_FILE, FILE_WRITE);
+    if (df) { df.println(F("already burned")); df.close(); }
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Already burned  "); }
+    delay(1500);
+    return false;
+  }
+
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse burn...   ");
+    lcd.setCursor(0, 1); lcd.print("Do NOT power off");
+  }
+  Serial.println(F("[efuse] burning XPD_SDIO bits"));
+
+  bool seqOk =
+      esp_loader_write_register(EFUSE_BLK0_WDATA4, toBurn)        == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CONF_REG, EFUSE_CONF_WRITE) == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CMD_REG, EFUSE_CMD_PGM)     == ESP_LOADER_SUCCESS
+   && waitEfuseCmdClear(EFUSE_CMD_PGM, 2000)
+   && esp_loader_write_register(EFUSE_CONF_REG, EFUSE_CONF_READ)  == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CMD_REG, EFUSE_CMD_READ)    == ESP_LOADER_SUCCESS
+   && waitEfuseCmdClear(EFUSE_CMD_READ, 2000);
+
+  if (!seqOk) {
+    Serial.println(F("[efuse] burn sequence failed"));
+    if (printLCD) { lcd.setCursor(0, 0); lcd.print("Efuse FAIL      "); }
+    delay(2000);
+    return false;
+  }
+
+  uint32_t after = 0;
+  if (esp_loader_read_register(EFUSE_BLK0_RDATA4, &after) != ESP_LOADER_SUCCESS
+      || (after & wantMask) != wantMask) {
+    Serial.print(F("[efuse] verify failed: after=0x")); Serial.println(after, HEX);
+    if (printLCD) { lcd.setCursor(0, 0); lcd.print("Efuse VERIFY    "); }
+    delay(2000);
+    return false;
+  }
+
+  Serial.print(F("[efuse] burn verified: after=0x")); Serial.println(after, HEX);
+  File df = SD.open(EFUSE_BURN_DONE_FILE, FILE_WRITE);
+  if (df) { df.print(F("burned: 0x")); df.println(after, HEX); df.close(); }
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse OK        ");
+    lcd.setCursor(0, 1); lcd.print("Rebooting...    ");
+  }
+  delay(2000);
+  return true;
+}
+#endif // WIFI_AUTO_EFUSE_BURN
+
 /***********************
  * Probes the AirLift WiFi module. If WiFi.firmwareVersion() doesn't return a
  * sane string, attempts to reflash nina-fw from the SD card (NINAFW.BIN in the
@@ -1484,6 +1616,18 @@ void checkAndMaybeFlashWiFi() {
     delay(3000);
     return;
   }
+#if WIFI_AUTO_EFUSE_BURN
+  // Sentinel-gated burn. Runs before the flash attempt so a successful burn
+  // forces a reset to re-latch the flash voltage strap; the next boot's
+  // recovery flow will then reflash nina-fw under the new (correct) voltage.
+  // Does NOT count against the recovery retry cap — the cap is for flash
+  // failures, not for one-time hardware provisioning.
+  if (maybeBurnEfuseIfRequested()) {
+    Serial.println(F("[efuse] burn done; resetting to apply strap"));
+    delay(500);
+    NVIC_SystemReset();
+  }
+#endif
   uint8_t prior = readRecoveryAttempts();
   if (prior >= NINA_RECOVERY_MAX_ATTEMPTS) {
     Serial.print(F("[wifi] recovery attempt limit reached ("));
